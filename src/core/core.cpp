@@ -15,6 +15,7 @@
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
+#include "core/arm/recomp/arm_recomp.h"
 
 #include "launch_timestamp_cache.h"
 #include "core/core_timing.h"
@@ -342,6 +343,18 @@ struct System::Impl {
         LOG_INFO(Core, "Load: calling kernel.MakeApplicationProcess");
         kernel.MakeApplicationProcess(process->GetHandle());
         LOG_INFO(Core, "Load: kernel.MakeApplicationProcess returned");
+
+        // Loader inventory is complete here; publication below may immediately
+        // make guest threads runnable on the window-system thread.
+        if (HasRecompPrepareCallback()) {
+            RecompModules modules;
+            if (app_loader->ReadNSOModules(modules) != Loader::ResultStatus::Success ||
+                !PrepareRecompProcess(*process->GetHandle(), modules)) {
+                LOG_CRITICAL(Core, "Static-image preparation failed before process publication");
+                ShutdownMainProcess();
+                return SystemResultStatus::ErrorLoader;
+            }
+        }
 
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};

@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <map>
+#include <string>
 
 #include "core/arm/arm_interface.h"
 
@@ -60,6 +62,14 @@ void SetRecompLookup(RecompLookupFn lookup);
 using RecompBaseFn = void (*)(size_t index, const char* module, u64 base);
 void SetRecompBaseSetter(RecompBaseFn setter);
 
+// Installed only for a stopped, explicitly prepared static-image session.
+using RecompModules = std::map<u64, std::string>;
+using RecompPrepareFn = bool (*)(const RecompModules& modules);
+void SetRecompPrepareCallback(RecompPrepareFn callback);
+bool HasRecompPrepareCallback();
+// Must complete before the application process is published to the applet manager.
+bool PrepareRecompProcess(Kernel::KProcess& process, const RecompModules& modules);
+
 /// Returns the registered lookup, or nullptr when no recompiled image is
 /// loaded and the JIT should be used.
 RecompLookupFn GetRecompLookup();
@@ -77,6 +87,17 @@ struct RecompLiveStats {
     bool jit_available;     ///< false when built without a dynamic recompiler
 };
 RecompLiveStats GetRecompLiveStats();
+
+// Process-wide monotonically accumulated diagnostic counters. Fields are sampled
+// independently; callers may subtract a stopped-session baseline.
+struct RecompExecutionStats {
+    u64 blocks{};
+    u64 svc_calls{};
+    u64 lookup_misses{};
+    u64 unhandled{};
+    u64 no_fallback{};
+};
+RecompExecutionStats GetRecompExecutionStats();
 
 /**
  * CPU backend that executes statically recompiled AArch64 rather than JITing
@@ -132,6 +153,8 @@ public:
 
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
     void RewindBreakpointInstruction() override;
+
+friend bool PrepareRecompProcess(Kernel::KProcess&, const RecompModules&);
 
 private:
     /// Builds the JIT fallback if needed and marks this thread as running on

@@ -17,8 +17,14 @@ bool InstallStaticImages() {
     auto candidate = std::make_unique<Registry>(modules, count);
     if (!candidate->Error().empty()) return false;
     active = std::move(candidate);
-    Core::SetRecompBaseSetter([](std::size_t index, const char*, u64 base) {
-        if (active) active->Bind(index, base);
+    Core::SetRecompBaseSetter(nullptr);
+    Core::SetRecompPrepareCallback([](const Core::RecompModules& inventory) {
+        if (!active) return false;
+        std::size_t index = 0;
+        for (const auto& [base, name] : inventory) {
+            if (!active->BindNamed(index++, name.c_str(), base)) return false;
+        }
+        return active->Seal();
     });
     Core::SetRecompLookup([](u64 pc) -> Core::RecompBlockFn {
         return active ? active->Lookup(pc) : nullptr;
@@ -26,14 +32,16 @@ bool InstallStaticImages() {
     return true;
 }
 // Requires explicit loader-time binding BEFORE process publication/guest startup.
-// The current lazy ArmRecomp base setter is not sufficient; this bridge is not
-// connected by the core initialization probe.
+// System::Load owns this barrier; callers can query completion afterward.
 // A false result is a launch failure, never permission to start another engine.
-bool FinalizeStaticImages() { return active && active->Seal(); }
+bool FinalizeStaticImages() { return active && active->Ready(); }
 const char* StaticImageError() {
-    return active ? active->Error().c_str() : "Static image registry not installed";
+    if (!active) return "Static image registry not installed";
+    if (!active->Error().empty()) return active->Error().c_str();
+    return active->Ready() ? "" : "Static image preparation has not completed";
 }
 void ClearStaticImages() {
+    Core::SetRecompPrepareCallback(nullptr);
     Core::SetRecompLookup(nullptr);
     Core::SetRecompBaseSetter(nullptr);
     active.reset();
