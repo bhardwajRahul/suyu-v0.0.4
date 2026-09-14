@@ -1716,6 +1716,8 @@ void GMainWindow::ConnectWidgetEvents() {
             [this](const std::string&) { OnExportGame(); });
     connect(game_list, &GameList::LaunchRecompiledRequested, this,
             &GMainWindow::OnLaunchRecompiledBuild);
+    connect(game_list, &GameList::LaunchStaticBuildRequested, this,
+            &GMainWindow::OnLaunchStaticBuild);
     connect(game_list, &GameList::AddDirectory, this, &GMainWindow::OnGameListAddDirectory);
     connect(game_list_placeholder, &GameListPlaceholder::AddDirectory, this,
             &GMainWindow::OnGameListAddDirectory);
@@ -6162,7 +6164,10 @@ static int CountPlayableLibraryEntries(QAbstractItemModel* model) {
         for (int row = 0; row < rows; ++row) {
             const QModelIndex idx = model->index(row, 0, parent);
             const QString path = idx.data(kPathRole).toString();
-            if (!path.isEmpty() && !path.startsWith(QStringLiteral("owned://")) &&
+            const bool is_game =
+                idx.data(GameListItem::TypeRole).value<GameListItemType>() ==
+                GameListItemType::Game;
+            if (is_game && !path.isEmpty() && !path.startsWith(QStringLiteral("owned://")) &&
                 QFileInfo(path).isFile()) {
                 ++count;
             }
@@ -6232,7 +6237,11 @@ void GMainWindow::OnExportGame() {
                     const QModelIndex idx = model->index(row, 0, parent);
                     const QString game_path = idx.data(kPathRole).toString();
                     const QFileInfo game_info(game_path);
-                    if (!game_path.isEmpty() && !game_path.startsWith(QStringLiteral("owned://")) &&
+                    const bool is_game =
+                        idx.data(GameListItem::TypeRole).value<GameListItemType>() ==
+                        GameListItemType::Game;
+                    if (is_game && !game_path.isEmpty() &&
+                        !game_path.startsWith(QStringLiteral("owned://")) &&
                         game_info.exists() && game_info.isFile()) {
                         const QString title = idx.data(kTitleRole).toString().trimmed().isEmpty()
                                                   ? idx.data(Qt::DisplayRole).toString()
@@ -6291,6 +6300,9 @@ void GMainWindow::OnExportGame() {
         }
     }
     dialog.exec();
+    if (game_list) {
+        game_list->PopulateAsync(UISettings::values.game_dirs);
+    }
 }
 
 void GMainWindow::OnLaunchRecompiledBuild(const QString& game_name,
@@ -6353,6 +6365,25 @@ void GMainWindow::OnLaunchRecompiledBuild(const QString& game_name,
     LOG_INFO(Frontend, "Launched standalone recompiled build '{}' (pid {})", exe.toStdString(),
              pid);
     statusBar()->showMessage(tr("Launched recompiled build (pid %1)").arg(pid), 5000);
+}
+
+void GMainWindow::OnLaunchStaticBuild(const QString& executable) {
+    const QFileInfo build(executable);
+    if (!build.isFile()) {
+        QMessageBox::warning(this, tr("Static Build"),
+                             tr("The static build no longer exists:\n%1").arg(executable));
+        return;
+    }
+    qint64 pid = 0;
+    if (!QProcess::startDetached(build.absoluteFilePath(), QStringList{}, build.absolutePath(),
+                                 &pid)) {
+        QMessageBox::critical(this, tr("Static Build"),
+                              tr("Could not start the static build:\n%1").arg(executable));
+        return;
+    }
+    LOG_INFO(Frontend, "Launched static library build '{}' (pid {})", executable.toStdString(),
+             pid);
+    statusBar()->showMessage(tr("Launched static build (pid %1)").arg(pid), 5000);
 }
 
 void GMainWindow::RunFirstRunSetupIfNeeded() {
