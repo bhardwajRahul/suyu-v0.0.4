@@ -76,6 +76,9 @@ inline bool IsTerminator(u32 i) {
     if ((i & 0x7F000000) == 0x37000000) return true; // TBNZ
     if ((i & 0xFF000010) == 0x54000000) return true; // B.cond
     if ((i & 0xFFE0001F) == 0xD4000001) return true; // SVC
+    if ((i & 0xFFE0001F) == 0xD4200000) return true; // BRK
+    if ((i & 0xFFFFF0FF) == 0xD50330DF) return true; // ISB: new fetch boundary
+    if ((i & 0xFFFFFFE0) == 0xD50B7520) return true; // IC IVAU host event
     return false;
 }
 
@@ -192,6 +195,9 @@ inline std::vector<Block> DiscoverBlocks(const u8* text, size_t n_bytes, u64 bas
             start[(u32)((addr - base) / 4)] = true;
         }
     }
+    // Preserve roots independently of the mechanical boundary after a terminator.
+    // Only the latter can be omitted when an unconditional transfer precedes zeros.
+    std::vector<bool> required = start;
     const u32* p = reinterpret_cast<const u32*>(text);
     for (u32 i = 0; i < n; ++i) {
         const u32 insn = p[i];
@@ -199,17 +205,35 @@ inline std::vector<Block> DiscoverBlocks(const u8* text, size_t n_bytes, u64 bas
         if (IsTerminator(insn)) {
             if (i + 1 < n) start[i + 1] = true;
             u64 t = 0;
-            if (DirectBranchTarget(insn, pc, t) && t >= base && (t - base) / 4 < n)
-                start[(u32)((t - base) / 4)] = true;
+            if (DirectBranchTarget(insn, pc, t) && t >= base && (t - base) / 4 < n) {
+                const u32 target = (u32)((t - base) / 4);
+                start[target] = required[target] = true;
+            }
         }
     }
     std::vector<Block> blocks;
-    u32 s = 0;
-    for (u32 i = 1; i <= n; ++i) {
-        if (i == n || start[i]) {
-            blocks.push_back(Block{base + (u64)s * 4, (i - s) * 4, i - s, s == 0});
-            s = i;
+    for (u32 s = 0; s < n;) {
+        u32 end = s + 1;
+        if (p[s] != 0) {
+            while (end < n && !start[end] && p[end] != 0) ++end;
         }
+        // A zero immediately after B/BR/RET has no architectural fallthrough.
+        // Omit only that mechanical boundary, retaining every independently
+        // rooted address. Calls, conditional branches and SVC can return/fall
+        // through, so their first zero remains an undefined-instruction trap.
+        const u32 previous = s > 0 ? p[s - 1] : 0;
+        const bool no_fallthrough = (previous & 0xFC000000) == 0x14000000 || // B, not BL
+                                    (previous & 0xFFFFFC1F) == 0xD61F0000 || // BR
+                                    (previous & 0xFFFFFC1F) == 0xD65F0000;   // RET
+        if (p[s] != 0 || required[s] || !no_fallthrough) {
+            blocks.push_back(Block{base + (u64)s * 4, (end - s) * 4, end - s, s == 0});
+        }
+        // Further unrooted zeros cannot execute past the retained trap (or
+        // preceding transfer). Resume conservatively at the next nonzero word.
+        if (p[s] == 0) {
+            while (end < n && p[end] == 0 && !start[end]) ++end;
+        }
+        s = end;
     }
     return blocks;
 }
@@ -303,8 +327,8 @@ inline std::string ChainTo(u64 t) {
         // nothing may come of that below -O2 - which is why the budget has to
         // bound the depth rather than assume it stays at one frame.
         snprintf(b, sizeof b,
-                 "{ void %s(GuestContext*); if (--c->chain_budget <= 0) "
-                 "{ c->pc=g_module_base+0x%llxULL; return; } %s(c); return; }",
+                 "{ void %s(GuestContext*); c->pc=g_module_base+0x%llxULL; "
+                 "if (--c->chain_budget <= 0) return; %s(c); return; }",
                  nm, (unsigned long long)t, nm);
     } else {
         snprintf(b, sizeof b, "{ c->pc=g_module_base+0x%llxULL; return; }",
@@ -403,6 +427,228 @@ inline std::string Xsp(u32 r) {
 /// this signal the emitter cannot tell a full translation from a stream of
 /// fallbacks, which is how a whole module of misdecoded ARM32 once passed for a
 /// successful export.
+// Emit one baseline S/D addition/subtraction from raw uint64_t _a/_b to _v.
+// Three guard bits plus sticky alignment preserve exact rounding, including
+// cancellation. No host FP arithmetic or host FP state is involved.
+inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
+    return "{ const unsigned _f=" + std::string(dbl?"52":"23") +
+        ";const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
+        (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
+        (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
+        "unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
+        "if(c->fpcr&(1ULL<<24)){if(!(_a&_exp)&&(_a&_frac)){_a&=_sign;c->fpsr|=128;}"
+        "if(!(_b&_exp)&&(_b&_frac)){_b&=_sign;c->fpsr|=128;}}"
+        "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+        "unsigned _sa=!!(_a&_sign),_sb="+std::string(subtract?"!(_b&_sign)":"!!(_b&_sign)")+";"
+        "if(_an||_bn){int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+        "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs){c->fpsr|=1;}"
+        "if(c->fpcr&(1ULL<<25)){_v=_exp|_quiet;}}"
+        "else if((_a&_exp)==_exp||(_b&_exp)==_exp){"
+        "if((_a&_exp)==_exp&&(_b&_exp)==_exp&&_sa!=_sb){_v=_exp|_quiet;c->fpsr|=1;}"
+        "else _v=_exp|(((_a&_exp)==_exp?_sa:_sb)?_sign:0);}"
+        "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
+        "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
+        "if(!_ea){_ea=1;}if(!_eb){_eb=1;}"
+        "if(_ea<_eb||(_ea==_eb&&_ma<_mb)){unsigned _t=_ea;_ea=_eb;_eb=_t;_t=_sa;_sa=_sb;_sb=_t;"
+        "uint64_t _u=_ma;_ma=_mb;_mb=_u;}"
+        "_ma<<=3;_mb<<=3;unsigned _distance=_ea-_eb;"
+        "if(_distance>=64)_mb=!!_mb;else if(_distance)_mb=(_mb>>_distance)|!!(_mb&((1ULL<<_distance)-1));"
+        "uint64_t _magnitude=_sa==_sb?_ma+_mb:_ma-_mb;"
+        "if(!_magnitude)_v=(_sa==_sb?_sa:_mode==2)?_sign:0;"
+        "else {if(_magnitude>=(_hidden<<4)){_magnitude=(_magnitude>>1)|(_magnitude&1);++_ea;}"
+        "while(_magnitude<(_hidden<<3)&&_ea>1){_magnitude<<=1;--_ea;}"
+        "int _tiny=_ea==1&&_magnitude<(_hidden<<3);"
+        "if(_tiny&&(c->fpcr&(1ULL<<24))){c->fpsr|=8;_v=0;}"
+        "else {unsigned _lost=(unsigned)(_magnitude&7);uint64_t _rounded=_magnitude>>3;"
+        "if(_lost){c->fpsr|=16;if(_tiny)c->fpsr|=8;"
+        "if((_mode==0&&(_lost>4||(_lost==4&&(_rounded&1))))||(_mode==1&&!_sa)||(_mode==2&&_sa))++_rounded;}"
+        "if(_rounded>=(_hidden<<1)){_rounded>>=1;++_ea;}"
+        "if(_ea>=(unsigned)(_exp>>_f)){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_sa)||(_mode==2&&_sa))?_exp:_exp-1;}"
+        "else _v=((_rounded>=_hidden?(uint64_t)_ea:0)<<_f)|(_rounded&_frac);}"
+        "if(_sa)_v|=_sign;}}}";
+}
+
+// Generated exact product/addend lattice. Inputs _a,_b,_z and output _v are
+// IEEE bit patterns. A multiply supplies a same-sign zero addend so its zero
+// result has the product sign in every rounding mode.
+inline std::string EmitFPDivideValue(bool dbl) {
+    return "{ const unsigned _f="+std::string(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+R"C(;
+const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
+const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
+const unsigned _mode=(unsigned)(c->fpcr>>22)&3;unsigned _negative=!!((_a^_b)&_sign);
+if(c->fpcr&(1ULL<<24)) {
+ if(!(_a&_exp)&&(_a&_frac)){_a&=_sign;c->fpsr|=128;}
+ if(!(_b&_exp)&&(_b&_frac)){_b&=_sign;c->fpsr|=128;}
+}
+int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);
+int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);
+int _ai=(_a&~_sign)==_exp,_bi=(_b&~_sign)==_exp,_az=!(_a&~_sign),_bz=!(_b&~_sign);
+if(_an||_bn){_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs)c->fpsr|=1;
+ if(c->fpcr&(1ULL<<25))_v=_exp|_quiet;
+}else if((_ai&&_bi)||(_az&&_bz)){_v=_exp|_quiet;c->fpsr|=1;}
+else if(_ai||_bz){_v=_exp|(_negative?_sign:0);if(!_ai)c->fpsr|=2;}
+else if(_az||_bi)_v=_negative?_sign:0;
+else {
+ unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);
+ uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);
+ int _ae=_ea?(int)_ea-(int)_bias:1-(int)_bias,_be=_eb?(int)_eb-(int)_bias:1-(int)_bias;
+ while(_ma<_hidden){_ma<<=1;--_ae;}while(_mb<_hidden){_mb<<=1;--_be;}
+ int _e=_ae-_be,_emin=1-(int)_bias;if(_ma<_mb){_ma<<=1;--_e;}
+ if(_e<_emin&&(c->fpcr&(1ULL<<24))){_v=_negative?_sign:0;c->fpsr|=8;}
+ else {
+  int _bits=(int)_f+(_e<_emin?_e-_emin:0);uint64_t _mant=0,_rem=_ma-_mb;
+  unsigned _roundbit=0,_sticky=0;
+  if(_bits>=0){_mant=1;for(int _j=0;_j<_bits;++_j){_mant<<=1;_rem<<=1;if(_rem>=_mb){++_mant;_rem-=_mb;}}
+   _rem<<=1;_roundbit=_rem>=_mb;if(_roundbit)_rem-=_mb;_sticky=_rem!=0;
+  }else{_roundbit=_bits==-1;_sticky=_bits<-1||_rem!=0;}
+  unsigned _lost=_roundbit|_sticky;if(_lost){c->fpsr|=16;if(_e<_emin)c->fpsr|=8;
+   if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}
+  if(_e<_emin){_e=_emin;}if(_mant>=(_hidden<<1)){_mant>>=1;++_e;}
+  if(_e>(int)_bias){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}
+  else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);
+  if(_negative)_v|=_sign;
+ }
+}
+}
+)C";
+}
+
+// Architectural reciprocal estimate. The estimate is deliberately computed
+// with the integer table algorithm from the ARM pseudocode.
+inline std::string EmitFPRecipEstimateValue(bool dbl) {
+    std::string s = "{ const unsigned _f=" + std::string(dbl ? "52" : "23") +
+                    ",_bias=" + (dbl ? "1023" : "127") + ";";
+    s += R"C(
+const int _emin=1-(int)_bias;const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
+const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
+unsigned _eraw=(unsigned)((_x&_exp)>>_f);uint64_t _fb=_x&_frac;unsigned _negative=!!(_x&_sign);
+if(_eraw==2*_bias+1){
+ if(_fb){if(!(_x&_quiet))c->fpsr|=1;_v=_x|_quiet;if(c->fpcr&(1ULL<<25))_v=_exp|_quiet;}
+ else _v=_negative?_sign:0;
+}else if(!_eraw&&!_fb){c->fpsr|=2;_v=(_x&_sign)|_exp;}
+else if(!_eraw&&_fb&&(c->fpcr&(1ULL<<24))){c->fpsr|=130;_v=(_x&_sign)|_exp;}
+else {
+ uint64_t _mant;int _e;
+ if(_eraw){_mant=_hidden|_fb;_e=(int)_eraw-(int)_bias;}
+ else{_mant=_fb;_e=_emin;while(!(_mant&_hidden)){_mant<<=1;--_e;}}
+ if(_e<_emin-2){
+  unsigned _mode=(unsigned)(c->fpcr>>22)&3;
+  unsigned _to_inf=_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative);
+  c->fpsr|=20;_v=(_x&_sign)|(_to_inf?_exp:_exp-1);
+ }else if((c->fpcr&(1ULL<<24))&&_e>=-_emin){c->fpsr|=8;_v=_x&_sign;}
+ else {
+  unsigned _index=(unsigned)(_mant>>(_f-8));uint64_t _q=_index*2+1;
+  uint64_t _estimate=(uint8_t)((((1ULL<<19)/_q)+1)/2);_estimate<<=_f-8;
+  int _re=-(_e+1);
+  if(_re<_emin){if(_re==_emin-1){_estimate|=_hidden;_estimate>>=1;}
+   else{_estimate|=_hidden;_estimate>>=2;++_re;}}
+  _v=(_x&_sign)|((uint64_t)(_re+(int)_bias)<<_f)|(_estimate&_frac);
+ }
+}
+}
+)C";
+    return s;
+}
+
+// Architectural reciprocal-square-root estimate. The estimate is deliberately
+// computed with the integer table algorithm from the ARM pseudocode: host
+// rsqrt instructions do not guarantee the same eight result bits.
+inline std::string EmitFPRSqrtEstimateValue(bool dbl) {
+    std::string s = "{ const unsigned _f=" + std::string(dbl ? "52" : "23") +
+                    ",_bias=" + (dbl ? "1023" : "127") + ";";
+    s += R"C(
+const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
+const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
+unsigned _eraw=(unsigned)((_x&_exp)>>_f);uint64_t _fb=_x&_frac;
+if(!_eraw&&!_fb){c->fpsr|=2;_v=(_x&_sign)|_exp;}
+else if(!_eraw&&_fb&&(c->fpcr&(1ULL<<24))){c->fpsr|=130;_v=(_x&_sign)|_exp;}
+else if(_eraw==2*_bias+1){
+ if(_fb){if(!(_x&_quiet))c->fpsr|=1;_v=_x|_quiet;if(c->fpcr&(1ULL<<25))_v=_exp|_quiet;}
+ else if(_x&_sign){c->fpsr|=1;_v=_exp|_quiet;}else _v=0;
+}else if(_x&_sign){c->fpsr|=1;_v=_exp|_quiet;}
+else {
+ uint64_t _mant;int _e;
+ if(_eraw){_mant=_hidden|_fb;_e=(int)_eraw-(int)_bias;}
+ else{_mant=_fb;_e=1-(int)_bias;while(!(_mant&_hidden)){_mant<<=1;--_e;}}
+ unsigned _index=(unsigned)(_mant>>(_f-((_e%2)==0?7:8)));
+ uint64_t _q=_index<256?_index*2+1:(_index|1)*2,_b=512;
+ while(_q*(_b+1)*(_b+1)<(1ULL<<28))++_b;
+ uint64_t _estimate=(uint8_t)((_b+1)/2);int _re=(-(_e+1))>>1;
+ _v=((uint64_t)(_re+(int)_bias)<<_f)|((_estimate<<(_f-8))&_frac);
+}
+}
+)C";
+    return s;
+}
+
+inline std::string EmitFPMulAddValue(bool dbl) {
+    std::string s="{ const unsigned _f="+std::string(dbl?"52":"23")+
+        ",_bias="+(dbl?"1023":"127")+",_count="+(dbl?"67":"9")+
+        "; const int _base="+(dbl?"-2148":"-298")+"; uint64_t _p["+
+        (dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};";
+    s+=R"C(
+const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
+const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
+unsigned _mode=(unsigned)(c->fpcr>>22)&3;
+if(c->fpcr&(1ULL<<24)) {
+ if(!(_a&_exp)&&(_a&_frac)){_a&=_sign;c->fpsr|=128;}
+ if(!(_b&_exp)&&(_b&_frac)){_b&=_sign;c->fpsr|=128;}
+ if(!(_z&_exp)&&(_z&_frac)){_z&=_sign;c->fpsr|=128;}
+}
+int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac),_zn=(_z&_exp)==_exp&&(_z&_frac);
+int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet),_zs=_zn&&!(_z&_quiet);
+int _ai=(_a&~_sign)==_exp,_bi=(_b&~_sign)==_exp,_zi=(_z&~_sign)==_exp;
+int _az=!(_a&~_sign),_bz=!(_b&~_sign),_zz=!(_z&~_sign),_badproduct=(_ai&&_bz)||(_bi&&_az);
+unsigned _ps=!!((_a^_b)&_sign),_cs=!!(_z&_sign);
+if(_an||_bn||_zn) {
+ _v=(_zs?_z:_as?_a:_bs?_b:_zn?_z:_an?_a:_b)|_quiet;
+ if(_as||_bs||_zs)c->fpsr|=1;
+ if((c->fpcr&(1ULL<<25))||(_zn&&!_zs&&_badproduct))_v=_exp|_quiet;
+ if(_zn&&!_zs&&_badproduct)c->fpsr|=1;
+}else if(_badproduct||(_zi&&(_ai||_bi)&&_ps!=_cs)){_v=_exp|_quiet;c->fpsr|=1;}
+else if(_zi||_ai||_bi)_v=_exp|((_zi?_cs:_ps)?_sign:0);
+else {
+ unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f),_ez=(unsigned)((_z&_exp)>>_f);
+ uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0),_mz=(_z&_frac)|(_ez?_hidden:0);
+ uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;
+ uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);
+ uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;
+ unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;
+ _p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);
+ if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);
+ _shift=(_ez?_ez-1:0)+_bias+_f-1;_j=_shift/64;_s=_shift%64;
+ _c[_j]=_mz<<_s;if(_s)_c[_j+1]=_mz>>(64-_s);
+ unsigned _negative=_ps;
+ if(_ps!=_cs) {
+  int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k){if(_p[_k]!=_c[_k]){_compare=_p[_k]>_c[_k]?1:-1;break;}}
+  _negative=_compare>=0?_ps:_cs;uint64_t _borrow=0;
+  for(unsigned _k=0;_k<_count;++_k){uint64_t _left=_compare>=0?_p[_k]:_c[_k],_right=_compare>=0?_c[_k]:_p[_k];
+   uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);_p[_k]=_diff-_borrow;_borrow=_next;}
+ }else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k){uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];
+  uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}
+ int _top=(int)(_count*64)-1;while(_top>=0&&!((_p[(unsigned)_top/64]>>(_top%64))&1))--_top;
+ if(_top<0)_v=((_zz&&(_az||_bz)&&_ps==_cs)?_ps:_mode==2)?_sign:0;
+ else {int _e=_top+_base,_emin=1-(int)_bias;
+  if(_e<_emin&&(c->fpcr&(1ULL<<24))){c->fpsr|=8;_v=_negative?_sign:0;}
+  else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;
+   unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;
+   uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);
+   unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1),_sticky=0;
+   for(int _k=0;_k<_cut-1;++_k)_sticky|=(unsigned)((_p[(unsigned)_k/64]>>(_k%64))&1);
+   unsigned _lost=_roundbit|_sticky;if(_lost){c->fpsr|=16;if(_e<_emin)c->fpsr|=8;
+    if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}
+   if(_e<_emin){_e=_emin;}if(_mant>=(_hidden<<1)){_mant>>=1;++_e;}
+   if(_e>(int)_bias){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}
+   else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);
+   if(_negative)_v|=_sign;
+  }
+ }
+}
+}
+)C";
+    return s;
+}
+
 inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
     if (unhandled) {
         *unhandled = false;
@@ -477,6 +723,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     // mark that could make a later unrelated STXR succeed.
     if ((i & 0xFFFFF0FF) == 0xD503305F) { put("recomp_clrex(c);"); return true; }
 
+    if ((i & 0xFFFFF0FF) == 0xD50330DF) {
+        snprintf(buf, sizeof buf, "recomp_barrier(); c->pc=g_module_base+0x%llxULL; return;", (unsigned long long)next);
+        put(buf); return false;
+    }
     if ((i & 0xFFFFF01F) == 0xD503301F) { put("recomp_barrier();"); return true; }
 
     if ((i & 0x1F800000) == 0x12800000) { // MOVZ/MOVN/MOVK
@@ -618,6 +868,40 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         return true;
     }
 
+    // PC-relative literal loads. GPR register 31 discards the value, but still
+    // performs the memory access; vector register 31 is an ordinary register.
+    if ((i & 0x3B000000) == 0x18000000) {
+        const u32 opc = i >> 30, V = (i >> 26) & 1, rt = i & 31;
+        const u32 field = (i >> 5) & 0x7FFFF;
+        const s64 offset = (field & 0x40000) ? (s64)field - 0x80000 : (s64)field;
+        const u64 address = pc + (u64)(offset * 4);
+        char literal[32];
+        snprintf(literal, sizeof literal, "0x%llxULL", (unsigned long long)address);
+        const std::string addr = literal;
+        if (!V && opc == 3) {
+            put("/* prfm literal: hint, no effect */");
+            return true;
+        }
+        if (opc < 3) {
+            const std::string bits = opc == 0 || (!V && opc == 2) ? "32" : "64";
+            std::string s = "{ uint64_t _v=recomp_load" + bits + "(c," + addr + "); ";
+            if (V) {
+                s += "c->vreg[" + std::to_string(rt) + "][0]=_v; ";
+                s += "c->vreg[" + std::to_string(rt) + "][1]=" +
+                     (opc == 2 ? "recomp_load64(c," + addr + "+8)" : "0") + "; ";
+            } else if (rt != 31) {
+                // Unsigned subtraction defines signed-word extension without
+                // an out-of-range signed cast in the generated C.
+                if (opc == 2) s += "_v=(_v^0x80000000ULL)-0x80000000ULL; ";
+                s += "c->x[" + std::to_string(rt) + "]=_v; ";
+            } else {
+                s += "(void)_v; ";
+            }
+            put(s + "}");
+            return true;
+        }
+    }
+
     // LDR/STR immediate unsigned offset. Bit 26 is the V bit: it selects the
     // SIMD/FP register file rather than the general registers. Leaving it out
     // of the mask made every "LDR s0, [x1, #8]" compile into an integer load
@@ -681,6 +965,13 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     if ((i & 0x7E000000) == 0x34000000) { u32 sf = i >> 31; bool nz = (i >> 24) & 1; u32 rt = i & 31; s64 off = ((s32)(((i >> 5) & 0x7FFFF) << 13) >> 13); u64 tt = pc + off * 4; std::string v = sf ? Xz(rt) : Wz(rt); snprintf(buf, sizeof buf, "if ((%s)%s0) { c->pc=g_module_base+0x%llxULL; } else { c->pc=g_module_base+0x%llxULL; } return;", v.c_str(), nz ? "!=" : "==", (unsigned long long)tt, (unsigned long long)next); put(buf); return false; }
     if ((i & 0x7E000000) == 0x36000000) { bool nz = (i >> 24) & 1; u32 b = ((i >> 31) << 5) | ((i >> 19) & 31); u32 rt = i & 31; s64 off = ((s32)(((i >> 5) & 0x3FFF) << 18) >> 18); u64 tt = pc + off * 4; snprintf(buf, sizeof buf, "if (((%s>>%u)&1)%s0) { c->pc=g_module_base+0x%llxULL; } else { c->pc=g_module_base+0x%llxULL; } return;", Xz(rt).c_str(), b, nz ? "!=" : "==", (unsigned long long)tt, (unsigned long long)next); put(buf); return false; }
     if ((i & 0xFFE0001F) == 0xD4000001) { u32 imm = (i >> 5) & 0xFFFF; snprintf(buf, sizeof buf, "c->pc=g_module_base+0x%llxULL; c->pending_svc=%uULL; recomp_svc(c,%u); return;", (unsigned long long)next, imm, imm); put(buf); return false; }
+    if ((i & 0xFFE0001F) == 0xD4200000) {
+        const u32 imm = (i >> 5) & 0xFFFF;
+        snprintf(buf, sizeof buf, "/* brk #0x%x */ c->pc=g_module_base+0x%llxULL; c->halted=RECOMP_HALT_BREAKPOINT; return;",
+                 imm, (unsigned long long)pc);
+        put(buf);
+        return false;
+    }
 
     // STP/LDP - load/store pair. Every non-leaf AArch64 function opens and
     // closes with these, so without them a real game stops at its first
@@ -804,7 +1095,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 s += "_r = (_s >> " + std::to_string(immr) + ")";
                 if (nbits < 64) s += " & ((1ULL << " + std::to_string(nbits) + ") - 1)";
                 s += "; ";
-                if (opc == 0) { // SBFM: sign-extend from nbits
+                if (opc == 0 && nbits < 64) { // SBFM: sign-extend from nbits
                     s += "if (_r & (1ULL << " + std::to_string(nbits - 1) + ")) _r |= ~((1ULL << " +
                          std::to_string(nbits) + ") - 1); ";
                 }
@@ -815,7 +1106,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 s += "_r = (_s";
                 if (nbits < 64) s += " & ((1ULL << " + std::to_string(nbits) + ") - 1)";
                 s += ") << " + std::to_string(shift) + "; ";
-                if (opc == 0) {
+                if (opc == 0 && shift + nbits < 64) {
                     s += "if (_r & (1ULL << " + std::to_string(shift + nbits - 1) +
                          ")) _r |= ~((1ULL << " + std::to_string(shift + nbits) + ") - 1); ";
                 }
@@ -1154,9 +1445,85 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // Non-saturating immediate shifts. Unsigned intermediates implement sign
+    // extension and rounding without signed overflow or a shift by 64.
+    if ((i & 0x8F800400) == 0x0F000400) {
+        const u32 scalar = (i >> 28) & 1, Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 opcode = (i >> 11) & 31, imm = (i >> 16) & 127;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        const bool narrow = opcode == 16 || opcode == 17;
+        const bool left = opcode == 10;
+        const bool insert = opcode == 8 || (left && U);
+        const bool round = opcode == 4 || opcode == 6 || opcode == 17;
+        const bool acc = opcode == 2 || opcode == 6;
+        const bool known = opcode == 0 || opcode == 2 || opcode == 4 || opcode == 6 ||
+                           (opcode == 8 && U) || left || (narrow && !U);
+        u32 bits = 8;
+        while (bits < 64 && imm >= bits * 2) bits *= 2;
+        if (known && (!left || U || g_translate_all) && imm >= 8 &&
+            (!scalar || (Q && !narrow && bits == 64)) &&
+            (scalar || narrow || bits != 64 || Q) && (!narrow || bits < 64)) {
+            const u32 sbits = narrow ? bits * 2 : bits;
+            const u32 shift = left ? imm - bits : bits * 2 - imm;
+            const u32 bytes = scalar ? 8 : Q ? 16 : 8;
+            const u32 lanes = narrow ? 64 / bits : bytes * 8 / bits;
+            const std::string st = "uint" + std::to_string(sbits) + "_t";
+            const std::string dt = "uint" + std::to_string(bits) + "_t";
+            std::string s = "{ " + st + " _a[" + std::to_string(lanes) + "]; " + dt +
+                            " _d[" + std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," +
+                 std::to_string(narrow ? 16 : bytes) + "); ";
+            s += "memcpy(_d,c->vreg[" + std::to_string(rd) + "]," +
+                 std::to_string(narrow ? 8 : bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";++_i) { uint64_t _v=_a[_i],_z; ";
+            if (left) {
+                s += "_z=_v<<" + std::to_string(shift) + "; ";
+                if (insert) s += "_z|=(uint64_t)_d[_i]&" +
+                    std::to_string(shift ? (uint64_t{1} << shift) - 1 : 0) + "ULL; ";
+            } else {
+                s += shift == 64 ? "_z=0; " : "_z=_v>>" + std::to_string(shift) + "; ";
+                if (!U && !narrow) {
+                    const uint64_t mask = shift == 64 ? ~uint64_t{0} :
+                        (~uint64_t{0} << (bits - shift));
+                    s += "if(_v&(1ULL<<" + std::to_string(bits - 1) + ")) _z|=" +
+                         std::to_string(mask) + "ULL; ";
+                }
+                if (round) s += "_z+=(_v>>" + std::to_string(shift - 1) + ")&1; ";
+                if (acc) s += "_z+=(uint64_t)_d[_i]; ";
+                if (insert) {
+                    const uint64_t mask = shift == bits ? ~uint64_t{0} :
+                        (~uint64_t{0} << (bits - shift));
+                    s += "_z|=(uint64_t)_d[_i]&" + std::to_string(mask) + "ULL; ";
+                }
+            }
+            s += "_r[_i]=(" + dt + ")_z; } ";
+            if (!narrow || !Q) s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+                std::to_string(rd) + "][1]=0; ";
+            s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rd) + "]+" +
+                 std::to_string(narrow && Q ? 8 : 0) + ",_r," +
+                 std::to_string(narrow ? 8 : bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // SHLL widens and shifts by exactly the source width (not SSHLL's range).
+    if ((i & 0xBF3FFC00) == 0x2E213800 && ((i >> 22) & 3) != 3) {
+        const u32 Q = (i >> 30) & 1, bits = 8u << ((i >> 22) & 3);
+        const u32 rn = (i >> 5) & 31, rd = i & 31, lanes = 64 / bits;
+        const std::string st = "uint" + std::to_string(bits) + "_t";
+        const std::string dt = "uint" + std::to_string(bits * 2) + "_t";
+        put("{ " + st + " _a[" + std::to_string(lanes) + "]; " + dt + " _r[" +
+            std::to_string(lanes) + "]; memcpy(_a,(uint8_t*)c->vreg[" + std::to_string(rn) +
+            "]+" + std::to_string(Q ? 8 : 0) + ",8); for(int _i=0;_i<" + std::to_string(lanes) +
+            ";++_i) _r[_i]=(" + dt + ")((uint64_t)_a[_i]<<" + std::to_string(bits) +
+            "); memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
+        return true;
+    }
+
     // SSHR / USHR / SHRN: shift right by an immediate. SSHR and USHR keep the
     // element width; SHRN halves it and writes one half of the destination.
-    if ((i & 0x9F00FC00) == 0x0F000400 || (i & 0x9F00FC00) == 0x0F008400) {
+    if ((i & 0x9F80FC00) == 0x0F000400 || (i & 0x9F80FC00) == 0x0F008400) {
         const bool narrow = ((i >> 10) & 0x3F) == 0x21;
         const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
         const u32 immh = (i >> 19) & 15, immb = (i >> 16) & 7;
@@ -1168,7 +1535,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         else if (immh & 2)  size = 1;
         else if (immh & 1)  size = 0;
         else                shaped = false;
-        if (narrow && size == 3) shaped = false;   // no 128-bit source element
+        if (narrow && (size == 3 || U)) shaped = false;   // no 128-bit source element
         if (shaped) {
             // The shift is relative to the *destination* element in both
             // cases; for SHRN the source is twice that, which is the whole
@@ -1267,13 +1634,16 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
 
     // SQSHRN / SQRSHRN and the unsigned forms: shift right, round for the R
     // variants, then saturate into the half-width destination.
-    if ((i & 0x9F00FC00) == 0x0F009400 || (i & 0x9F00FC00) == 0x0F009C00) {
+    if ((i & 0x8F80F400) == 0x0F009400 || (i & 0xAF80F400) == 0x2F008400) {
         const bool round = ((i >> 11) & 1) != 0;
+        const bool scalar = ((i >> 28) & 1) != 0;
+        const bool to_unsigned = (i & 0x1000) == 0;
         const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
         const u32 immh = (i >> 19) & 15, immb = (i >> 16) & 7;
         const u32 rn = (i >> 5) & 31, rd = i & 31;
         u32 size = 0;
         bool shaped = true;
+        if (scalar && !Q) shaped = false;
         if (immh & 8)       shaped = false;   // no 128-bit source element
         else if (immh & 4)  size = 2;
         else if (immh & 2)  size = 1;
@@ -1283,14 +1653,16 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             const int dbits = 8 << size, sbits = dbits * 2;
             const u32 shift = (u32)dbits * 2 - ((immh << 3) | immb);
             if (shift >= 1 && shift <= (u32)dbits) {
-                const int lanes = 64 / dbits;
+                const int lanes = scalar ? 1 : 64 / dbits;
+                const int result_bytes = scalar ? dbits / 8 : 8;
                 const std::string sty =
-                    std::string(U ? "uint" : "int") + std::to_string(sbits) + "_t";
+                    std::string(U && !to_unsigned ? "uint" : "int") + std::to_string(sbits) + "_t";
                 const std::string dty = "uint" + std::to_string(dbits) + "_t";
-                const std::string wide = U ? "uint64_t" : "int64_t";
+                const std::string wide = U && !to_unsigned ? "uint64_t" : "int64_t";
                 std::string s = "{ " + sty + " _a[" + std::to_string(lanes) + "]; " + dty +
                                 " _r[" + std::to_string(lanes) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "],16); ";
+                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," +
+                     std::to_string(scalar ? sbits / 8 : 16) + "); ";
                 s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ " + wide +
                      " _v=(" + wide + ")_a[_i]; ";
                 // Rounding as add-then-shift can overflow the source type; taking
@@ -1301,31 +1673,181 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
                 s += "; ";
                 if (U) {
-                    s += "if(_x>(uint64_t)UINT" + std::to_string(dbits) + "_MAX) _x=(uint64_t)UINT" +
-                         std::to_string(dbits) + "_MAX; ";
+                    if (to_unsigned) s += "if(_x<0){_x=0;c->fpsr|=1ULL<<27;} ";
+                    s += "if(_x>(" + wide + ")UINT" + std::to_string(dbits) + "_MAX){_x=(" + wide + ")UINT" +
+                         std::to_string(dbits) + "_MAX;c->fpsr|=1ULL<<27;} ";
                 } else {
-                    s += "if(_x>(int64_t)INT" + std::to_string(dbits) + "_MAX) _x=(int64_t)INT" +
-                         std::to_string(dbits) + "_MAX; ";
+                    s += "if(_x>(int64_t)INT" + std::to_string(dbits) + "_MAX){_x=(int64_t)INT" +
+                         std::to_string(dbits) + "_MAX;c->fpsr|=1ULL<<27;} ";
                     s += "else if(_x<(int64_t)INT" + std::to_string(dbits) +
-                         "_MIN) _x=(int64_t)INT" + std::to_string(dbits) + "_MIN; ";
+                         "_MIN){_x=(int64_t)INT" + std::to_string(dbits) + "_MIN;c->fpsr|=1ULL<<27;} ";
                 }
                 s += "_r[_i]=(" + dty + ")_x; } ";
-                if (!Q) {
+                if (scalar || !Q) {
                     s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
                          std::to_string(rd) + "][1]=0; ";
                 }
                 s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rd) + "]+" +
-                     std::to_string(Q ? 8 : 0) + ",_r,8); }";
+                     std::to_string(!scalar && Q ? 8 : 0) + ",_r," +
+                     std::to_string(result_bytes) + "); }";
                 put(s);
                 return true;
             }
         }
     }
 
-    // SQADD / UQADD: add with saturation, and CMHI / CMHS: unsigned compares.
-    // All four are three-same ops separated by opcode and U.
-    if ((i & 0x9F20FC00) == 0x0E200C00 || (i & 0x9F20FC00) == 0x0E203400 ||
-        (i & 0x9F20FC00) == 0x0E203C00 || (i & 0x9F20FC00) == 0x0E208C00 ||
+    // CMGT / CMGE / CMHI / CMHS, register forms. Scalar forms only allow D.
+    if ((i & 0x9F20F400) == 0x0E203400 || (i & 0xDF20F400) == 0x5E203400) {
+        const bool scalar = (i & 0x10000000) != 0;
+        const bool Q = (i & 0x40000000) != 0, U = (i & 0x20000000) != 0;
+        const u32 size = (i >> 22) & 3;
+        if ((scalar && size == 3) || (!scalar && (size != 3 || Q))) {
+            const int bits = 8 << size, bytes = scalar ? 8 : (Q ? 16 : 8);
+            const int lanes = bytes * 8 / bits;
+            const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+            const std::string ty = std::string(U ? "uint" : "int") + std::to_string(bits) + "_t";
+            const std::string uty = "uint" + std::to_string(bits) + "_t";
+            const std::string op = (i & 0x800) ? ">=" : ">";
+            std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_b[" +
+                std::to_string(lanes) + "]; " + uty + " _r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(_a[_i]" +
+                op + "_b[_i])?(" + uty + ")~(" + uty + ")0:0; ";
+            s += "memset(c->vreg[" + std::to_string(rd) + "],0,16); memcpy(c->vreg[" +
+                std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // Saturating variable shifts use only the signed low byte of each shift
+    // lane. Right shifts never saturate; rounding belongs to that branch only.
+    if ((i & 0x8F20EC00) == 0x0E204C00) {
+        const bool scalar = (i & 0x10000000) != 0, Q = (i & 0x40000000) != 0;
+        const bool U = (i & 0x20000000) != 0, round = (i & 0x1000) != 0;
+        const u32 size = (i >> 22) & 3, rn = (i >> 5) & 31, rd = i & 31, rm = (i >> 16) & 31;
+        if ((!scalar || Q) && (scalar || Q || size != 3)) {
+            const int bits = 8 << size, bytes = scalar ? bits / 8 : Q ? 16 : 8;
+            const int lanes = bytes * 8 / bits;
+            const std::string ty = "uint" + std::to_string(bits) + "_t";
+            const std::string n = std::to_string(bits);
+            std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_b[" +
+                std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
+                ");memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";++_i){uint64_t _x=_a[_i],_z;int _sh=(int)(_b[_i]&255);if(_sh>=128)_sh-=256; ";
+            s += "if(_sh>=0){ ";
+            if (U) {
+                s += "if(_x&&(_sh>=" + n + "||_x>((uint64_t)UINT" + n + "_MAX>>_sh))){_z=UINT" + n + "_MAX;c->fpsr|=UINT64_C(1)<<27;}else _z=_sh>=" + n + "?0:_x<<_sh; ";
+            } else {
+                s += "uint64_t _sign=UINT64_C(1)<<" + std::to_string(bits - 1) + ";int _neg=(_x&_sign)!=0;uint64_t _mag=_neg?(" + ty + ")((uint64_t)0-_x):_x,_lim=_neg?_sign:_sign-1; ";
+                s += "if(_mag&&(_sh>=" + n + "||_mag>(_lim>>_sh))){_z=_neg?_sign:_sign-1;c->fpsr|=UINT64_C(1)<<27;}else _z=_sh>=" + n + "?0:_x<<_sh; ";
+            }
+            s += "}else{unsigned _rsh=(unsigned)-_sh; ";
+            if (U) {
+                s += "_z=_rsh>=" + n + "?0:_x>>_rsh; ";
+                if (round) s += "if(_rsh<=" + n + ")_z+=(_x>>(_rsh-1))&1; ";
+            } else {
+                s += "int _neg=(_x&(UINT64_C(1)<<" + std::to_string(bits - 1) + "))!=0; ";
+                s += "if(_rsh>=" + n + ")_z=" + std::string(round ? "0" : "_neg?UINT" + n + "_MAX:0") + ";else{_z=_x>>_rsh;if(_neg)_z|=UINT" + n + "_MAX^(UINT" + n + "_MAX>>_rsh); ";
+                if (round) s += "_z+=(_x>>(_rsh-1))&1; ";
+                s += "} ";
+            }
+            s += "}_r[_i]=(" + ty + ")_z;}memset(c->vreg[" + std::to_string(rd) + "],0,16);memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + ");}";
+            put(s);
+            return true;
+        }
+    }
+
+    // Saturating integer arithmetic. Carry/sign tests use unsigned values so
+    // even the 64-bit forms have no signed-overflow dependency. QC is sticky.
+    if ((i & 0x8F20DC00) == 0x0E200C00 ||
+        (i & 0x8F3FFC00) == 0x0E207800 ||
+        (i & 0x8F3FFC00) == 0x0E214800 ||
+        (i & 0xAF3FFC00) == 0x2E212800 ||
+        (i & 0x8F20FC00) == 0x0E20B400 ||
+        (i & 0xAF00E400) == 0x0F00C000) {
+        const bool scalar = (i & 0x10000000) != 0, Q = (i & 0x40000000) != 0;
+        const bool U = (i & 0x20000000) != 0;
+        const u32 size = (i >> 22) & 3, rn = (i >> 5) & 31, rd = i & 31;
+        const u32 rm = (i >> 16) & 31;
+        const bool binary = (i & 0x8F20DC00) == 0x0E200C00;
+        const bool unary = (i & 0x8F3FFC00) == 0x0E207800;
+        const bool indexed_mul = (i & 0xAF00E400) == 0x0F00C000;
+        const bool mul = (i & 0x8F20FC00) == 0x0E20B400 || indexed_mul;
+        const bool narrow = !binary && !unary && !mul;
+        const bool to_unsigned = narrow && (i & 0x2000) != 0;
+        if ((!scalar || Q) && (narrow ? size != 3 : mul ? (size == 1 || size == 2) :
+                              (scalar || Q || size != 3))) {
+            const int bits = 8 << size, sbits = narrow ? bits * 2 : bits;
+            const int bytes = scalar ? bits / 8 : narrow ? 8 : Q ? 16 : 8;
+            const int lanes = bytes * 8 / bits;
+            const std::string ty = "uint" + std::to_string(bits) + "_t";
+            const std::string sty = "uint" + std::to_string(sbits) + "_t";
+            std::string s = "{ " + sty + " _a[" + std::to_string(lanes) + "]; " + ty +
+                " _r[" + std::to_string(lanes) + "]; ";
+            if (binary || mul) s += ty + " _b[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," +
+                 std::to_string(lanes * sbits / 8) + "); ";
+            if (indexed_mul) {
+                const u32 index = (((i >> 11) & 1) << (size == 1 ? 2 : 1)) |
+                    (((i >> 21) & 1) << (size == 1 ? 1 : 0)) |
+                    (size == 1 ? ((i >> 20) & 1) : 0);
+                s += "for(int _j=0;_j<" + std::to_string(lanes) + ";++_j)memcpy(&_b[_j],(const uint8_t*)c->vreg[" +
+                    std::to_string(size == 1 ? rm & 15 : rm) + "]+" +
+                    std::to_string(index * bits / 8) + ",sizeof(_b[_j])); ";
+            } else if (binary || mul) s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";++_i){ uint64_t _z; ";
+            if (binary || unary || (narrow && U && !to_unsigned)) s += "uint64_t _x=_a[_i]; ";
+            const std::string sign = "(UINT64_C(1)<<" + std::to_string(bits - 1) + ")";
+            const std::string max = "UINT" + std::to_string(bits) + "_MAX";
+            if (binary) {
+                const bool sub = (i & 0x2000) != 0;
+                s += "uint64_t _y=_b[_i]; _z=(" + ty + ")(_x" + (sub ? "-" : "+") + "_y); ";
+                if (U) s += "if(" + std::string(sub ? "_x<_y" : "_z<_x") + "){_z=" + (sub ? "0" : max) + ";c->fpsr|=UINT64_C(1)<<27;} ";
+                else s += "if(((" + std::string(sub ? "_x^_y" : "~(_x^_y)") + ")&(_x^_z)&" + sign + ")!=0){_z=(_x&" + sign + ")?" + sign + ":" + sign + "-1;c->fpsr|=UINT64_C(1)<<27;} ";
+            } else if (unary) {
+                s += "_z=_x; if(_x==" + sign + "){_z=" + sign + "-1;c->fpsr|=UINT64_C(1)<<27;} else ";
+                s += U ? "_z=(uint64_t)0-_x; " : "if(_x&" + sign + ")_z=(uint64_t)0-_x; ";
+            } else if (narrow) {
+                if (U && !to_unsigned) s += "_z=_x;if(_z>" + max + "){_z=" + max + ";c->fpsr|=UINT64_C(1)<<27;} ";
+                else {
+                    s += "int" + std::to_string(sbits) + "_t _v;memcpy(&_v,&_a[_i],sizeof(_v)); ";
+                    const std::string hi = to_unsigned ? max : "INT" + std::to_string(bits) + "_MAX";
+                    const std::string lo = to_unsigned ? "0" : "INT" + std::to_string(bits) + "_MIN";
+                    s += "if(_v>" + hi + "){_z=" + hi + ";c->fpsr|=UINT64_C(1)<<27;}else if(_v<" + lo + "){_z=(uint64_t)(int64_t)(" + lo + ");c->fpsr|=UINT64_C(1)<<27;}else _z=(uint64_t)_v; ";
+                }
+            } else {
+                // The undoubled product fits int64_t, including S x S. Divide
+                // by 2^(bits-1) with explicit floor instead of shifting negatives.
+                s += "int" + std::to_string(bits) + "_t _sx,_sy;memcpy(&_sx,&_a[_i],sizeof(_sx));memcpy(&_sy,&_b[_i],sizeof(_sy));int64_t _p=(int64_t)_sx*_sy; ";
+                if (indexed_mul ? (i & 0x1000) != 0 : U) s += "_p+=INT64_C(1)<<" + std::to_string(bits - 2) + "; ";
+                s += "int64_t _d=INT64_C(1)<<" + std::to_string(bits - 1) + ",_v=_p/_d;if(_p<0&&_p%_d)--_v;if(_v>INT" + std::to_string(bits) + "_MAX){_v=INT" + std::to_string(bits) + "_MAX;c->fpsr|=UINT64_C(1)<<27;}_z=(uint64_t)_v; ";
+            }
+            s += "_r[_i]=(" + ty + ")_z;} ";
+            if (!(narrow && Q && !scalar)) s += "memset(c->vreg[" + std::to_string(rd) + "],0,16); ";
+            s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rd) + "]+" +
+                 std::to_string(narrow && Q && !scalar ? 8 : 0) + ",_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // Scalar D ADD/SUB and CMEQ/CMTST. Snapshot both sources for aliases.
+    if ((i & 0xDFE0F400) == 0x5EE08400) {
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const bool U = (i & 0x20000000) != 0, compare = (i & 0x800) != 0;
+        const std::string expr = compare ? (U ? "(_a==_b)?~0ULL:0" : "(_a&_b)?~0ULL:0")
+                                         : (U ? "_a-_b" : "_a+_b");
+        put("{ uint64_t _a=c->vreg[" + std::to_string(rn) + "][0],_b=c->vreg[" +
+            std::to_string(rm) + "][0]; c->vreg[" + std::to_string(rd) + "][0]=" + expr +
+            "; c->vreg[" + std::to_string(rd) + "][1]=0; }");
+        return true;
+    }
+
+    // Saturating adds, min/max, equality and bit-test comparisons.
+    if ((i & 0x9F20FC00) == 0x0E200C00 || (i & 0x9F20FC00) == 0x0E208C00 ||
         (i & 0x9F20FC00) == 0x0E206400 || (i & 0x9F20FC00) == 0x0E206C00) {
         const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
         const u32 size = (i >> 22) & 3, opcode = (i >> 11) & 0x1F;
@@ -1366,15 +1888,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 body = U ? ("_r[_i]=(_a[_i]==_b[_i])?(" + uty + ")~(" + uty + ")0:(" + uty + ")0;")
                          : ("_r[_i]=((_a[_i]&_b[_i])!=0)?(" + uty + ")~(" + uty + ")0:(" + uty +
                             ")0;");
-            } else if (opcode == 0x06 || opcode == 0x07) {
-                // CMHI is >, CMHS is >=; both unsigned, both U=1.
-                if (!U) {
-                    body.clear();
-                } else {
-                    const char* op = (opcode == 0x06) ? ">" : ">=";
-                    body = "_r[_i]=(_a[_i]" + std::string(op) + "_b[_i])?(" + uty + ")~(" + uty +
-                           ")0:(" + uty + ")0;";
-                }
             }
             if (!body.empty()) {
                 std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_b[" +
@@ -1394,26 +1907,74 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
-    // FADDP, vector: add adjacent pairs across the two sources.
-    if ((i & 0xBF20FC00) == 0x2E20D400) {
-        const u32 Q = (i >> 30) & 1;
-        const bool dbl = ((i >> 22) & 1) != 0;
-        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
-        const char* ct = dbl ? "double" : "float";
-        const int fsz = dbl ? 8 : 4;
-        const int bytes = Q ? 16 : 8;
-        const int lanes = bytes / fsz;
-        if (lanes >= 2) {
-            const int half = lanes / 2;
-            std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "],_b[" +
-                            std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
+    // Scalar/vector FADD/FSUB and pairwise FADDP share one exact FP-state core.
+    {
+        const bool scalar = (i & 0xFF20EC00) == 0x1E202800 && ((i >> 22) & 3) <= 1;
+        const bool vector = (i & 0xBF20FC00) == 0x0E20D400;
+        const bool scalar_pair = (i & 0xFFBFFC00) == 0x7E30D800;
+        const bool vector_pair = (i & 0xBFA0FC00) == 0x2E20D400;
+        const bool dbl=(i&0x00400000)!=0,q=(i&0x40000000)!=0;
+        if (scalar || scalar_pair || ((vector || vector_pair) && (!dbl || q))) {
+            const unsigned rd=i&31,rn=(i>>5)&31,rm=(i>>16)&31;
+            const unsigned lanes=scalar||scalar_pair?1:(q?16:8)/(dbl?8:4);
+            const bool sub=scalar?(i&0x1000)!=0:vector&&(i&0x800000)!=0;
+            const std::string ct=dbl?"uint64_t":"uint32_t",count=dbl?"2":"4";
+            put("{ "+ct+" _n["+count+"],_m["+count+"],_r["+count+"]={0};"
+                "memcpy(_n,c->vreg["+std::to_string(rn)+"],16);memcpy(_m,c->vreg["+std::to_string(rm)+"],16);");
+            for(unsigned e=0;e<lanes;++e) {
+                const std::string src=vector_pair&&e>=lanes/2?"_m":"_n";
+                const unsigned a=scalar_pair?0:vector_pair?2*(e%(lanes/2)):e;
+                const unsigned b=scalar_pair?1:vector_pair?a+1:e;
+                put("{uint64_t _a="+src+"["+std::to_string(a)+"],_b="+
+                    (scalar_pair||vector_pair?src:"_m")+"["+std::to_string(b)+"],_v=0;"+
+                    EmitFPAddSubValue(dbl,sub)+"_r["+std::to_string(e)+"]=("+ct+")_v;}");
+            }
+            put("memcpy(c->vreg["+std::to_string(rd)+"],_r,16);}");
+            return true;
+        }
+    }
+
+    // Integer pairwise add/min/max and min/max reductions. Snapshot both
+    // sources before writing so all register aliases remain valid.
+    {
+        const u32 pair = i & 0xBF20FC00;
+        const bool add = pair == 0x0E20BC00;
+        const bool extrema = (i & 0x9F20F400) == 0x0E20A400;
+        const bool reduction = (i & 0x9F3EFC00) == 0x0E30A800;
+        const bool scalar_add = (i & 0xFFFFFC00) == 0x5EF1B800;
+        const u32 Q = (i >> 30) & 1, size = (i >> 22) & 3;
+        if (scalar_add || ((add || extrema || reduction) &&
+            (size < 3 || (add && Q)) && !(reduction && size == 2 && !Q))) {
+            const u32 rn = (i >> 5) & 31, rm = (i >> 16) & 31, rd = i & 31;
+            const int esz = scalar_add ? 8 : 1 << size;
+            const int bytes = scalar_add ? 16 : Q ? 16 : 8;
+            const int lanes = bytes / esz;
+            const bool minimum = ((i >> (reduction ? 16 : 11)) & 1) != 0;
+            const bool uns = ((i >> 29) & 1) != 0;
+            const std::string ty = std::string((add || scalar_add || uns) ? "uint" : "int") +
+                                   std::to_string(esz * 8) + "_t";
+            std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_r[" +
+                std::to_string(lanes) + "]={0}; ";
+            if (!reduction && !scalar_add) s += ty + " _b[" + std::to_string(lanes) + "]; ";
             s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
-            s += "for(int _i=0;_i<" + std::to_string(half) + ";_i++){ _r[_i]=_a[2*_i]+_a[2*_i+1]; ";
-            s += "_r[" + std::to_string(half) + "+_i]=_b[2*_i]+_b[2*_i+1]; } ";
-            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                 "][1]=0; ";
-            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            if (reduction) {
+                s += "_r[0]=_a[0]; for(int _j=1;_j<" + std::to_string(lanes) +
+                     ";++_j) if(_a[_j]" + (minimum ? "<" : ">") + "_r[0]) _r[0]=_a[_j]; ";
+            } else if (scalar_add) {
+                s += "_r[0]=_a[0]+_a[1]; ";
+            } else {
+                s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+                s += "for(int _j=0;_j<" + std::to_string(lanes / 2) + ";++_j) { ";
+                for (const char* src : {"_a", "_b"}) {
+                    const std::string a = std::string(src) + "[2*_j]", b = std::string(src) + "[2*_j+1]";
+                    s += "_r[_j" + std::string(src[1] == 'b' ? "+" + std::to_string(lanes / 2) : "") + "]=";
+                    s += add ? "(" + ty + ")(" + a + "+" + b + "); " :
+                         a + (minimum ? "<" : ">") + b + "?" + a + ":" + b + "; ";
+                }
+                s += "} ";
+            }
+            s += "memset(c->vreg[" + std::to_string(rd) + "],0,16); memcpy(c->vreg[" +
+                 std::to_string(rd) + "],_r," + std::to_string(reduction || scalar_add ? esz : bytes) + "); }";
             put(s);
             return true;
         }
@@ -1604,7 +2165,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     // LD1-LD4 / ST1-ST4, whole registers. opcode says how many registers and
     // whether they are interleaved: LD2/3/4 spread consecutive elements across
     // the registers, while the LD1 forms are plain consecutive blocks.
-    if ((i & 0xBFBF0000) == 0x0C000000 || (i & 0xBF800000) == 0x0C800000) {
+    if ((i & 0xBFBF0000) == 0x0C000000 || (i & 0xBFA00000) == 0x0C800000) {
         const u32 Q = (i >> 30) & 1;
         const bool post = ((i >> 23) & 1) != 0;
         const bool load = ((i >> 22) & 1) != 0;
@@ -1624,28 +2185,27 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
         const int esz = 1 << size;
         const int bytes = Q ? 16 : 8;
-        // The 64-bit element has no 8-byte form: one element per register is
-        // not an addressing mode the architecture provides here.
-        const bool shaped = regs > 0 && !(size == 3 && !Q);
+        // The .1D arrangement exists only for the non-interleaved LD1/ST1 forms.
+        const bool shaped = regs > 0 && !(size == 3 && !Q && step != 1);
         if (shaped) {
             const int lanes = bytes / esz;
             const int bits = esz * 8;
             std::string s = "{ uint64_t _a=" + Xsp(rn) + "; uint64_t _v; ";
-            for (int e = 0; e < lanes; ++e) {
-                for (int r = 0; r < regs; ++r) {
-                    const int off = (step == 1) ? (r * bytes + e * esz)
-                                                : ((e * regs + r) * esz);
-                    const std::string vr = std::to_string((rt + (u32)r) & 31);
-                    const std::string lane = std::to_string(e * esz);
-                    if (load) {
-                        s += "_v=recomp_load" + std::to_string(bits) + "(c,_a+" +
-                             std::to_string(off) + "); memcpy((uint8_t*)c->vreg[" + vr + "]+" +
-                             lane + ",&_v," + std::to_string(esz) + "); ";
-                    } else {
-                        s += "_v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + vr + "]+" + lane + "," +
-                             std::to_string(esz) + "); recomp_store" + std::to_string(bits) +
-                             "(c,_a+" + std::to_string(off) + ",_v); ";
-                    }
+            // Emit in ascending memory order, including non-interleaved LD1/ST1.
+            for (int k = 0; k < lanes * regs; ++k) {
+                const int e = step == 1 ? k % lanes : k / regs;
+                const int r = step == 1 ? k / lanes : k % regs;
+                const std::string off = std::to_string(k * esz);
+                const std::string vr = std::to_string((rt + (u32)r) & 31);
+                const std::string lane = std::to_string(e * esz);
+                if (load) {
+                    s += "_v=recomp_load" + std::to_string(bits) + "(c,_a+" +
+                         off + "); memcpy((uint8_t*)c->vreg[" + vr + "]+" +
+                         lane + ",&_v," + std::to_string(esz) + "); ";
+                } else {
+                    s += "_v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + vr + "]+" + lane + "," +
+                         std::to_string(esz) + "); recomp_store" + std::to_string(bits) +
+                         "(c,_a+" + off + ",_v); ";
                 }
             }
             if (load && !Q) {
@@ -1754,21 +2314,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
-    // FADDP, scalar: add the two lanes of the source together.
-    if ((i & 0xFFBFFC00) == 0x7E30D800) {
-        const bool dbl = ((i >> 22) & 1) != 0;
-        const u32 rn = (i >> 5) & 31, rd = i & 31;
-        const char* ct = dbl ? "double" : "float";
-        const int fsz = dbl ? 8 : 4;
-        std::string s = "{ " + std::string(ct) + " _a[2],_r; memcpy(_a,c->vreg[" +
-                        std::to_string(rn) + "]," + std::to_string(fsz * 2) + "); ";
-        s += "_r=_a[0]+_a[1]; c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
-             std::to_string(rd) + "][1]=0; ";
-        s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," + std::to_string(fsz) + "); }";
-        put(s);
-        return true;
-    }
-
     // BSL / BIT / BIF: bitwise select. All three are the same operation with a
     // different choice of which register supplies the mask and which the
     // destination, so size picks the variant rather than an element width.
@@ -1841,51 +2386,56 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         return true;
     }
 
-    // LD1 / ST1, one element. Unlike most vector loads this leaves the rest of
-    // the register alone, so the destination is not zeroed. Bit 23 selects the
-    // post-index form, where Rm of 31 means "advance by the element size" and
-    // anything else names a register to advance by.
-    if ((i & 0xBF200000) == 0x0D000000) {
+    // LD1-LD4 / ST1-ST4, one element per register, preserving every other lane.
+    // Bit 23 selects post-index; Rm=31 advances by the structure's byte size.
+    // Other Rm values name a register containing the increment.
+    if ((i & 0xBF000000) == 0x0D000000) {
         const u32 Q = (i >> 30) & 1;
         const bool post = ((i >> 23) & 1) != 0;
         const bool load = ((i >> 22) & 1) != 0;
         const u32 rm = (i >> 16) & 31;
         const u32 opcode = (i >> 13) & 7, S = (i >> 12) & 1, size = (i >> 10) & 3;
         const u32 rn = (i >> 5) & 31, rt = i & 31;
+        const u32 regs = (((opcode & 1) << 1) | ((i >> 21) & 1)) + 1;
         int esz = 0, index = 0;
         bool shaped = true;
-        if (opcode == 0) {
+        if ((opcode >> 1) == 0) {
             esz = 1;
             index = (int)((Q << 3) | (S << 2) | size);
-        } else if (opcode == 2 && (size & 1) == 0) {
+        } else if ((opcode >> 1) == 1 && (size & 1) == 0) {
             esz = 2;
             index = (int)((Q << 2) | (S << 1) | (size >> 1));
-        } else if (opcode == 4 && size == 0) {
+        } else if ((opcode >> 1) == 2 && size == 0) {
             esz = 4;
             index = (int)((Q << 1) | S);
-        } else if (opcode == 4 && size == 1 && S == 0) {
+        } else if ((opcode >> 1) == 2 && size == 1 && S == 0) {
             esz = 8;
             index = (int)Q;
         } else {
-            shaped = false;   // LD2/LD3/LD4 and the replicating forms
+            shaped = false;   // Reserved shapes and the replicating forms below.
         }
         // Only the no-offset form may have a register field of zero meaning
         // "no offset"; in the post-index form that field is Rm.
         if (shaped && (post || rm == 0)) {
             const int bits = esz * 8;
             std::string s = "{ uint64_t _a=" + Xsp(rn) + "; ";
-            if (load) {
-                s += "uint64_t _v=recomp_load" + std::to_string(bits) + "(c,_a); ";
-                s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rt) + "]+" +
-                     std::to_string(index * esz) + ",&_v," + std::to_string(esz) + "); ";
-            } else {
-                s += "uint64_t _v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + std::to_string(rt) +
-                     "]+" + std::to_string(index * esz) + "," + std::to_string(esz) + "); ";
-                s += "recomp_store" + std::to_string(bits) + "(c,_a,_v); ";
+            for (u32 r = 0; r < regs; ++r) {
+                const std::string vr = std::to_string((rt + r) & 31);
+                const std::string addr = "_a+" + std::to_string(r * esz);
+                if (load) {
+                    s += "{ uint64_t _v=recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
+                    s += "memcpy((uint8_t*)c->vreg[" + vr + "]+" +
+                         std::to_string(index * esz) + ",&_v," + std::to_string(esz) + "); ";
+                } else {
+                    s += "{ uint64_t _v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + vr +
+                         "]+" + std::to_string(index * esz) + "," + std::to_string(esz) + "); ";
+                    s += "recomp_store" + std::to_string(bits) + "(c," + addr + ",_v); ";
+                }
+                s += "} ";
             }
             if (post) {
                 const std::string step =
-                    (rm == 31) ? (std::to_string(esz) + "ULL") : ("c->x[" + std::to_string(rm) + "]");
+                    (rm == 31) ? (std::to_string(regs * esz) + "ULL") : ("c->x[" + std::to_string(rm) + "]");
                 s += "c->x[" + std::to_string(rn) + "]=_a+" + step + "; ";
             }
             s += "}";
@@ -2040,41 +2590,36 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
-    // USHL / SSHL: shift each lane by the signed low byte of the corresponding
-    // lane of Rm - positive shifts left, negative shifts right. Bits 15..11 are
-    // pinned because UQSHL (01001) and URSHL (01010) sit immediately next to
-    // this encoding and saturate or round instead.
-    if ((i & 0x9F20FC00) == 0x0E204400) {
+    // USHL/SSHL and URSHL/SRSHL, vector and scalar D. Only Rm's signed low
+    // byte controls the shift. Saturating neighboring opcodes remain separate.
+    if ((i & 0x8F20EC00) == 0x0E204400) {
         const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const bool scalar = (i & 0x10000000) != 0, round = (i & 0x1000) != 0;
         const u32 size = (i >> 22) & 3;
         const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
         const int esz = 1 << size;
         const int ebits = esz * 8;
-        const int bytes = Q ? 16 : 8;
-        // The 64-bit element only exists as 2D; 1D is the scalar encoding.
-        if (!(size == 3 && !Q)) {
+        const int bytes = scalar ? 8 : Q ? 16 : 8;
+        if (scalar ? Q && size == 3 : !(size == 3 && !Q)) {
             const int lanes = bytes / esz;
             const std::string uty = "uint" + std::to_string(ebits) + "_t";
-            const std::string ity = "int" + std::to_string(ebits) + "_t";
             const std::string eb = std::to_string(ebits);
             std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_m[" +
                             std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
             s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
             s += "memcpy(_m,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
             s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ ";
-            s += "int _s=(int)(int8_t)(_m[_i]&0xFF); ";
+            s += "int _s=(int)(_m[_i]&0xFF); if(_s>=128) _s-=256; uint64_t _v=_a[_i],_z; ";
             // A shift of the element width or more is defined by the
             // architecture but undefined in C, so both ends are special-cased.
-            s += "if(_s>=0) _r[_i]=(_s>=" + eb + ")?(" + uty + ")0:(" + uty + ")((" + uty +
-                 ")_a[_i]<<_s); ";
+            s += "if(_s>=0) _z=(_s>=" + eb + ")?0:(_v<<_s); ";
             s += "else { int _t=-_s; ";
-            if (U) {
-                s += "_r[_i]=(_t>=" + eb + ")?(" + uty + ")0:(" + uty + ")(_a[_i]>>_t); ";
-            } else {
-                s += "_r[_i]=(" + uty + ")((" + ity + ")_a[_i]>>((_t>=" + eb + ")?(" + eb +
-                     "-1):_t)); ";
-            }
-            s += "} } ";
+            s += "if(_t>" + eb + ") _z=" +
+                 std::string(round || U ? "0" : "(_v>>(" + eb + "-1))?~0ULL:0") + "; ";
+            s += "else { _z=(_t==64)?0:(_v>>_t); ";
+            if (!U) s += "if(_v>>(" + eb + "-1)) _z|=~0ULL<<(" + eb + "-_t); ";
+            if (round) s += "_z+=(_v>>(_t-1))&1; ";
+            s += "} } _r[_i]=(" + uty + ")_z; } ";
             s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                  "][1]=0; ";
             s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
@@ -2084,7 +2629,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     }
 
     // SHL by immediate. Bit 29 is U and must stay in the mask: the same opcode
-    // with U set is UQSHL, which saturates. immh selects the element width and
+    // with U set is SLI, handled above. immh selects the element width and
     // immh:immb encodes the shift as a bias above it.
     // Off deliberately, and measured. Enabling this frees the hot block that also
     // contains MOVI - transitions drop 47% - and costs 2.13 ms/frame against
@@ -2125,10 +2670,9 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
-    // MOVI / MVNI: materialise an immediate into a vector register. The same
-    // encoding with cmode<0> set (below cmode 1100) is ORR/BIC immediate, which
-    // reads the destination instead of replacing it - those fall through.
-    if ((i & 0x9FF80400) == 0x0F000400) {
+    // MOVI/MVNI and ORR/BIC modified immediates. Odd cmode below 1100 reads
+    // and combines with the destination; other forms replace it. o2 is zero.
+    if ((i & 0x9FF80C00) == 0x0F000400) {
         const u32 Q = (i >> 30) & 1, op = (i >> 29) & 1;
         const u32 cmode = (i >> 12) & 15;
         const u32 imm8 = ((((i >> 16) & 7) << 5) | ((i >> 5) & 31)) & 0xFF;
@@ -2136,10 +2680,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 hi3 = cmode >> 1;
         bool ok = true;
         u64 imm64 = 0;
-        if (hi3 <= 3 && (cmode & 1) == 0) {
+        if (hi3 <= 3) {
             const u64 v = (u64)imm8 << (8 * hi3);
             imm64 = (v << 32) | v;
-        } else if ((hi3 == 4 || hi3 == 5) && (cmode & 1) == 0) {
+        } else if (hi3 == 4 || hi3 == 5) {
             const u64 h = ((u64)imm8 << (8 * (hi3 - 4))) & 0xFFFF;
             imm64 = (h << 48) | (h << 32) | (h << 16) | h;
         } else if (hi3 == 6) {
@@ -2175,42 +2719,47 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 ok = false;
             }
         } else {
-            ok = false;   // the ORR/BIC immediate forms
+            ok = false;
         }
         if (ok) {
             // MVNI inverts, but cmode 1110 is MOVI in both op encodings.
             if (op == 1 && cmode < 14) imm64 = ~imm64;
             char lo[32];
             snprintf(lo, sizeof lo, "0x%llxULL", (unsigned long long)imm64);
-            put("c->vreg[" + std::to_string(rd) + "][0]=" + lo + "; c->vreg[" +
-                std::to_string(rd) + "][1]=" + (Q ? std::string(lo) : std::string("0")) + ";");
+            const bool combine = cmode < 12 && (cmode & 1);
+            const std::string assignment = combine ? (op ? "&=" : "|=") : "=";
+            put("c->vreg[" + std::to_string(rd) + "][0]" + assignment + lo + "; c->vreg[" +
+                std::to_string(rd) + "][1]" + (Q ? assignment + lo : "=0") + ";");
             return true;
         }
     }
 
-    // LD1R: load one element and replicate it across every lane. Bit 21 is R,
-    // which selects LD2R/LD4R - those write a second register and must stay on
-    // the fallback, so it has to be in the mask.
-    if ((i & 0xBFFFF000) == 0x0D40C000 || (i & 0xBFE0F000) == 0x0DC0C000) {
+    // LD1R-LD4R: load consecutive elements and replicate each into its register.
+    // R and opcode<0> select the structure count; S must be zero.
+    if ((i & 0xBFDFD000) == 0x0D40C000 || (i & 0xBFC0D000) == 0x0DC0C000) {
         const u32 Q = (i >> 30) & 1;
         const bool post = ((i >> 23) & 1) != 0;
         const u32 rm = (i >> 16) & 31;
         const u32 size = (i >> 10) & 3;
         const u32 rn = (i >> 5) & 31, rt = i & 31;
+        const u32 regs = ((((i >> 13) & 1) << 1) | ((i >> 21) & 1)) + 1;
         const int esz = 1 << size;
         const int bytes = Q ? 16 : 8;
         const int lanes = bytes / esz;
         const std::string uty = "uint" + std::to_string(esz * 8) + "_t";
-        std::string s = "{ uint64_t _a=" + Xsp(rn) + "; " + uty + " _e = (" + uty +
-                        ")recomp_load" + std::to_string(esz * 8) + "(c,_a); ";
-        s += uty + " _r[" + std::to_string(lanes) + "]; ";
-        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_e; ";
-        s += "c->vreg[" + std::to_string(rt) + "][0]=0; c->vreg[" + std::to_string(rt) +
-             "][1]=0; ";
-        s += "memcpy(c->vreg[" + std::to_string(rt) + "],_r," + std::to_string(bytes) + "); ";
+        std::string s = "{ uint64_t _a=" + Xsp(rn) + "; ";
+        for (u32 r = 0; r < regs; ++r) {
+            const std::string vr = std::to_string((rt + r) & 31);
+            s += "{ " + uty + " _e = (" + uty + ")recomp_load" +
+                 std::to_string(esz * 8) + "(c,_a+" + std::to_string(r * esz) + "); ";
+            s += uty + " _r[" + std::to_string(lanes) + "]; ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_e; ";
+            s += "c->vreg[" + vr + "][0]=0; c->vreg[" + vr + "][1]=0; ";
+            s += "memcpy(c->vreg[" + vr + "],_r," + std::to_string(bytes) + "); } ";
+        }
         if (post) {
             const std::string step =
-                (rm == 31) ? (std::to_string(esz) + "ULL") : ("c->x[" + std::to_string(rm) + "]");
+                (rm == 31) ? (std::to_string(regs * esz) + "ULL") : ("c->x[" + std::to_string(rm) + "]");
             s += "c->x[" + std::to_string(rn) + "]=_a+" + step + "; ";
         }
         s += "}";
@@ -2470,6 +3019,21 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 sys_crm = (i >> 8) & 0xF;
         const u32 sys_op2 = (i >> 5) & 7;
 
+        // DC ZVA. The host config reports DCZID_EL0=4: 16 words, or 64 bytes.
+        // The operand may point anywhere within that naturally aligned block.
+        // Use guest-memory helpers so hosted writes retain normal translation.
+        if (sys_op1 == 3 && sys_crn == 7 && sys_crm == 4 && sys_op2 == 1) {
+            put("{ uint64_t _base=" + Xz(i & 31) +
+                "&~UINT64_C(63); for(unsigned _off=0;_off<64;_off+=8) "
+                "recomp_store64(c,_base+_off,UINT64_C(0)); }");
+            return true;
+        }
+
+        if ((i & 0xFFFFFFE0) == 0xD50B7520) {
+            snprintf(buf, sizeof buf, "c->pc=g_module_base+0x%llxULL; ", (unsigned long long)pc);
+            put(std::string(buf) + "recomp_ic_ivau(c," + Xz(i & 31) + ",g_recomp_guard_host_v2); return;");
+            return false;
+        }
         // Data cache clean / invalidate by VA: DC CVAC, CVAU, CVAP, CVADP,
         // CIVAC. Guest memory is host memory here with no emulated cache
         // hierarchy, so there is nothing to write back or discard.
@@ -2479,9 +3043,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         // fallback JIT compiles these to nothing. Emitting nothing matches the
         // other engine exactly.
         //
-        // Deliberately narrow. Two neighbours in the same CRn=7 space must keep
-        // falling back:
-        //   DC ZVA (CRm=4)  zeroes a cache line - a real memory write.
+        // Deliberately narrow. DC ZVA above writes memory, whereas the
+        // following neighbour requires instruction-cache handling:
         //   IC IVAU (CRm=5) invalidates the instruction cache, which suyu does
         //                   act on (InvalidateCacheRange, then halts the JIT).
         const bool is_dc_clean_invalidate =
@@ -2491,7 +3054,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             put("/* dc clean/invalidate: no cache to maintain */");
             return true;
         }
-        // Everything else in this space - DC ZVA, the IC family, AT, TLBI -
+        // Everything else in this space - the IC family, AT, TLBI -
         // goes to the fallback engine.
     }
     if ((i & 0xFFF00000) == 0xD5300000 || (i & 0xFFF00000) == 0xD5100000) {
@@ -2626,6 +3189,518 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // Scalar S/D register FP comparisons. Ordered comparisons signal every
+    // NaN; equality signals only sNaN. Baseline FZ/IDC, no host FP operations.
+    {
+        const u32 key = i & 0xFF20FC00;
+        const bool eq = key == 0x5E20E400 && !(i & 0x00800000);
+        const bool ordered = key == 0x7E20E400;
+        if (eq || ordered) {
+            const bool dbl = (i & 0x00400000) != 0, gt = (i & 0x00800000) != 0;
+            const unsigned rd=i&31,rn=(i>>5)&31,rm=(i>>16)&31;
+            const std::string ct=dbl?"uint64_t":"uint32_t",sz=dbl?"8":"4";
+            put("{ "+ct+" _aa,_bb;memcpy(&_aa,c->vreg["+std::to_string(rn)+"],"+sz+
+                ");memcpy(&_bb,c->vreg["+std::to_string(rm)+"],"+sz+
+                ");uint64_t _a=_aa,_b=_bb,_r=0;const uint64_t _sign="+
+                (dbl?"0x8000000000000000ULL":"0x80000000ULL")+",_exp="+
+                (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_frac="+
+                (dbl?"0xfffffffffffffULL":"0x7fffffULL")+",_quiet="+
+                (dbl?"0x8000000000000ULL":"0x400000ULL")+";"
+                "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
+                "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
+                "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+                "if(_an||_bn) { if("+std::string(eq?"(_an&&!(_a&_quiet))||(_bn&&!(_b&_quiet))":"1")+
+                ")c->fpsr|=1; }else {int _equal=_a==_b||!((_a|_b)&~_sign);"
+                "int _greater=!_equal&&(((_a^_b)&_sign)?!(_a&_sign):((_a&_sign)?_a<_b:_a>_b));"
+                "(void)_quiet;(void)_greater; if("+std::string(eq?"_equal":gt?"_greater":"_equal||_greater")+
+                ")_r="+(dbl?"UINT64_MAX":"UINT32_MAX")+";}c->vreg["+std::to_string(rd)+
+                "][0]=_r;c->vreg["+std::to_string(rd)+"][1]=0;}");
+            return true;
+        }
+    }
+
+    // Scalar FRECPS/FRSQRTS S/D, evaluated exactly before one rounding.
+    // A fixed multiword product lattice covers every finite input exponent.
+    // This deliberately favors correctness over speed; no host fma or
+    // intermediate halve can introduce double rounding. Baseline FP modes
+    // only: exception/access trap delivery and FEAT_AFP remain unsupported.
+    if ((i & 0xFF20FC00) == 0x5E20FC00) {
+        const bool dbl=(i&0x00400000)!=0,half=(i&0x00800000)!=0;
+        const unsigned rd=i&31,rn=(i>>5)&31,rm=(i>>16)&31;
+        const std::string ct=dbl?"uint64_t":"uint32_t",sz=dbl?"8":"4";
+        put("{ "+ct+" _aa,_bb;memcpy(&_aa,c->vreg["+std::to_string(rn)+"],"+sz+
+            ");memcpy(&_bb,c->vreg["+std::to_string(rm)+"],"+sz+
+            ");const unsigned _f="+(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+
+            ",_count="+(dbl?"67":"9")+";const int _base="+
+            std::to_string((dbl?-2148:-298)-(half?1:0))+";"
+            "const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
+            (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
+            (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
+            // FPNeg precedes NaN processing in the architectural pseudocode.
+            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
+            "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
+            "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
+            "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+            "if(_an||_bn) {int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+            "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs) {c->fpsr|=1;}"
+            "if(c->fpcr&(1ULL<<25)) {_v=_exp|_quiet;}}"
+            "else if(((_a&_exp)==_exp&&!(_b&~_sign))||((_b&_exp)==_exp&&!(_a&~_sign)))"
+            "_v="+(dbl?(half?"0x3ff8000000000000ULL":"0x4000000000000000ULL"):
+                         (half?"0x3fc00000ULL":"0x40000000ULL"))+";"
+            "else if((_a&_exp)==_exp||(_b&_exp)==_exp)_v=_exp|((_a^_b)&_sign);"
+            "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
+            "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
+            "uint64_t _p["+std::string(dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};"
+            "uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;"
+            "uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);"
+            "uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;"
+            "unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;"
+            "_p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);"
+            "if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);"
+            "unsigned _bit="+std::string(dbl?"2149":"299")+";_c[_bit/64]|=1ULL<<(_bit%64);");
+        if(half)put("--_bit;_c[_bit/64]|=1ULL<<(_bit%64);");
+        put("unsigned _negative=0;"
+            "if((_a^_b)&_sign) {int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k)"
+            "{if(_p[_k]!=_c[_k]) {_compare=_p[_k]>_c[_k]?1:-1;break;}}"
+            "_negative=_compare>0;uint64_t _borrow=0;for(unsigned _k=0;_k<_count;++_k)"
+            "{uint64_t _left=_negative?_p[_k]:_c[_k],_right=_negative?_c[_k]:_p[_k];"
+            "uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);"
+            "_p[_k]=_diff-_borrow;_borrow=_next;}}"
+            "else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k)"
+            "{uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];"
+            "uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}"
+            "int _top=(int)(_count*64)-1;while(_top>=0&&!((_p[(unsigned)_top/64]>>(_top%64))&1))--_top;"
+            "if(_top<0)_v=_mode==2?_sign:0;else {int _e=_top+_base,_emin=1-(int)_bias;"
+            "if(_e<_emin&&(c->fpcr&(1ULL<<24))) {c->fpsr|=8;_v=_negative?_sign:0;}"
+            "else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;"
+            "unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;"
+            "uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);"
+            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1),_sticky=0;"
+            "for(int _k=0;_k<_cut-1;++_k)_sticky|=(unsigned)((_p[(unsigned)_k/64]>>(_k%64))&1);"
+            "unsigned _lost=_roundbit|_sticky;if(_lost) {c->fpsr|=16;if(_e<_emin)c->fpsr|=8;"
+            "if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}"
+            "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
+            "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
+            "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
+            "if(_negative)_v|=_sign;}}}c->vreg["+std::to_string(rd)+"][0]=_v;c->vreg["+
+            std::to_string(rd)+"][1]=0;}");
+        return true;
+    }
+
+    // FSQRT vector and FABD vector/scalar, S/D. Integer significands make
+    // rounding independent of host FP modes. Baseline DN/FZ/RMode and FPSR
+    // flags are supported; FP access/exception traps and FEAT_AFP are not.
+    {
+        const bool sqrt_vec = (i & 0xBFBFFC00) == 0x2EA1F800;
+        const bool abd_vec = (i & 0xBFA0FC00) == 0x2EA0D400;
+        const bool abd_scalar = (i & 0xFFA0FC00) == 0x7EA0D400;
+        const bool dbl = ((i >> 22) & 1) != 0;
+        const bool q = ((i >> 30) & 1) != 0;
+        if (((sqrt_vec || abd_vec) && (!dbl || q)) || abd_scalar) {
+            const unsigned rd = i & 31, rn = (i >> 5) & 31, rm = (i >> 16) & 31;
+            const unsigned lanes = abd_scalar ? 1 : (q ? 16 : 8) / (dbl ? 8 : 4);
+            const std::string ct = dbl ? "uint64_t" : "uint32_t";
+            put("{ " + ct + " _n[" + std::string(dbl ? "2" : "4") + "],_m[" +
+                (dbl ? "2" : "4") + "],_r[" + (dbl ? "2" : "4") +
+                "]={0}; memcpy(_n,c->vreg[" + std::to_string(rn) +
+                "],16); memcpy(_m,c->vreg[" + std::to_string(rm) + "],16);");
+            put("for(unsigned _lane=0;_lane<" + std::to_string(lanes) +
+                ";++_lane) { uint64_t _a=_n[_lane],_b=" +
+                std::string(sqrt_vec ? "0" : "_m[_lane]") + ",_v=0;"
+                " const unsigned _f=" + (dbl ? "52" : "23") + "; const uint64_t _hidden=1ULL<<_f,"
+                " _frac=_hidden-1,_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+                ",_sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
+                ",_quiet=_hidden>>1; " + std::string(sqrt_vec ? "unsigned _mode=(unsigned)(c->fpcr>>22)&3;" : "") +
+                " if(c->fpcr&(1ULL<<24)) {"
+                " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign;c->fpsr|=128; }"
+                " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign;c->fpsr|=128; } }"
+                " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+                " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+                " if(_an||_bn) { _v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;"
+                " if(_as||_bs) { c->fpsr|=1; } if(c->fpcr&(1ULL<<25)) { _v=_exp|_quiet; } }");
+            if (sqrt_vec) {
+                put("else if(!(_a&~_sign))_v=_a;"
+                    " else if(_a&_sign) { _v=_exp|_quiet;c->fpsr|=1; }"
+                    " else if((_a&_exp)==_exp)_v=_a;"
+                    " else { const int _bias=" + std::string(dbl ? "1023" : "127") +
+                    "; uint64_t _magnitude=_a&_frac;"
+                    " int _e=(int)((_a&_exp)>>_f)-(int)_bias;"
+                    " if(_a&_exp)_magnitude|=_hidden; else { ++_e;"
+                    " while(_magnitude<_hidden) { _magnitude<<=1;--_e; } }"
+                    " if(_e%2) { _magnitude<<=1;--_e; }"
+                    // Restoring square root of magnitude * 2^fraction_bits.
+                    // The radicand can exceed 64 bits, but only two bits are
+                    // consumed each step; root and remainder fit uint64_t.
+                    " uint64_t _root=0,_rem=0;"
+                    " for(int _k=(int)_f;_k>=0;--_k) { int _shift=2*_k-(int)_f;"
+                    " uint64_t _pair=(_shift>=0?_magnitude>>_shift:_magnitude<<(-_shift))&3;"
+                    " _rem=(_rem<<2)|_pair;uint64_t _trial=(_root<<2)|1;_root<<=1;"
+                    " if(_rem>=_trial) { _rem-=_trial;_root|=1; } }"
+                    " if(_rem) { c->fpsr|=16;"
+                    " if(_mode==1||(_mode==0&&_rem>_root))++_root; }"
+                    " _e=_e/2+(int)_bias;"
+                    " if(_root>=(_hidden<<1)) { _root>>=1;++_e; }"
+                    " _v=((uint64_t)_e<<_f)|(_root&_frac); }");
+            } else {
+                put("else " + EmitFPAddSubValue(dbl, true));
+            }
+            put("_r[_lane]=(" + ct + ")(_v" + (sqrt_vec ? std::string("") : "&~_sign") +
+                "); } memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
+            return true;
+        }
+    }
+
+    // SIMD S/D min/max: Arm FPMin/FPMax/FPMinNum/FPMaxNum, with bitwise
+    // ordering so host NaN, signed-zero and denormal modes cannot intervene.
+    // Implements baseline FPCR.DN/FZ and cumulative FPSR.IOC/IDC. FP exception
+    // trap delivery and later FEAT_AFP modes are not implemented here.
+    {
+        const u32 vec_key = i & 0x9F20FC00;
+        const u32 pair_key = i & 0xFF3FFC00;
+        const u32 reduce_key = i & 0xFF7FFC00;
+        const bool vec = vec_key == 0x0E20F400 || vec_key == 0x0E20C400;
+        const bool scalar_pair = pair_key == 0x7E30F800 || pair_key == 0x7E30C800;
+        const bool reduce = reduce_key == 0x6E30F800 || reduce_key == 0x6E30C800;
+        const bool dbl = ((i >> 22) & 1) != 0;
+        const bool q = ((i >> 30) & 1) != 0;
+        if ((vec && (!dbl || q)) || scalar_pair || reduce) {
+            const bool minimum = ((i >> 23) & 1) != 0;
+            const bool numeric = ((i >> 12) & 3) == 0;
+            const bool pair = vec && ((i >> 29) & 1);
+            const u32 rn = (i >> 5) & 31, rm = (i >> 16) & 31, rd = i & 31;
+            const unsigned lanes = dbl ? 2 : 4;
+            const unsigned active = q ? lanes : lanes / 2;
+            const std::string ct = dbl ? "uint64_t" : "uint32_t";
+            put("{ " + ct + " _n[" + std::to_string(lanes) + "],_m[" +
+                std::to_string(lanes) + "],_r[" + std::to_string(lanes) +
+                "]={0}; memcpy(_n,c->vreg[" + std::to_string(rn) +
+                "],16); memcpy(_m,c->vreg[" + std::to_string(rm) + "],16);");
+            const auto element = [](const char* array, unsigned e) {
+                return std::string(array) + "[" + std::to_string(e) + "]";
+            };
+            const auto emit_pair = [&](const std::string& a, const std::string& b,
+                                       const std::string& dest) {
+                put("{ uint64_t _a=" + a + ",_b=" + b + ",_v; const uint64_t _sign=" +
+                    (dbl ? std::string("0x8000000000000000ULL") : "0x80000000ULL") +
+                    ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+                    ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+                    ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";");
+                put("if(c->fpcr & (1ULL<<24)) {"
+                    " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
+                    " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }");
+                put("{ int _an=(_a&_exp)==_exp&&(_a&_frac),"
+                    " _bn=(_b&_exp)==_exp&&(_b&_frac);"
+                    " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+                    " if(_as||_bs) { c->fpsr|=1; _v=(_as?_a:_b)|_quiet; }");
+                if (numeric) {
+                    put("else if(_an&&!_bn) _v=_b; else if(_bn&&!_an) _v=_a;");
+                }
+                put("else if(_an||_bn) _v=(_an?_a:_b)|_quiet;"
+                    " else if(!((_a|_b)&~_sign)) _v=" +
+                    std::string(minimum ? "(_a|_b)" : "(_a&_b)") + ";"
+                    " else { int _less=((_a^_b)&_sign)?!!(_a&_sign):"
+                    " ((_a&_sign)?_a>_b:_a<_b); _v=" +
+                    std::string(minimum ? "(_less?_a:_b)" : "(_less?_b:_a)") + "; }");
+                put("if((c->fpcr&(1ULL<<25))&&((_v&_exp)==_exp)&&(_v&_frac))"
+                    " { _v=_exp|_quiet; } " + dest + "=(" + ct + ")_v; } }");
+            };
+            if (reduce) {
+                // Architectural reduction is a balanced tree, not a left fold:
+                // the distinction affects signaling/quiet NaN selection.
+                emit_pair("_n[0]", "_n[1]", "_n[0]");
+                emit_pair("_n[2]", "_n[3]", "_n[2]");
+                emit_pair("_n[0]", "_n[2]", "_r[0]");
+            } else if (scalar_pair) {
+                emit_pair("_n[0]", "_n[1]", "_r[0]");
+            } else {
+                for (unsigned e = 0; e < active; ++e) {
+                    const char* source = e < active / 2 ? "_n" : "_m";
+                    emit_pair(pair ? element(source, 2 * (e % (active / 2))) : element("_n", e),
+                              pair ? element(source, 2 * (e % (active / 2)) + 1) : element("_m", e),
+                              element("_r", e));
+                }
+            }
+            put("memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
+            return true;
+        }
+    }
+
+    // Absolute FP comparisons. IEEE magnitudes order as unsigned integers;
+    // both quiet and signaling NaNs raise IOC for ordered GE/GT comparisons.
+    {
+        const bool scalar = (i & 0xFF20FC00) == 0x7E20EC00;
+        const bool vector = (i & 0xBF20FC00) == 0x2E20EC00;
+        const bool dbl = (i & (1U << 22)) != 0, q = (i & (1U << 30)) != 0;
+        if (scalar || (vector && (!dbl || q))) {
+            const unsigned rd=i&31, rn=(i>>5)&31, rm=(i>>16)&31;
+            const unsigned lanes=dbl?2:4, active=scalar?1:q?lanes:lanes/2;
+            const std::string ct=dbl?"uint64_t":"uint32_t";
+            put("{ " + ct + " _n[" + std::to_string(lanes) + "],_m[" +
+                std::to_string(lanes) + "],_r[" + std::to_string(lanes) +
+                "]={0}; memcpy(_n,c->vreg[" + std::to_string(rn) +
+                "],16); memcpy(_m,c->vreg[" + std::to_string(rm) + "],16);");
+            put("for(unsigned _j=0;_j<" + std::to_string(active) + ";++_j) {"
+                " uint64_t _a=_n[_j]&" + std::string(dbl?"0x7fffffffffffffffULL":"0x7fffffffULL") +
+                ",_b=_m[_j]&" + (dbl?"0x7fffffffffffffffULL":"0x7fffffffULL") +
+                "; const uint64_t _exp=" + (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL") +
+                ",_min=" + (dbl?"0x10000000000000ULL":"0x800000ULL") + ";"
+                " if(c->fpcr&(1ULL<<24)) { if(_a&&_a<_min) { _a=0; c->fpsr|=128; }"
+                " if(_b&&_b<_min) { _b=0; c->fpsr|=128; } }"
+                " if(_a>_exp||_b>_exp) c->fpsr|=1; else if(_a" +
+                std::string((i&(1U<<23))?">":">=") + "_b) _r[_j]=~(" + ct + ")0;"
+                " } memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
+            return true;
+        }
+    }
+
+    // Vector float/fixed conversions and nearest integral conversions. Keep
+    // saturation and rounding in integer fields; invalid suppresses inexact.
+    {
+        const u32 key=i&0x9FBFFC00, fixed_key=i&0x9F80FC00;
+        const u32 scalar_key=i&0xDFBFFC00;
+        const bool scalar=scalar_key==0x5E21A800||scalar_key==0x5E21C800;
+        const bool nearest=key==0x0E21A800||scalar_key==0x5E21A800;
+        const bool away=key==0x0E21C800||scalar_key==0x5E21C800;
+        const bool fixed=fixed_key==0x0F00FC00, to_float=fixed_key==0x0F00E400;
+        const unsigned imm=(i>>16)&127;
+        const bool dbl=(fixed||to_float)?(imm&64)!=0:(i&(1U<<22))!=0;
+        const bool q=(i&(1U<<30))!=0, uns=(i&(1U<<29))!=0;
+        if((nearest||away||((fixed||to_float)&&imm>=32))&&(!dbl||q)) {
+            const unsigned width=dbl?64:32,frac=dbl?52:23,bias=dbl?1023:127;
+            const unsigned fbits=(fixed||to_float)?2*width-imm:0;
+            const unsigned rd=i&31,rn=(i>>5)&31,active=scalar?1:q?128/width:64/width;
+            const std::string ct=dbl?"uint64_t":"uint32_t";
+            const auto lit=[](uint64_t v){return std::to_string(v)+"ULL";};
+            put("{ "+ct+" _src["+std::to_string(128/width)+"],_dst["+
+                std::to_string(128/width)+"]={0}; memcpy(_src,c->vreg["+std::to_string(rn)+"],16);"
+                " for(unsigned _j=0;_j<"+std::to_string(active)+";++_j) { uint64_t _v=_src[_j],_r=0;");
+            if(to_float) {
+                put("int _neg="+std::string(uns?"0":"!!(_v&"+lit(1ULL<<(width-1))+")")+";"
+                    " uint64_t _mag=_neg?((~_v+1)&"+lit(dbl?~0ULL:0xffffffffULL)+"):_v;"
+                    " if(_mag) { unsigned _top=0; uint64_t _scan=_mag; while(_scan>>1) { _scan>>=1; ++_top; }"
+                    " int _shift=(int)_top-"+std::to_string(frac)+";"
+                    " uint64_t _whole=_shift>0?_mag>>_shift:_mag<<(-_shift);"
+                    " uint64_t _lost=_shift>0?_mag&((1ULL<<_shift)-1):0; unsigned _mode=(unsigned)((c->fpcr>>22)&3);"
+                    " int _up=_lost&&(_mode==0?(_lost>(1ULL<<(_shift-1))||(_lost==(1ULL<<(_shift-1))&&(_whole&1))):"
+                    " _mode==1?!_neg:_mode==2?_neg:0); _whole+=_up; if(_whole>="+lit(1ULL<<(frac+1))+") { _whole>>=1; ++_top; }"
+                    " _r=((uint64_t)_neg<<"+std::to_string(width-1)+")|((uint64_t)((int)_top-"+
+                    std::to_string(fbits)+"+"+std::to_string(bias)+")<<"+std::to_string(frac)+")|(_whole&"+
+                    lit((1ULL<<frac)-1)+"); if(_lost)c->fpsr|=16; }");
+            } else {
+                put("unsigned _exp=(unsigned)((_v>>"+std::to_string(frac)+")&"+std::to_string(2*bias+1)+");"
+                    " uint64_t _mant=_v&"+lit((1ULL<<frac)-1)+"; int _neg=!!(_v&"+lit(1ULL<<(width-1))+");"
+                    " int _invalid=0,_inexact=0; uint64_t _mag=0,_limit="+
+                    std::string(uns?lit(dbl?~0ULL:0xffffffffULL):"(_neg?"+lit(1ULL<<(width-1))+":"+lit((1ULL<<(width-1))-1)+")")+";"
+                    " if(_exp=="+std::to_string(2*bias+1)+") { _invalid=1; _mag=_mant?0:_limit;"
+                    " if(_mant)_neg=0; } else if(!_exp&&_mant&&(c->fpcr&(1ULL<<24))) c->fpsr|=128;"
+                    " else if(_exp||_mant) { int _e=(_exp?(int)_exp-"+std::to_string(bias)+":"+
+                    std::to_string(1-(int)bias)+")+"+std::to_string(fbits)+"; if(_exp)_mant|="+lit(1ULL<<frac)+";"
+                    " if(_e>="+std::to_string(width)+") { _invalid=1; _mag=_limit; } else {"
+                    " int _shift="+std::to_string(frac)+"-_e; uint64_t _lost=_shift<=0?0:_shift<64?_mant&((1ULL<<_shift)-1):_mant;"
+                    " _mag=_shift<=0?_mant<<(-_shift):_shift<64?_mant>>_shift:0; _inexact=_lost!=0;");
+                if(nearest||away)put("if(_lost&&_shift<64&&(_lost>(1ULL<<(_shift-1))||(_lost==(1ULL<<(_shift-1))&&"+
+                    std::string(away?"1":"(_mag&1)")+"))) ++_mag;");
+                put("if(_mag>_limit) { _mag=_limit; _invalid=1; } } }");
+                if(uns)put("if(_neg&&_mag) { _mag=0; _invalid=1; }");
+                put("_r=_neg?0-_mag:_mag; if(_invalid)c->fpsr|=1; else if(_inexact)c->fpsr|=16;");
+            }
+            put("_dst[_j]=("+ct+")_r; } memcpy(c->vreg["+std::to_string(rd)+"],_dst,16); }");
+            return true;
+        }
+    }
+
+    // Baseline half conversions observe AHP, but ignore FZ16 (FPUnpackCV /
+    // FPRoundCV). This is distinct from optional half arithmetic instructions.
+    {
+        const u32 key=i&0xFFFFFC00, vkey=i&0xBFFFFC00;
+        const bool scalar=key==0x1E624000||key==0x1E22C000||key==0x1E23C000||
+            key==0x1E63C000||key==0x1EE24000||key==0x1EE2C000;
+        const bool vw=vkey==0x0E217800, vn=vkey==0x0E216800;
+        if(scalar||vw||vn) {
+            const unsigned rd=i&31,rn=(i>>5)&31;
+            const bool upper=(i&(1U<<30))!=0;
+            const unsigned from=vw?16:vn?32:((i>>22)&3)==0?32:((i>>22)&3)==1?64:16;
+            const unsigned to=vw?32:vn?16:((i>>15)&3)==0?32:((i>>15)&3)==1?64:16;
+            const unsigned sf=from==16?10:from==32?23:52, df=to==16?10:to==32?23:52;
+            const unsigned sb=from==16?15:from==32?127:1023, db=to==16?15:to==32?127:1023;
+            const auto literal=[](uint64_t v){return std::to_string(v)+"ULL";};
+            const uint64_t sm=(1ULL<<sf)-1,dm=(1ULL<<df)-1;
+            const std::string src="uint"+std::to_string(from)+"_t",dst="uint"+std::to_string(to)+"_t";
+            put("{ "+src+" _src["+std::to_string(128/from)+"]; "+dst+" _dst["+
+                std::to_string(128/to)+"]={0}; memcpy(_src,c->vreg["+std::to_string(rn)+"],16);");
+            if(vn&&upper)put("memcpy(_dst,c->vreg["+std::to_string(rd)+"],16);");
+            put("for(unsigned _j=0;_j<"+std::to_string(scalar?1:4)+";++_j) { uint64_t _v=_src[_j+"+
+                std::to_string(vw&&upper?4:0)+"],_f=_v&"+literal(sm)+",_r; unsigned _e=(unsigned)((_v>>"+
+                std::to_string(sf)+")&"+std::to_string(2*sb+1)+"); uint64_t _sign=(_v>>"+
+                std::to_string(from-1)+")<<"+std::to_string(to-1)+"; unsigned _mode=(unsigned)((c->fpcr>>22)&3);"
+                " int _ahp="+std::string(to==16?"!!(c->fpcr&(1ULL<<26))":"0")+"; _r=_sign;");
+            put("if(_e=="+std::to_string(2*sb+1)+std::string(from==16?"&&!(c->fpcr&(1ULL<<26))":"")+
+                ") { if(_f) { if(!(_f&"+literal(1ULL<<(sf-1))+")||_ahp) c->fpsr|=1; if(!_ahp) {"
+                " _r|="+literal((uint64_t)(2*db+1)<<df)+"|"+
+                std::string(sf>df?"(_f>>"+std::to_string(sf-df)+")":"(_f<<"+std::to_string(df-sf)+")")+
+                "|"+literal(1ULL<<(df-1))+"; if(c->fpcr&(1ULL<<25)) _r="+
+                literal(((uint64_t)(2*db+1)<<df)|(1ULL<<(df-1)))+"; } } else {"
+                " if(_ahp) { _r|="+literal((1ULL<<(to-1))-1)+"; c->fpsr|=1; } else _r|="+
+                literal((uint64_t)(2*db+1)<<df)+"; } }");
+            if(from!=16)put("else if(!_e&&_f&&(c->fpcr&(1ULL<<24))) c->fpsr|=128;");
+            put("else if(_e||_f) { int _unbiased=_e?(int)_e-"+std::to_string(sb)+":"+
+                std::to_string(1-(int)sb)+"; uint64_t _mant=_f|(_e?"+literal(1ULL<<sf)+":0);"
+                " while(!(_mant&"+literal(1ULL<<sf)+")) { _mant<<=1; --_unbiased; }");
+            if(to!=16)put("if(_unbiased<"+std::to_string(1-(int)db)+"&&(c->fpcr&(1ULL<<24))) c->fpsr|=8; else");
+            put("{ int _tiny=_unbiased<"+std::to_string(1-(int)db)+"; int _shift="+
+                std::to_string((int)sf-(int)df)+"+(_tiny?"+std::to_string(1-(int)db)+"-_unbiased:0);"
+                " uint64_t _whole=_shift<=0?_mant<<(-_shift):_shift<64?_mant>>_shift:0;"
+                " uint64_t _lost=_shift<=0?0:_shift<64?_mant&((1ULL<<_shift)-1):_mant;"
+                " int _up=_lost&&(_mode==0?(_shift<64&&(_lost>(1ULL<<(_shift-1))||"
+                " (_lost==(1ULL<<(_shift-1))&&(_whole&1)))):_mode==1?!_sign:_mode==2?!!_sign:0);"
+                " _whole+=_up; if(_whole>="+literal(1ULL<<(df+1))+") { _whole>>=1; ++_unbiased; }"
+                " if(_unbiased>"+std::to_string(db)+"+_ahp) { if(_ahp) { _r|="+
+                literal((1ULL<<(to-1))-1)+"; c->fpsr|=1; } else {"
+                " int _inf=_mode==0||(_mode==1&&!_sign)||(_mode==2&&_sign); _r|=_inf?"+
+                literal((uint64_t)(2*db+1)<<df)+":"+literal(((uint64_t)(2*db+1)<<df)-1)+"; c->fpsr|=20; } }"
+                " else { _r|=_tiny?_whole:((uint64_t)(_unbiased+"+std::to_string(db)+")<<"+
+                std::to_string(df)+")|(_whole&"+literal(dm)+"); if(_lost) { c->fpsr|=16; if(_tiny) c->fpsr|=8; } } } }"
+                " _dst[_j+"+std::to_string(vn&&upper?4:0)+"]=("+dst+")_r; } memcpy(c->vreg["+
+                std::to_string(rd)+"],_dst,16); }");
+            return true;
+        }
+    }
+
+    // S->D vector widening and D->S narrowing. Half conversions are above;
+    // rounding-to-odd FCVTXN remains a separate, unmatched encoding.
+    if ((i & 0xBFFFFC00) == 0x0E617800 || (i & 0xBFFFFC00) == 0x0E616800) {
+        const unsigned rd = i & 31, rn = (i >> 5) & 31;
+        const bool upper = (i & (1U << 30)) != 0, widen = (i & 0x1000) != 0;
+        if (widen) {
+            put("{ uint32_t _src[4]; uint64_t _dst[2]; memcpy(_src,c->vreg[" +
+                std::to_string(rn) + "],16); for(unsigned _j=0;_j<2;++_j) {"
+                " uint32_t _v=_src[_j+" + std::to_string(upper ? 2 : 0) +
+                "],_f=_v&0x7fffff; unsigned _e=(_v>>23)&255;"
+                " uint64_t _r=(uint64_t)(_v&0x80000000U)<<32;"
+                " if(_e==255) { _r|=0x7ff0000000000000ULL; if(_f) {"
+                " if(!(_f&0x400000)) c->fpsr|=1; _r|=((uint64_t)_f<<29)|0x8000000000000ULL;"
+                " if(c->fpcr&(1ULL<<25)) _r=0x7ff8000000000000ULL; } }"
+                " else if(_e) _r|=((uint64_t)(_e+896)<<52)|((uint64_t)_f<<29);"
+                " else if(_f) { if(c->fpcr&(1ULL<<24)) c->fpsr|=128;"
+                " else { int _unbiased=-126; while(!(_f&0x800000)) { _f<<=1; --_unbiased; }"
+                " _r|=((uint64_t)(_unbiased+1023)<<52)|((uint64_t)(_f&0x7fffff)<<29); } }"
+                " _dst[_j]=_r; } memcpy(c->vreg[" + std::to_string(rd) + "],_dst,16); }");
+        } else {
+            put("{ uint64_t _src[2]; uint32_t _dst[2]; memcpy(_src,c->vreg[" +
+                std::to_string(rn) + "],16); for(unsigned _j=0;_j<2;++_j) {"
+                " uint64_t _v=_src[_j],_f=_v&0xfffffffffffffULL; unsigned _e=(unsigned)((_v>>52)&2047);"
+                " uint32_t _sign=(uint32_t)(_v>>32)&0x80000000U,_r=_sign;"
+                " unsigned _mode=(unsigned)((c->fpcr>>22)&3);"
+                " if(_e==2047) { _r|=0x7f800000U; if(_f) {"
+                " if(!(_f&0x8000000000000ULL)) c->fpsr|=1; _r|=(uint32_t)(_f>>29)|0x400000U;"
+                " if(c->fpcr&(1ULL<<25)) _r=0x7fc00000U; } }"
+                " else if(!_e&&_f&&(c->fpcr&(1ULL<<24))) c->fpsr|=128;"
+                " else if(_e||_f) { int _unbiased=_e?(int)_e-1023:-1022;"
+                " uint64_t _mant=_f|(_e?0x10000000000000ULL:0);"
+                " if(_unbiased < -126 && (c->fpcr&(1ULL<<24))) { c->fpsr|=8; }"
+                " else { unsigned _shift=_unbiased < -126?(unsigned)(-97-_unbiased):29;"
+                " uint64_t _whole=_shift<64?_mant>>_shift:0;"
+                " uint64_t _lost=_shift<64?_mant&((1ULL<<_shift)-1):_mant;"
+                " int _up=_lost&&(_mode==0?(_shift<64&&(_lost>(1ULL<<(_shift-1))||"
+                " (_lost==(1ULL<<(_shift-1))&&(_whole&1)))):_mode==1?!_sign:_mode==2?!!_sign:0);"
+                " _whole+=_up; if(_whole>=0x1000000ULL) { _whole>>=1; ++_unbiased; }"
+                " if(_unbiased>127) { int _inf=_mode==0||(_mode==1&&!_sign)||(_mode==2&&_sign);"
+                " _r|=_inf?0x7f800000U:0x7f7fffffU; c->fpsr|=20; }"
+                " else { _r|=_unbiased < -126?(uint32_t)_whole:"
+                " ((uint32_t)(_unbiased+127)<<23)|((uint32_t)_whole&0x7fffffU);"
+                " if(_lost) { c->fpsr|=16; if(_unbiased < -126) c->fpsr|=8; } } } }"
+                " _dst[_j]=_r; } memcpy((char*)c->vreg[" + std::to_string(rd) + "]+" +
+                std::to_string(upper ? 8 : 0) + ",_dst,8);");
+            if (!upper) put("c->vreg[" + std::to_string(rd) + "][1]=0;");
+            put("}");
+        }
+        return true;
+    }
+
+    // Vector integral rounding, using integer IEEE-754 fields so guest rounding
+    // and subnormal modes do not depend on the host floating-point environment.
+    {
+        const u32 key = i & 0xBFBFFC00;
+        const bool rounding = key == 0x0E218800 || key == 0x0EA18800 ||
+            key == 0x0E219800 || key == 0x0EA19800 || key == 0x2E218800 ||
+            key == 0x2E219800 || key == 0x2EA19800;
+        const bool dbl = (i & (1U << 22)) != 0, q = (i & (1U << 30)) != 0;
+        if (rounding && (!dbl || q)) {
+            const unsigned rd = i & 31, rn = (i >> 5) & 31;
+            const unsigned lanes = dbl ? 2 : 4, active = q ? lanes : lanes / 2;
+            const std::string ct = dbl ? "uint64_t" : "uint32_t";
+            const std::string mode = key == 0x0E218800 ? "0" : key == 0x0EA18800 ? "1" :
+                key == 0x0E219800 ? "2" : key == 0x0EA19800 ? "3" :
+                key == 0x2E218800 ? "4" : "((c->fpcr>>22)&3)";
+            put("{ " + ct + " _src[" + std::to_string(lanes) + "],_dst[" +
+                std::to_string(lanes) + "]={0}; memcpy(_src,c->vreg[" +
+                std::to_string(rn) + "],16); const unsigned _mode=" + mode + ";");
+            put("for(unsigned _j=0;_j<" + std::to_string(active) + ";++_j) {"
+                " uint64_t _v=_src[_j],_a,_r; const uint64_t _sign=" +
+                std::string(dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
+                ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+                ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+                ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";");
+            put("if((c->fpcr&(1ULL<<24))&&!(_v&_exp)&&(_v&_frac))"
+                " { _v&=_sign; c->fpsr|=128; } _a=_v&~_sign; _r=_v;"
+                " if((_a&_exp)==_exp) { if(_a&_frac) {"
+                " if(!(_a&_quiet)) c->fpsr|=1; _r=_v|_quiet;"
+                " if(c->fpcr&(1ULL<<25)) _r=_exp|_quiet; } }"
+                " else { int _e=(int)(_a>>" + std::to_string(dbl ? 52 : 23) + ")-" +
+                std::to_string(dbl ? 1023 : 127) + "; if(_a&&_e<" +
+                std::to_string(dbl ? 52 : 23) + ") { int _up=0; if(_e<0) {"
+                " const uint64_t _half=" + (dbl ? "0x3fe0000000000000ULL" : "0x3f000000ULL") +
+                "; _up=(_mode==0?_a>_half:_mode==4?_a>=_half:"
+                " _mode==1?!(_v&_sign):_mode==2?!!(_v&_sign):0);"
+                " _r=(_v&_sign)|(_up?" + (dbl ? "0x3ff0000000000000ULL" : "0x3f800000ULL") + ":0);"
+                " } else { unsigned _shift=" + std::to_string(dbl ? 52 : 23) +
+                "-_e; uint64_t _unit=1ULL<<_shift,_mask=_unit-1,_lost=_a&_mask;"
+                " _up=_lost&&(_mode==0?(_lost>(_unit>>1)||(_lost==(_unit>>1)&&(_a&_unit))):"
+                " _mode==4?_lost>=(_unit>>1):_mode==1?!(_v&_sign):_mode==2?!!(_v&_sign):0);"
+                " _r=(_v&_sign)|((_a&~_mask)+(_up?_unit:0)); } }");
+            if (key == 0x2E219800) put("if(_r!=_v) c->fpsr|=16;");
+            put("} _dst[_j]=(" + ct + ")_r; } memcpy(c->vreg[" +
+                std::to_string(rd) + "],_dst,16); }");
+            return true;
+        }
+    }
+
+    // Scalar fused multiply-add: negate inputs before the single rounding.
+    if ((i & 0xFF000000) == 0x1F000000 && ((i >> 22) & 3) <= 1) {
+        const bool dbl = ((i >> 22) & 1) != 0;
+        const bool negate_addend = ((i >> 21) & 1) != 0;
+        const bool negate_product = negate_addend != (((i >> 15) & 1) != 0);
+        const u32 rm = (i >> 16) & 31, ra = (i >> 10) & 31;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        const std::string sz = dbl ? "8" : "4";
+        put("{ uint64_t _a=0,_b=0,_z=0,_v; memcpy(&_a,c->vreg["+std::to_string(rn)+"],"+sz+
+            ");memcpy(&_b,c->vreg["+std::to_string(rm)+"],"+sz+
+            ");memcpy(&_z,c->vreg["+std::to_string(ra)+"],"+sz+");");
+        if(negate_product)put("_a^="+std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
+        if(negate_addend)put("_z^="+std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
+        put(EmitFPMulAddValue(dbl));
+        put("c->vreg["+std::to_string(rd)+"][0]=_v;c->vreg["+std::to_string(rd)+"][1]=0;}");
+        return true;
+    }
+
+    if((i&0xFFA0FC00)==0x1E200800||(i&0xFFA0FC00)==0x1E201800||
+       (i&0xFFA0FC00)==0x1E208800) {
+        const bool divide=(i&0x1000)!=0;
+        const bool negate=(i&0x8000)!=0;
+        const bool dbl=(i&(1U<<22))!=0;const unsigned rd=i&31,rn=(i>>5)&31,rm=(i>>16)&31;
+        const std::string sz=dbl?"8":"4";
+        put("{uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg["+std::to_string(rn)+"],"+sz+
+            ");memcpy(&_b,c->vreg["+std::to_string(rm)+"],"+sz+");_z=(_a^_b)&"+
+            std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
+        if(divide)put("(void)_z;");
+        put(divide?EmitFPDivideValue(dbl):EmitFPMulAddValue(dbl));
+        // FNMUL negates the rounded product, including NaN/zero sign. Moving
+        // this sign change to an input would reverse directed rounding.
+        if(negate)put("_v^="+std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
+        put("c->vreg["+std::to_string(rd)+"][0]=_v;c->vreg["+std::to_string(rd)+"][1]=0;}");
+        return true;
+    }
+
     // Scalar floating point. Only single (ftype 00) and double (ftype 01) are
     // handled; half-precision and the SIMD vector forms still fall through.
     // Values move through memcpy rather than type punning so this stays
@@ -2674,21 +3749,9 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 return true;
             }
 
-            // Two-source: FMUL/FDIV/FADD/FSUB (opcode in bits 15..12).
+            // Remaining two-source scalar operations (opcode in bits 15..12).
             if (((i >> 10) & 3) == 2) {
                 const u32 opcode = (i >> 12) & 15;
-                const char* op = nullptr;
-                switch (opcode) {
-                case 0: op = "*"; break;
-                case 1: op = "/"; break;
-                case 2: op = "+"; break;
-                case 3: op = "-"; break;
-                default: break;
-                }
-                if (op) {
-                    put(ld_n + ld_m + "_r = _a " + op + " _b; " + st_d);
-                    return true;
-                }
                 // FMAX/FMIN propagate a NaN operand; the NM forms return the
                 // other operand instead, which is exactly what fmax/fmin do.
                 std::string expr2;
@@ -2697,7 +3760,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 case 5: expr2 = "(_a!=_a||_b!=_b) ? (_a+_b) : (_a<_b?_a:_b)"; break;  // FMIN
                 case 6: expr2 = dbl ? "fmax(_a,_b)" : "fmaxf(_a,_b)"; break;          // FMAXNM
                 case 7: expr2 = dbl ? "fmin(_a,_b)" : "fminf(_a,_b)"; break;          // FMINNM
-                case 8: expr2 = "-(_a*_b)"; break;                                    // FNMUL
                 default: break;
                 }
                 if (!expr2.empty()) {
@@ -2913,6 +3975,25 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // same width. This is the vector counterpart of the general-register
             // conversion handled further up - the operand is a lane here, not a
             // general register.
+            // Bit 23 selects reciprocal/reciprocal-square-root estimates,
+            // not integer conversion. U selects the square-root form.
+            if (opcode == 0x1D && (i & (1U << 23)) != 0 && (!dbl || Q)) {
+                const int fsz = dbl ? 8 : 4;
+                const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
+                const int lanes = bytes / fsz;
+                const std::string ct = dbl ? "uint64_t" : "uint32_t";
+                std::string s = "{ " + ct + " _a[" + std::to_string(lanes) + "],_r[" +
+                                std::to_string(lanes) + "]={0}; memcpy(_a,c->vreg[" +
+                                std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+                s += "for(int _i=0;_i<" + std::to_string(lanes) +
+                     ";++_i){uint64_t _v=0,_x=_a[_i];";
+                s += U ? EmitFPRSqrtEstimateValue(dbl) : EmitFPRecipEstimateValue(dbl);
+                s += "_r[_i]=(" + ct + ")_v;} c->vreg[" + std::to_string(rd) +
+                     "][0]=0;c->vreg[" + std::to_string(rd) + "][1]=0;memcpy(c->vreg[" +
+                     std::to_string(rd) + "],_r," + std::to_string(bytes) + ");}";
+                put(s);
+                return true;
+            }
             if (opcode == 0x1D && (i & (1U << 23)) == 0) {
                 const char* ct = dbl ? "double" : "float";
                 const int fsz = dbl ? 8 : 4;
@@ -3140,7 +4221,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             const u32 rm = ((i >> 16) & 15) | (((i >> 20) & 1) << 4);
             const u32 H = (i >> 11) & 1, L = (i >> 21) & 1;
             const u32 index = dbl ? H : ((H << 1) | L);
-            const char* ct = dbl ? "double" : "float";
+            const char* ct = dbl ? "uint64_t" : "uint32_t";
             const int fsz = dbl ? 8 : 4;
             const int bytes = scl_idx ? fsz : (Q ? 16 : 8);
             const int lanes = bytes / fsz;
@@ -3150,15 +4231,16 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
                 s += "memcpy(&_m,(const uint8_t*)c->vreg[" + std::to_string(rm) + "]+" +
                      std::to_string(index * fsz) + "," + std::to_string(fsz) + "); ";
-                if (idxop == 0x9) {
-                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_a[_i]*_m; ";
-                } else {
-                    // FMLA/FMLS read the destination before writing it.
-                    s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "]," +
-                         std::to_string(bytes) + "); ";
-                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]" +
-                         std::string(idxop == 0x1 ? "+=" : "-=") + "_a[_i]*_m; ";
-                }
+                s += "memcpy(_r,c->vreg["+std::to_string(rd)+"],"+std::to_string(bytes)+");";
+                // Local scalar names belong to an inner block; source arrays
+                // are captured before entering it so every alias remains safe.
+                s += "for(int _i=0;_i<"+std::to_string(lanes)+";++_i){uint64_t _n=_a[_i],_z0=_r[_i];"
+                     "{uint64_t _a=_n,_b=_m,_z=_z0,_v;";
+                const std::string sign=dbl?"0x8000000000000000ULL":"0x80000000ULL";
+                if(idxop==9)s+="_z=(_a^_b)&"+sign+";";
+                if(idxop==5)s+="_a^="+sign+";";
+                s+=EmitFPMulAddValue(dbl);
+                s+="_r[_i]=("+std::string(ct)+")_v;}}";
                 s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                      "][1]=0; ";
                 s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
@@ -3174,7 +4256,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     {
         const u32 idxop = (i >> 12) & 0xF;
         const u32 U = (i >> 29) & 1;
-        const bool shaped = (idxop == 0x8 && !U) || ((idxop == 0x0 || idxop == 0x4) && U);
+        const bool widening = idxop == 0x2 || idxop == 0x6 || idxop == 0xA;
+        const bool shaped = widening || (idxop == 0x8 && !U) || ((idxop == 0x0 || idxop == 0x4) && U);
         if (shaped && (i & 0x9F00F400) == 0x0F000000 + (idxop << 12)) {
             const u32 Q = (i >> 30) & 1, size = (i >> 22) & 3;
             const u32 rn = (i >> 5) & 31, rd = i & 31;
@@ -3190,6 +4273,24 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             } else {
                 ok = false;
             }
+            if (ok && widening) {
+                const int esz = 1 << size, lanes = 8 / esz;
+                const std::string sty = std::string(U ? "uint" : "int") + std::to_string(esz * 8) + "_t";
+                const std::string dty = "uint" + std::to_string(esz * 16) + "_t";
+                const std::string wide = U ? "uint64_t" : "int64_t";
+                std::string s = "{ " + sty + " _a[" + std::to_string(lanes) + "],_m; " +
+                                dty + " _r[" + std::to_string(lanes) + "]; ";
+                s += "memcpy(_a,&c->vreg[" + std::to_string(rn) + "][" + std::to_string(Q) + "],8); ";
+                s += "memcpy(&_m,(const uint8_t*)c->vreg[" + std::to_string(rm) + "]+" +
+                     std::to_string(index * esz) + "," + std::to_string(esz) + "); ";
+                if (idxop != 0xA) s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "],16); ";
+                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";++_i) _r[_i]=(" + dty + ")(";
+                if (idxop != 0xA) s += "(uint64_t)_r[_i]" + std::string(idxop == 2 ? "+" : "-");
+                s += "(uint64_t)((" + wide + ")_a[_i]*(" + wide + ")_m)); ";
+                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+                put(s);
+                return true;
+            }
             if (ok) {
                 const int esz = 1 << size;
                 const int bytes = Q ? 16 : 8;
@@ -3203,13 +4304,13 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                      std::to_string(index * esz) + "," + std::to_string(esz) + "); ";
                 if (idxop == 0x8) {
                     s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + uty +
-                         ")(_a[_i]*_m); ";
+                         ")((uint64_t)_a[_i]*(uint64_t)_m); ";
                 } else {
                     s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "]," + std::to_string(bytes) +
                          "); ";
                     s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + uty +
                          ")(_r[_i]" + std::string(idxop == 0x0 ? "+" : "-") + "(" + uty +
-                         ")(_a[_i]*_m)); ";
+                         ")((uint64_t)_a[_i]*(uint64_t)_m)); ";
                 }
                 s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                      "][1]=0; ";
@@ -3218,6 +4319,102 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 put(s);
                 return true;
             }
+        }
+    }
+
+    // Integer leading-bit counts, halving arithmetic, absolute differences,
+    // and narrowing high-half arithmetic. These operations do not affect QC.
+    {
+        const bool leading = (i & 0x9F3FFC00) == 0x0E204800;
+        const u32 half_op = i & 0x9F20FC00;
+        const bool halving = half_op == 0x0E200400 || half_op == 0x0E201400 || half_op == 0x0E202400;
+        const bool difference = (i & 0x9F20F400) == 0x0E207400;
+        const bool high_narrow = (i & 0x9F20DC00) == 0x0E204000;
+        const u32 size = (i >> 22) & 3;
+        if ((leading || halving || difference || high_narrow) && size < 3) {
+            const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+            const u32 rn = (i >> 5) & 31, rm = (i >> 16) & 31, rd = i & 31;
+            const int esz = 1 << size, bits = esz * 8, bytes = Q ? 16 : 8;
+            const int lanes = high_narrow ? 8 / esz : bytes / esz;
+            const std::string dest = "uint" + std::to_string(bits) + "_t";
+            const std::string src = std::string(high_narrow || leading || U ? "uint" : "int") +
+                                    std::to_string(high_narrow ? bits * 2 : bits) + "_t";
+            std::string s = "{ " + src + " _a[" + std::to_string(lanes) + "]; " + dest +
+                            " _r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(high_narrow ? 16 : bytes) + "); ";
+            if (!leading) {
+                s += src + " _b[" + std::to_string(lanes) + "]; memcpy(_b,c->vreg[" +
+                     std::to_string(rm) + "]," + std::to_string(high_narrow ? 16 : bytes) + "); ";
+            }
+            const bool accumulate = difference && (i & 0x800);
+            if (accumulate) s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _j=0;_j<" + std::to_string(lanes) + ";++_j) { ";
+            if (leading) {
+                s += "uint64_t _x=_a[_j]; unsigned _n=0; ";
+                if (!U) s += "if(_x&(UINT64_C(1)<<" + std::to_string(bits - 1) + ")) _x=(" + dest + ")~_x; ";
+                s += "for(int _b=" + std::to_string(bits - (U ? 1 : 2)) + ";_b>=0;--_b) { if((_x>>_b)&1) break; ++_n; } _r[_j]=(" + dest + ")_n; ";
+            } else if (high_narrow) {
+                s += "uint64_t _x=(uint64_t)_a[_j]" + std::string(i & 0x2000 ? "-" : "+") + "(uint64_t)_b[_j]";
+                if (U) s += "+(UINT64_C(1)<<" + std::to_string(bits - 1) + ")";
+                s += "; _r[_j]=(" + dest + ")(_x>>" + std::to_string(bits) + "); ";
+            } else if (halving) {
+                s += "int64_t _x=(int64_t)_a[_j]" + std::string(half_op == 0x0E202400 ? "-" : "+") + "(int64_t)_b[_j]";
+                if (half_op == 0x0E201400) s += "+1";
+                s += "; _r[_j]=(" + dest + ")(_x<0?-((-_x+1)/2):_x/2); ";
+            } else {
+                s += "int64_t _x=(int64_t)_a[_j]-(int64_t)_b[_j]; uint64_t _abs=(uint64_t)(_x<0?-_x:_x); ";
+                s += "_r[_j]=(" + dest + ")(" + std::string(accumulate ? "(uint64_t)_r[_j]+" : "") + "_abs); ";
+            }
+            s += "} ";
+            if (high_narrow) {
+                if (!Q) s += "c->vreg[" + std::to_string(rd) + "][1]=0; ";
+                s += "memcpy(&c->vreg[" + std::to_string(rd) + "][" + std::to_string(Q) + "],_r,8); }";
+            } else s += "memset(c->vreg[" + std::to_string(rd) + "],0,16); memcpy(c->vreg[" +
+                        std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // Integer widening add/subtract and pairwise long add/accumulate.
+    // Unsigned arithmetic at 64 bits implements modular destination writes,
+    // including signed wide additions that would otherwise overflow C types.
+    {
+        const bool widen = (i & 0x9F20CC00) == 0x0E200000;
+        const bool paired = (i & 0x9F3FBC00) == 0x0E202800;
+        const bool absolute = (i & 0x9F20DC00) == 0x0E205000;
+        const u32 size = (i >> 22) & 3;
+        if ((widen || paired || absolute) && size < 3) {
+            const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+            const u32 rn = (i >> 5) & 31, rm = (i >> 16) & 31, rd = i & 31;
+            const bool wide = widen && (i & 0x1000), sub = widen && (i & 0x2000);
+            const bool accumulate = (paired && (i & 0x4000)) || (absolute && !(i & 0x2000));
+            const int esz = 1 << size, bytes = paired ? (Q ? 16 : 8) : 16;
+            const int lanes = bytes / (2 * esz);
+            const std::string narrow = std::string(U ? "uint" : "int") + std::to_string(esz * 8) + "_t";
+            const std::string dest = "uint" + std::to_string(esz * 16) + "_t";
+            std::string s = "{ " + dest + " _r[8]={0}; ";
+            if (!wide) s += narrow + " _a[16]; ";
+            if (widen || absolute) s += narrow + " _b[8]; ";
+            if (wide || accumulate) s += dest + " _w[8]; ";
+            if (wide) s += "memcpy(_w,c->vreg[" + std::to_string(rn) + "],16); ";
+            else s += "memcpy(_a," + std::string(paired ? "c->vreg[" : "&c->vreg[") +
+                      std::to_string(rn) + (paired ? "]," : "][" + std::to_string(Q) + "],") +
+                      std::to_string(paired ? bytes : 8) + "); ";
+            if (widen || absolute) s += "memcpy(_b,&c->vreg[" + std::to_string(rm) + "][" + std::to_string(Q) + "],8); ";
+            if (accumulate) s += "memcpy(_w,c->vreg[" + std::to_string(rd) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _j=0;_j<" + std::to_string(lanes) + ";++_j) { ";
+            if (absolute) s += "int64_t _x=(int64_t)_a[_j]-(int64_t)_b[_j]; ";
+            s += "_r[_j]=(" + dest + ")(";
+            if (accumulate) s += "(uint64_t)_w[_j]+";
+            if (absolute) s += "(uint64_t)(_x<0?-_x:_x)";
+            else s += "(uint64_t)" + std::string(paired ? "_a[2*_j]" : wide ? "_w[_j]" : "_a[_j]") +
+                      (sub ? "-" : "+") + "(uint64_t)" + (paired ? "_a[2*_j+1]" : "_b[_j]");
+            s += "); } ";
+            s += "memset(c->vreg[" + std::to_string(rd) + "],0,16); memcpy(c->vreg[" +
+                 std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
         }
     }
 
@@ -3332,42 +4529,27 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
-    // Advanced SIMD modified immediate - MOVI and MVNI. The immediate is
-    // scattered across two fields (abc at 18..16, defgh at 9..5) and cmode
-    // decides how those eight bits expand, so it has to be rebuilt rather
-    // than read out directly.
-    if ((i & 0x9FF80400) == 0x0F000400) {
-        const u32 Q = (i >> 30) & 1, op = (i >> 29) & 1;
-        const u32 cmode = (i >> 12) & 0xF;
-        const u32 rd = i & 31;
-        const u32 imm8 = (((i >> 16) & 7) << 5) | ((i >> 5) & 0x1F);
-        u64 lo = 0;
-        bool ok = false;
-        if (cmode == 0xE) {
-            if (!op) {
-                // MOVI Vd.8B/16B, #imm8 - the byte repeated across the vector.
-                lo = 0x0101010101010101ULL * (u64)imm8;
-                ok = true;
-            } else {
-                // MOVI Vd.2D / Dd, #imm64 - each bit of imm8 expands to a
-                // whole byte of 0x00 or 0xFF.
-                for (u32 b = 0; b < 8; ++b) {
-                    if ((imm8 >> b) & 1) lo |= 0xFFULL << (b * 8);
-                }
-                ok = true;
-            }
-        }
-        if (ok) {
-            char hb[48];
-            snprintf(hb, sizeof hb, "0x%llxULL", (unsigned long long)lo);
-            // op=1 with cmode=1110 is a 64-bit value: it fills the upper half
-            // only when Q selects the full 128-bit register. The 8-bit form
-            // replicates across whichever width Q selects.
-            const std::string hi = Q ? std::string(hb) : std::string("0");
-            put("c->vreg[" + std::to_string(rd) + "][0]=" + hb + "; c->vreg[" +
-                std::to_string(rd) + "][1]=" + hi + ";");
-            return true;
-        }
+    // MLA / MLS (vector): accumulate the low element-width product modulo 2^bits.
+    // Widen before multiplication to avoid signed promotion overflow for H lanes.
+    if ((i & 0x9F20FC00) == 0x0E209400 && ((i >> 22) & 3) < 3) {
+        const u32 size = (i >> 22) & 3, Q = (i >> 30) & 1;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const bool subtract = ((i >> 29) & 1) != 0;
+        const int bytes = Q ? 16 : 8, lanes = bytes >> size;
+        const std::string ty = "uint" + std::to_string(8 << size) + "_t";
+        std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_b[" +
+                        std::to_string(lanes) + "],_d[" + std::to_string(lanes) + "],_r[" +
+                        std::to_string(lanes) + "]; ";
+        s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+        s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+        s += "memcpy(_d,c->vreg[" + std::to_string(rd) + "]," + std::to_string(bytes) + "); ";
+        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";++_i) _r[_i]=(" + ty +
+             ")((uint64_t)_d[_i]" + (subtract ? "-" : "+") +
+             "(uint64_t)_a[_i]*(uint64_t)_b[_i]); ";
+        s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); ";
+        if (!Q) s += "c->vreg[" + std::to_string(rd) + "][1]=0; ";
+        put(s + "}");
+        return true;
     }
 
     // Advanced SIMD three-register same (0x0E/0x4E/0x6E group).
@@ -3465,45 +4647,50 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         {
             const u32 a   = (i >> 23) & 1;   // opcode extension, not a size bit
             const bool dbl = ((i >> 22) & 1) != 0;   // sz: 0 = float, 1 = double
-            const char* ct = dbl ? "double" : "float";
             const int fsz  = dbl ? 8 : 4;
             const int fne  = vbytes / fsz;
-            // Emit an element-wise FP operation, optionally accumulating into rd.
-            auto fp_op = [&](const char* expr, bool acc) {
-                std::string s = "{ ";
-                s += std::string(ct) + " _a[" + std::to_string(fne) + "]";
-                s += ",_b[" + std::to_string(fne) + "]";
-                if (acc) s += ",_d[" + std::to_string(fne) + "]";
-                s += ",_r[" + std::to_string(fne) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(vbytes) + "); ";
-                s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(vbytes) + "); ";
-                if (acc) s += "memcpy(_d,c->vreg[" + std::to_string(rd) + "]," + std::to_string(vbytes) + "); ";
-                s += "for(int _i=0;_i<" + std::to_string(fne) + ";_i++) _r[_i]=(" + std::string(ct) + ")(" + expr + "); ";
-                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(vbytes) + "); ";
-                if (!Q) s += "c->vreg[" + std::to_string(rd) + "][1]=0; ";
-                s += "}";
-                put(s);
-            };
             // opcode 11001: FMLA (a=0) / FMLS (a=1), both U=0.
             if (opc5 == 0x19 && !U) {
-                fp_op(a ? "_d[_i]-_a[_i]*_b[_i]" : "_d[_i]+_a[_i]*_b[_i]", true);
-                return true;
-            }
-            // opcode 11010: FADD (a=0) / FSUB (a=1), both U=0.
-            if (opc5 == 0x1A && !U) {
-                fp_op(a ? "_a[_i]-_b[_i]" : "_a[_i]+_b[_i]", false);
+                const std::string ty=dbl?"uint64_t":"uint32_t";
+                put("{"+ty+" _n["+std::to_string(fne)+"],_m["+std::to_string(fne)+"],_d["+std::to_string(fne)+"];"
+                    "memcpy(_n,c->vreg["+std::to_string(rn)+"],"+std::to_string(vbytes)+");"
+                    "memcpy(_m,c->vreg["+std::to_string(rm)+"],"+std::to_string(vbytes)+");"
+                    "memcpy(_d,c->vreg["+std::to_string(rd)+"],"+std::to_string(vbytes)+");"
+                    "for(unsigned _j=0;_j<"+std::to_string(fne)+";++_j){uint64_t _a=_n[_j],_b=_m[_j],_z=_d[_j],_v;");
+                if(a)put("_a^="+std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
+                put(EmitFPMulAddValue(dbl));
+                put("_d[_j]=("+ty+")_v;}memcpy(c->vreg["+std::to_string(rd)+"],_d,"+std::to_string(vbytes)+");");
+                if(!Q)put("c->vreg["+std::to_string(rd)+"][1]=0;");
+                put("}");
                 return true;
             }
             // opcode 11011 with U=1 and a=0 is FMUL. The U=0 encoding at the
             // same opcode is FMULX, which differs on infinity times zero, so
             // it is deliberately left alone rather than aliased to FMUL.
             if (opc5 == 0x1B && U && !a) {
-                fp_op("_a[_i]*_b[_i]", false);
+                const std::string ty=dbl?"uint64_t":"uint32_t";
+                put("{"+ty+" _n["+std::to_string(fne)+"],_m["+std::to_string(fne)+"],_d["+std::to_string(fne)+"];"
+                    "memcpy(_n,c->vreg["+std::to_string(rn)+"],"+std::to_string(vbytes)+");"
+                    "memcpy(_m,c->vreg["+std::to_string(rm)+"],"+std::to_string(vbytes)+");"
+                    "for(unsigned _j=0;_j<"+std::to_string(fne)+";++_j){uint64_t _a=_n[_j],_b=_m[_j],_z=(_a^_b)&"+
+                    std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+",_v;");
+                put(EmitFPMulAddValue(dbl));
+                put("_d[_j]=("+ty+")_v;}memcpy(c->vreg["+std::to_string(rd)+"],_d,"+std::to_string(vbytes)+");");
+                if(!Q)put("c->vreg["+std::to_string(rd)+"][1]=0;");
+                put("}");
                 return true;
             }
             // opcode 11111 with U=1 and a=0 is FDIV.
             if (opc5 == 0x1F && U && !a) {
-                fp_op("_a[_i]/_b[_i]", false);
+                const std::string ty=dbl?"uint64_t":"uint32_t";
+                put("{"+ty+" _n["+std::to_string(fne)+"],_m["+std::to_string(fne)+"],_d["+std::to_string(fne)+"];"
+                    "memcpy(_n,c->vreg["+std::to_string(rn)+"],"+std::to_string(vbytes)+");"
+                    "memcpy(_m,c->vreg["+std::to_string(rm)+"],"+std::to_string(vbytes)+");"
+                    "for(unsigned _j=0;_j<"+std::to_string(fne)+";++_j){uint64_t _a=_n[_j],_b=_m[_j],_v;");
+                put(EmitFPDivideValue(dbl));
+                put("_d[_j]=("+ty+")_v;}memcpy(c->vreg["+std::to_string(rd)+"],_d,"+std::to_string(vbytes)+");");
+                if(!Q)put("c->vreg["+std::to_string(rd)+"][1]=0;");
+                put("}");
                 return true;
             }
         }
@@ -3884,7 +5071,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                         "#include <stdint.h>\n"
                         "#include <string.h>\n"   // memcpy, used by the scalar FP paths
                         "#include <math.h>\n"
-                        "struct _recomp_ent{uint64_t va; BlockFn fn;};\n\n";
+                        "struct _recomp_ent{uint64_t lo,hi; BlockFn fn;};\n\n";
+        if (u == 0) units.back() << "int g_recomp_guard_host_v2=0;\n";
     }
 
     // Each unit accumulates into a string and is written out in large blocks.
@@ -3933,16 +5121,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         rcu += line;
         for (size_t i = lo; i < hi; ++i) {
             FuncNameTo(namebuf, mod.c_str(), blocks[i].vaddr);
-            snprintf(line, sizeof line, "  {0x%llxULL, %s},\n",
-                     (unsigned long long)blocks[i].vaddr, namebuf);
+            snprintf(line, sizeof line, "  {0x%llxULL, 0x%llxULL, %s},\n",
+                     (unsigned long long)blocks[i].vaddr,
+                     (unsigned long long)(blocks[i].vaddr + (u64)(blocks[i].count - 1) * 4),
+                     namebuf);
             rcu += line;
         }
         // C has no empty initialiser list; a zero-length segment still needs a
         // well-formed array, and its declared count of 0 keeps it unsearchable.
         if (lo >= hi) {
-            rcu += "  {0ULL, 0}\n";
+            rcu += "  {0ULL, 0ULL, 0}\n";
         } else {
-            seg_hi[u] = blocks[hi - 1].vaddr;
+            const auto& last = blocks[hi - 1];
+            seg_hi[u] = last.vaddr + (u64)(last.count - 1) * 4;
         }
         snprintf(line, sizeof line, "};\nconst unsigned _segn_%s_%zu = %zuU;\n", mod.c_str(), u,
                  hi - lo);
@@ -3979,8 +5170,48 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         rcu += namebuf;
         rcu += "(GuestContext* c){\n";
         const u32 first = (u32)((b.vaddr - base) / 4);
+        rcu += "    static const uint32_t _expected[]={";
+        for (u32 k = 0; k < b.count; ++k) {
+            char word[32]; snprintf(word, sizeof word, "0x%08xU,", p[first + k]); rcu += word;
+        }
+        rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
+               "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
+        // Lookup indexes every emitted instruction, not only block starts. An
+        // indirect transfer can therefore enter the middle of this function.
+        // Direct chains publish their exact target PC before calling, so any
+        // address outside this block is an invariant violation, never a request
+        // to start silently at the first instruction.
+        {
+            char addr[32];
+            rcu += "    { uint64_t _entry=c->pc-g_module_base; if(_entry!=0x";
+            snprintf(addr, sizeof addr, "%llx", (unsigned long long)b.vaddr);
+            rcu += addr;
+            rcu += "ULL){ if(_entry<0x";
+            rcu += addr;
+            rcu += "ULL || _entry>0x";
+            snprintf(addr, sizeof addr, "%llx",
+                     (unsigned long long)(b.vaddr + (u64)(b.count - 1) * 4));
+            rcu += addr;
+            rcu += "ULL || ((_entry-0x";
+            snprintf(addr, sizeof addr, "%llx", (unsigned long long)b.vaddr);
+            rcu += addr;
+            rcu += "ULL)&3ULL)!=0){ recomp_unhandled(c,0U,c->pc); return; } switch((unsigned)((_entry-0x";
+            rcu += addr;
+            rcu += "ULL)>>2)){\n";
+            for (u32 k = 1; k < b.count; ++k) {
+                char entry[96];
+                snprintf(entry, sizeof entry, "      case %uU: goto _recomp_entry_%u;\n", k, k);
+                rcu += entry;
+            }
+            rcu += "      default: recomp_unhandled(c,0U,c->pc); return;\n    } } }\n";
+        }
         bool open = true;
         for (u32 k = 0; k < b.count; ++k) {
+            if (k > 0) {
+                char label[48];
+                snprintf(label, sizeof label, "_recomp_entry_%u: ;\n", k);
+                rcu += label;
+            }
             body.clear();
             const u32 insn = p[first + k];
             const u64 insn_pc = b.vaddr + (u64)k * 4;
@@ -3998,7 +5229,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                 }
                 ++site.count;
             }
-            if (!open) { ++stats.translated_terminators; break; }
+            if (!open) ++stats.translated_terminators;
         }
         // A block that ends by running off its own end still has to hand the
         // dispatcher an absolute guest address, exactly as every branch
@@ -4027,7 +5258,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     rc.reserve(unit_count * 200 + 4096);
     rc += "/* auto-generated by suyu static recompiler - DO NOT EDIT */\n"
           "#include \"recomp_runtime.h\"\n#include <stdint.h>\n\n"
-          "struct _recomp_ent{uint64_t va; BlockFn fn;};\n\n";
+          "struct _recomp_ent{uint64_t lo,hi; BlockFn fn;};\n\n";
     {
         char line[192];
         for (size_t u = 0; u < unit_count; ++u) {
@@ -4087,7 +5318,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "  if(_idx_tried) return;\n"
           "  _idx_tried = 1;\n"
           "  if(_NSEG == 0 || *_segn[0] == 0) return;\n"
-          "  _idx_lo = _segs[0][0].va;\n"
+          "  _idx_lo = _segs[0][0].lo;\n"
           "  _idx_hi = _seg_hi[_NSEG-1];\n"
           "  if(_idx_hi < _idx_lo) return;\n"
           "  n = (size_t)((_idx_hi - _idx_lo) >> 2) + 1;\n"
@@ -4096,7 +5327,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "  for(i=0;i<_NSEG;i++){\n"
           "    const struct _recomp_ent* t=_segs[i];\n"
           "    unsigned m=*_segn[i];\n"
-          "    for(j=0;j<m;j++) _idx[(size_t)((t[j].va - _idx_lo) >> 2)] = t[j].fn;\n"
+          "    for(j=0;j<m;j++){ uint64_t k,count=((t[j].hi-t[j].lo)>>2)+1;\n"
+          "      for(k=0;k<count;k++) _idx[(size_t)(((t[j].lo+4*k)-_idx_lo)>>2)]=t[j].fn; }\n"
           "  }\n"
           "}\n"
           "/* Called from recomp_image_set_base, which the loader runs once per\n"
@@ -4114,7 +5346,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "}\n"
           "\n"
           "BlockFn recomp_lookup(uint64_t pc){\n"
-          "  if(_idx && pc>=_idx_lo && pc<=_idx_hi) return _idx[(size_t)((pc-_idx_lo)>>2)];\n"
+          "  if(_idx && pc>=_idx_lo && pc<=_idx_hi && ((pc-_idx_lo)&3ULL)==0) return _idx[(size_t)((pc-_idx_lo)>>2)];\n"
           "  {\n"
           "  unsigned slo=0, shi=(unsigned)_NSEG;\n"
           "  while(slo<shi){ unsigned m=slo+(shi-slo)/2; if(_seg_hi[m]<pc) slo=m+1; else shi=m; }\n"
@@ -4122,8 +5354,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "  {\n"
           "    const struct _recomp_ent* t=_segs[slo];\n"
           "    unsigned n=*_segn[slo], lo=0, hi=n;\n"
-          "    while(lo<hi){ unsigned m=lo+(hi-lo)/2; if(t[m].va<pc) lo=m+1; else hi=m; }\n"
-          "    return (lo<n && t[lo].va==pc)?t[lo].fn:0;\n"
+          "    while(lo<hi){ unsigned m=lo+(hi-lo)/2; if(t[m].lo<=pc) lo=m+1; else hi=m; }\n"
+          "    if(lo==0) return 0; --lo;\n"
+          "    return (pc<=t[lo].hi && ((pc-t[lo].lo)&3ULL)==0)?t[lo].fn:0;\n"
           "  }\n"
           "  }\n}\n";
 
@@ -4284,6 +5517,10 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "endif()\n\n"
        << "if(NOT RECOMP_STATIC_ONLY)\n"
        << "add_executable(recompiled main.c recomp_runtime.c ${RECOMP_SOURCES})\n"
+       << "if(EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/data\")\n"
+       << "  add_custom_command(TARGET recompiled POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory"
+          " \"${CMAKE_CURRENT_SOURCE_DIR}/data\" \"$<TARGET_FILE_DIR:recompiled>/data\")\n"
+       << "endif()\n"
        << "if(SDL2_FOUND)\n"
        << "  target_compile_definitions(recompiled PRIVATE HAVE_SDL2)\n"
        << "  target_include_directories(recompiled PRIVATE ${SDL2_INCLUDE_DIRS})\n"
@@ -4340,6 +5577,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "target_compile_definitions(" << static_target
        << " PRIVATE SUYU_HOSTED_RECOMP=1 RECOMP_STATIC_MODULE=1"
        << " g_module_base=g_module_base_" << mod
+       << " g_recomp_guard_host_v2=g_recomp_guard_host_v2_" << mod
+       << " recomp_image_guard_v2=recomp_image_guard_v2_" << mod
        << " recomp_lookup=recomp_lookup_" << mod
        << " recomp_image_lookup=recomp_image_lookup_" << mod
        << " recomp_image_set_base=recomp_image_set_base_" << mod
@@ -4364,6 +5603,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "#else\n"
           "#define RECOMP_API __attribute__((visibility(\"default\")))\n"
           "#endif\n\n"
+          "RECOMP_API unsigned recomp_image_guard_v2(unsigned host_version){\n"
+          "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n"
           "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
           /* Hands the block index out so a host dispatcher can do the lookup
              itself. Going through recomp_image_lookup costs three nested calls
@@ -4654,6 +5895,9 @@ typedef char recomp_layout_tpidrro[offsetof(GuestContext, tpidrro_el0) == 840 ? 
    real memory rather than near null. One global per image, since each module
    is its own shared library. */
 extern uint64_t g_module_base;
+extern int g_recomp_guard_host_v2;
+void recomp_code_guard(GuestContext*,uint64_t,const uint32_t*,uint32_t,int);
+void recomp_ic_ivau(GuestContext*,uint64_t,int);
 
 typedef void (*BlockFn)(GuestContext*);
 BlockFn recomp_lookup(uint64_t pc); void recomp_run(GuestContext* c);
@@ -4664,6 +5908,7 @@ void recomp_set_flags(GuestContext*,int,uint64_t,uint64_t,uint64_t,int);
 /* High 64 bits of a 64x64 multiply, for SMULH/UMULH. */
 uint64_t recomp_smulh(uint64_t,uint64_t);
 uint64_t recomp_umulh(uint64_t,uint64_t);
+uint64_t recomp_fp_estimate(GuestContext*,uint64_t,unsigned,int);
 int  recomp_cond(GuestContext*,unsigned);
 /* Guest memory access.
 
@@ -4704,6 +5949,9 @@ uint32_t recomp_stxp(GuestContext* c, uint64_t addr, uint32_t size, uint64_t lo,
    current PC on its interpreter fallback because the decoder had no
    translation for the instruction there. */
 #define RECOMP_HALT_UNHANDLED 2
+/* A guest breakpoint, with PC parked on BRK. Never invokes fallback. */
+#define RECOMP_HALT_BREAKPOINT 3
+#define RECOMP_HALT_IC_IVAU 4
 /* Save-data API callable from recompiled code and runtime */
 int  recomp_save_init(GuestContext* c, const char* exe_path);
 int  recomp_save_write(GuestContext* c, const char* name, const void* data, uint64_t size);
@@ -4848,6 +6096,54 @@ static uint64_t memload(GuestContext* c, uint64_t a, uint32_t sz){
 static void memstore(GuestContext* c, uint64_t a, uint32_t sz, uint64_t v){
   if(c->host_mem){ c->host_mem->store(c->host_mem->user,a,sz,v); return; }
   { uint8_t* p=memptr(c,a,sz); if(p)memcpy(p,&v,sz); }
+}
+
+/* Every generated block checks its compilation input before any guest effect.
+   This guards synchronized instruction fetch, not unsynchronized concurrent
+   mutation of an already executing block. Failure must never enter a JIT. */
+void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint32_t count,int host_guard_version){
+  uint32_t k;
+  if(c->host_mem && host_guard_version!=2){
+    c->pc=pc;
+    fprintf(stderr,"[recomp] code guard requires a guard-v2 host and guarded modules at 0x%llx\n",(unsigned long long)pc);
+    fflush(stderr); abort();
+  }
+  for(k=0;k<count;++k){
+    uint64_t va=pc+(uint64_t)k*4, actual=0;
+    int valid=va>=pc;
+    if(c->host_mem){
+      /* Guard-v2 reserved load size 0: bit32 is explicit mapping validity,
+         independently of the low32 instruction word (which may be zero). */
+      if(valid){
+        actual=c->host_mem->load(c->host_mem->user,va,0);
+        valid=(actual&UINT64_C(0x100000000))!=0;
+      }
+    }else{
+      uint64_t off=va-c->mem_base_vaddr;
+      valid=valid && c->mem && va>=c->mem_base_vaddr && off<=c->mem_size && c->mem_size-off>=4;
+      if(valid) memcpy(&actual,c->mem+off,4);
+    }
+    if(!valid || (uint32_t)actual!=expected[k]){
+      c->pc=va;
+      fprintf(stderr,"[recomp] unsupported code change or unavailable code at 0x%llx (expected %08x, read %08x)\n",
+              (unsigned long long)va,expected[k],(unsigned)(uint32_t)actual);
+      fflush(stderr); abort();
+    }
+  }
+}
+void recomp_ic_ivau(GuestContext* c,uint64_t address,int host_guard_version){
+  recomp_barrier();
+  if(c->host_mem){
+    if(host_guard_version!=2){
+      fprintf(stderr,"[recomp] IC IVAU requires a guard-v2 host and guarded modules; refusing at 0x%llx\n",(unsigned long long)c->pc);
+      fflush(stderr); abort();
+    }
+    c->pending_svc=address&~UINT64_C(63); /* payload tagged by halted, never an SVC */
+    c->halted=RECOMP_HALT_IC_IVAU;
+  }else{
+    c->pending_svc=~UINT64_C(0);
+    c->pc+=4; /* no fallback cache; the next block still verifies its bytes */
+  }
 }
 
 /* Exclusive access.

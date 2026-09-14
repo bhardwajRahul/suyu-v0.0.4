@@ -61,6 +61,12 @@ public:
     ///        (0 = Source, 1 = Build); negative leaves the current selection.
     void TriggerExportForTesting(const QString& rom_path, const QString& output_dir,
                                  int format_index = -1);
+    bool IsExportInProgressForTesting() const;
+    bool HasExportResultForTesting() const;
+    bool ExportSucceededForTesting() const;
+    int ExportProgressForTesting() const;
+    QString ExportStatusForTesting() const;
+    QString ExportOutputForTesting() const;
 
     /// Every standalone recompiled executable that has already been built for
     /// this game, one per recompiled module, newest-looking first. Empty when
@@ -72,6 +78,8 @@ public:
     ///                   library title, so both are tried.
     static QStringList FindRecompiledExecutables(const QString& game_name,
                                                  const QString& rom_path = {});
+    /// Standalone static launchers across every remembered export root, newest first.
+    static QStringList FindAllRecompiledExecutables();
 
     /// Directories that have been used as export output, most recent first.
     static QStringList RecompileOutputRoots();
@@ -85,8 +93,8 @@ public:
     };
 
     enum class RecompileBackend {
-        Dynarmic,   ///< Default — mature and stable
-        Ballistic,  ///< WIP — from pound-emu/ballistic
+        SuyuStatic, ///< In-tree AArch64-to-C ahead-of-time recompiler
+        Dynarmic,   ///< JIT baseline for comparison
     };
 
 signals:
@@ -117,16 +125,20 @@ private:
     /// can call TriggerExportForTesting() from the event loop that the export
     /// is pumping, and two exports writing the same cache directory corrupt it.
     bool export_in_progress{false};
+    bool test_driven_export{false};
+    bool test_export_has_result{false};
+    bool test_export_succeeded{false};
+    QString test_export_output;
 
     /// AOT export: scan ARM code and serialize translated compiler artifacts.
     /// Returns path to the generated cache directory, or empty string on failure.
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,
-                             RecompileBackend backend, const QString& game_name);
+                             const QString& game_name);
 
     /// Package the translated output into a platform-specific export bundle.
     bool PackageNativeExport(const QString& rom_path, const QString& cache_dir,
                              const QString& output_dir, const QString& game_name,
-                             TargetPlatform platform);
+                             TargetPlatform platform, RecompileBackend backend);
 
     QLineEdit* rom_path_edit{};
     QLineEdit* output_path_edit{};

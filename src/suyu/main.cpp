@@ -1716,6 +1716,8 @@ void GMainWindow::ConnectWidgetEvents() {
             [this](const std::string&) { OnExportGame(); });
     connect(game_list, &GameList::LaunchRecompiledRequested, this,
             &GMainWindow::OnLaunchRecompiledBuild);
+    connect(game_list, &GameList::LaunchStaticBuildRequested, this,
+            &GMainWindow::OnLaunchStaticBuild);
     connect(game_list, &GameList::AddDirectory, this, &GMainWindow::OnGameListAddDirectory);
     connect(game_list_placeholder, &GameListPlaceholder::AddDirectory, this,
             &GMainWindow::OnGameListAddDirectory);
@@ -5095,6 +5097,13 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                 last_emu_speed_.load(std::memory_order_relaxed);
             state[QStringLiteral("shaders_building")] =
                 (emulation_running && system) ? system->GPU().ShaderNotify().ShadersBuilding() : 0;
+            const auto recomp = Core::GetRecompLiveStats();
+            state[QStringLiteral("static_backend_active")] = recomp.backend_active;
+            state[QStringLiteral("static_blocks")] = static_cast<qint64>(recomp.static_blocks);
+            state[QStringLiteral("jit_transitions")] =
+                static_cast<qint64>(recomp.jit_transitions);
+            state[QStringLiteral("jit_available")] = recomp.jit_available;
+            state[QStringLiteral("guard_v2_ready")] = Core::IsRecompCodeGuardReady();
             // TAS playback progress. A replayed script is a fixed workload, so
             // the honest CPU benchmark is how long a backend takes to reach the
             // last frame - comparing FPS at equal wall-clock compares two runs
@@ -5115,11 +5124,16 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
         });
     }
     if (allow_runtime_mcp && mcp_server_ && !mcp_server_->IsRunning()) {
-        if (!mcp_server_->Start(9742)) {
-            LOG_ERROR(Frontend, "MCP Server failed to start on port 9742: {}",
+        bool port_ok = false;
+        const int configured_port = qEnvironmentVariableIntValue("SUYU_MCP_PORT", &port_ok);
+        const quint16 mcp_port = port_ok && configured_port > 0 && configured_port <= 65535
+                                     ? static_cast<quint16>(configured_port)
+                                     : 9742;
+        if (!mcp_server_->Start(mcp_port)) {
+            LOG_ERROR(Frontend, "MCP Server failed to start on port {}: {}", mcp_port,
                       mcp_server_->GetLastErrorString().toStdString());
         } else {
-            LOG_INFO(Frontend, "MCP Server started on port 9742");
+            LOG_INFO(Frontend, "MCP Server started on port {}", mcp_port);
             const auto install_firmware_from_directory = [this](const QString& firmware_source_location) -> QJsonObject {
                 if (emu_thread != nullptr && emu_thread->IsRunning()) {
                     return QJsonObject{{QStringLiteral("success"), false},
@@ -5403,6 +5417,62 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                        {QStringLiteral("target"), target},
                                        {QStringLiteral("width"), screenshot.width()},
                                        {QStringLiteral("height"), screenshot.height()}};
+                });
+
+            mcp_server_->RegisterTool(
+                QStringLiteral("capture_game_screenshot"),
+                QStringLiteral("Request a PNG screenshot from the active game renderer."),
+                QJsonObject{{QStringLiteral("type"), QStringLiteral("object")},
+                            {QStringLiteral("properties"),
+                             QJsonObject{{QStringLiteral("path"),
+                                          QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
+                                                      {QStringLiteral("description"),
+                                                       QStringLiteral("Absolute output PNG path")}}}}},
+                            {QStringLiteral("required"), QJsonArray{QStringLiteral("path")}}},
+                [this](const QJsonObject& params) -> QJsonObject {
+                    const QString output_path = params[QStringLiteral("path")].toString().trimmed();
+                    if (output_path.isEmpty()) {
+                        return QJsonObject{{QStringLiteral("success"), false},
+                                           {QStringLiteral("error"), QStringLiteral("path is required")}};
+                    }
+                    if (!emu_thread || !emu_thread->IsRunning() || !render_window) {
+                        return QJsonObject{{QStringLiteral("success"), false},
+                                           {QStringLiteral("error"),
+                                            QStringLiteral("No running game renderer is available")}};
+                    }
+                    const QFileInfo file_info(output_path);
+                    if (!QDir().mkpath(file_info.absolutePath())) {
+                        return QJsonObject{{QStringLiteral("success"), false},
+                                           {QStringLiteral("error"),
+                                            QStringLiteral("Could not create screenshot directory")},
+                                           {QStringLiteral("path"), output_path}};
+                    }
+                    render_window->CaptureScreenshot(output_path);
+                    return QJsonObject{{QStringLiteral("success"), true},
+                                       {QStringLiteral("requested"), true},
+                                       {QStringLiteral("path"), output_path}};
+                });
+
+            mcp_server_->RegisterTool(
+                QStringLiteral("get_aot_export_status"),
+                QStringLiteral("Get progress and the final result of a test-driven AOT export."),
+                QJsonObject{{QStringLiteral("type"), QStringLiteral("object")}},
+                [](const QJsonObject&) -> QJsonObject {
+                    auto* dialog = qobject_cast<GameExportDialog*>(QApplication::activeModalWidget());
+                    if (!dialog) {
+                        return QJsonObject{{QStringLiteral("available"), false},
+                                           {QStringLiteral("error"),
+                                            QStringLiteral("No GameExportDialog is currently open")}};
+                    }
+                    return QJsonObject{{QStringLiteral("available"), true},
+                                       {QStringLiteral("running"),
+                                        dialog->IsExportInProgressForTesting()},
+                                       {QStringLiteral("done"), dialog->HasExportResultForTesting()},
+                                       {QStringLiteral("success"), dialog->ExportSucceededForTesting()},
+                                       {QStringLiteral("progress"), dialog->ExportProgressForTesting()},
+                                       {QStringLiteral("status"), dialog->ExportStatusForTesting()},
+                                       {QStringLiteral("output_path"),
+                                        dialog->ExportOutputForTesting()}};
                 });
 
             mcp_server_->RegisterTool(
@@ -5719,7 +5789,12 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         const int format_index = fmt == QStringLiteral("build")   ? 1
                                                  : fmt == QStringLiteral("source") ? 0
                                                                                    : -1;
-                        dialog->TriggerExportForTesting(rom_path, output_dir, format_index);
+                        // Return the RPC response before the long export begins.
+                        // The caller polls get_aot_export_status while OnExport
+                        // pumps the nested Qt event loop.
+                        QTimer::singleShot(0, dialog, [dialog, rom_path, output_dir, format_index] {
+                            dialog->TriggerExportForTesting(rom_path, output_dir, format_index);
+                        });
                     } else if (action == QStringLiteral("nintendo_test_one_click")) {
                         // Test-only: directly invoke the One-Click Sign In
                         // handler on whatever NintendoAccountDialog is
@@ -6162,7 +6237,10 @@ static int CountPlayableLibraryEntries(QAbstractItemModel* model) {
         for (int row = 0; row < rows; ++row) {
             const QModelIndex idx = model->index(row, 0, parent);
             const QString path = idx.data(kPathRole).toString();
-            if (!path.isEmpty() && !path.startsWith(QStringLiteral("owned://")) &&
+            const bool is_game =
+                idx.data(GameListItem::TypeRole).value<GameListItemType>() ==
+                GameListItemType::Game;
+            if (is_game && !path.isEmpty() && !path.startsWith(QStringLiteral("owned://")) &&
                 QFileInfo(path).isFile()) {
                 ++count;
             }
@@ -6232,7 +6310,11 @@ void GMainWindow::OnExportGame() {
                     const QModelIndex idx = model->index(row, 0, parent);
                     const QString game_path = idx.data(kPathRole).toString();
                     const QFileInfo game_info(game_path);
-                    if (!game_path.isEmpty() && !game_path.startsWith(QStringLiteral("owned://")) &&
+                    const bool is_game =
+                        idx.data(GameListItem::TypeRole).value<GameListItemType>() ==
+                        GameListItemType::Game;
+                    if (is_game && !game_path.isEmpty() &&
+                        !game_path.startsWith(QStringLiteral("owned://")) &&
                         game_info.exists() && game_info.isFile()) {
                         const QString title = idx.data(kTitleRole).toString().trimmed().isEmpty()
                                                   ? idx.data(Qt::DisplayRole).toString()
@@ -6291,6 +6373,9 @@ void GMainWindow::OnExportGame() {
         }
     }
     dialog.exec();
+    if (game_list) {
+        game_list->PopulateAsync(UISettings::values.game_dirs);
+    }
 }
 
 void GMainWindow::OnLaunchRecompiledBuild(const QString& game_name,
@@ -6353,6 +6438,27 @@ void GMainWindow::OnLaunchRecompiledBuild(const QString& game_name,
     LOG_INFO(Frontend, "Launched standalone recompiled build '{}' (pid {})", exe.toStdString(),
              pid);
     statusBar()->showMessage(tr("Launched recompiled build (pid %1)").arg(pid), 5000);
+}
+
+void GMainWindow::OnLaunchStaticBuild(const QString& executable) {
+    const QFileInfo build(executable);
+    if (!build.isFile()) {
+        QMessageBox::warning(this, tr("Static Build"),
+                             tr("The static build no longer exists:\n%1").arg(executable));
+        return;
+    }
+
+    qint64 pid = 0;
+    if (!QProcess::startDetached(build.absoluteFilePath(), QStringList{}, build.absolutePath(),
+                                 &pid)) {
+        QMessageBox::critical(this, tr("Static Build"),
+                              tr("Could not start the static build:\n%1").arg(executable));
+        return;
+    }
+
+    LOG_INFO(Frontend, "Launched static library build '{}' (pid {})",
+             executable.toStdString(), pid);
+    statusBar()->showMessage(tr("Launched static build (pid %1)").arg(pid), 5000);
 }
 
 void GMainWindow::RunFirstRunSetupIfNeeded() {
@@ -6433,6 +6539,7 @@ namespace {
         // itself instead of calling across the shared-object boundary for it.
         int (*get_index)(u64*, u64*, Core::RecompBlockFn**);
         u64 base = 0;
+        unsigned (*guard_v2)(unsigned) = nullptr;
     };
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
@@ -6611,7 +6718,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         auto* get_index = reinterpret_cast<int (*)(u64*, u64*, Core::RecompBlockFn**)>(
             lib->resolve("recomp_image_index"));
         records.push_back(
-            RecompImage{owner.dirName().toStdString(), fn, set_base, get_index, 0});
+            RecompImage{owner.dirName().toStdString(), fn, set_base, get_index, 0,
+                        reinterpret_cast<unsigned (*)(unsigned)>(lib->resolve("recomp_image_guard_v2"))});
     }
 
     if (found.empty()) {
@@ -6718,7 +6826,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         const int n = owner_count;
         if (hint >= 0 && hint < n && owner_entries[hint].base <= pc) {
             const auto& e = owner_entries[hint];
-            if (pc >= e.idx_lo && pc <= e.idx_hi) {
+            if (pc >= e.idx_lo && pc <= e.idx_hi && ((pc - e.idx_lo) & 3) == 0) {
                 // The index covers every 4-byte slot in the module's range and
                 // holds null where no block starts, so a null here means the
                 // same thing the call would have returned.
@@ -6749,7 +6857,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
             // blocks and silently ran everything on the JIT instead.
             const auto& e = owner_entries[owner_slot];
             Core::RecompBlockFn block = nullptr;
-            if (pc >= e.idx_lo && pc <= e.idx_hi) {
+            if (pc >= e.idx_lo && pc <= e.idx_hi && ((pc - e.idx_lo) & 3) == 0) {
                 block = e.idx[(pc - e.idx_lo) >> 2];
             } else {
                 block = e.lookup(pc);
@@ -6792,6 +6900,16 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     LOG_INFO(Frontend, "recomp miss recording: {}",
              miss_record_dir.empty() ? std::string{"off"} : miss_record_dir);
     Core::SetRecompLookup(+chained);
+    bool guard_ready = !loaded_records.empty();
+    for (const auto& image : loaded_records) {
+        if (!image.guard_v2 || image.guard_v2(0) != 2) guard_ready = false;
+    }
+    for (const auto& image : loaded_records) {
+        if (image.guard_v2) image.guard_v2(guard_ready ? 2 : 0);
+    }
+    Core::SetRecompCodeGuardReady(guard_ready);
+    LOG_INFO(Frontend, "Recompiled instruction guard-v2: {}",
+             guard_ready ? "ready" : "not negotiated");
     LOG_INFO(Frontend, "Loaded {} recompiled module image(s) from {}", loaded_images.size(),
              dir.toStdString());
     return static_cast<int>(loaded_images.size());

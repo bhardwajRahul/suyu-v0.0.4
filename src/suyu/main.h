@@ -458,6 +458,7 @@ private slots:
     /// Strips the library UI down to the one game this build launches.
     void EnterSingleGameMode();
     void OnLaunchRecompiledBuild(const QString& game_name, const std::string& game_path);
+    void OnLaunchStaticBuild(const QString& executable);
     void OnNintendoAccount();
     void OnSteamIntegration();
     void OnOpenUserManual();

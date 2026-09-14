@@ -48,6 +48,9 @@ using RecompLookupFn = RecompBlockFn (*)(u64 pc);
  * own.
  */
 void SetRecompLookup(RecompLookupFn lookup);
+/// True only after every loaded compiled module negotiated guard version 2.
+void SetRecompCodeGuardReady(bool ready);
+bool IsRecompCodeGuardReady();
 
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by
