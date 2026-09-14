@@ -431,6 +431,30 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                  (unsigned long long)pc);
         put(b);
     };
+    // S/D FRECPE and FRSQRTE share one lane core; U selects reciprocal sqrt.
+    // Decode before the legacy conversion class, whose opcode is shared here.
+    const bool estimate_scalar = (i & 0xDFBFFC00u) == 0x5EA1D800u;
+    const bool estimate_vector = (i & 0x9FBFFC00u) == 0x0EA1D800u;
+    if (estimate_scalar || estimate_vector) {
+        const bool dbl = (i & (1u << 22)) != 0;
+        const bool q = (i & (1u << 30)) != 0;
+        if (estimate_vector && dbl && !q) { put_unhandled(); return true; }
+        const unsigned rn = (i >> 5) & 31, rd = i & 31;
+        const unsigned width = dbl ? 64 : 32;
+        const unsigned bytes = estimate_scalar ? width / 8 : q ? 16 : 8;
+        const unsigned lanes = bytes / (width / 8);
+        const std::string ty = dbl ? "uint64_t" : "uint32_t";
+        std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_r[" +
+                        std::to_string(lanes) + "]; memcpy(_a,c->vreg[" +
+                        std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+        s += "for(unsigned _i=0;_i<" + std::to_string(lanes) + ";++_i) _r[_i]=(" + ty +
+             ")recomp_fp_estimate(c,_a[_i]," + std::to_string(width) + "," +
+             std::to_string((i >> 29) & 1) + "); ";
+        s += "memset(c->vreg[" + std::to_string(rd) + "],0,16); memcpy(c->vreg[" +
+             std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+        put(s);
+        return true;
+    }
     const u64 next = pc + 4;
 
     if ((i & 0xFFFFF01F) == 0xD503201F) { put("/* nop/hint */"); return true; }
@@ -2889,7 +2913,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // same width. This is the vector counterpart of the general-register
             // conversion handled further up - the operand is a lane here, not a
             // general register.
-            if (opcode == 0x1D) {
+            if (opcode == 0x1D && (i & (1U << 23)) == 0) {
                 const char* ct = dbl ? "double" : "float";
                 const int fsz = dbl ? 8 : 4;
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
@@ -2907,17 +2931,17 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 put(s);
                 return true;
             }
-            // FABS / FNEG. size<0> picks the element width, as it does for
-            // every FP op in this class.
-            if (opcode == 0x0E || opcode == 0x0F) {
-                const char* ct = dbl ? "double" : "float";
+            // FABS/FNEG share opcode 0x0F; U selects negation. Opcode 0x0E
+            // is FCMLT and must reach the comparison below. Move sign bits
+            // directly so NaN payloads and FPSR remain untouched.
+            if ((i & 0x9FBFFC00) == 0x0EA0F800 && (!dbl || Q)) {
                 const int fsz = dbl ? 8 : 4;
-                const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
+                const int bytes = Q ? 16 : 8;
                 const int lanes = bytes / fsz;
-                const char* expr = (opcode == 0x0F)
-                                       ? "-_a[_i]"
-                                       : (dbl ? "fabs(_a[_i])" : "fabsf(_a[_i])");
-                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
+                const std::string ct = dbl ? "uint64_t" : "uint32_t";
+                const std::string sign = dbl ? "0x8000000000000000ULL" : "0x80000000U";
+                const std::string expr = U ? "_a[_i]^" + sign : "_a[_i]&~" + sign;
+                std::string s = "{ " + ct + " _a[" + std::to_string(lanes) +
                                 "],_r[" + std::to_string(lanes) + "]; ";
                 s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
                      "); ";
@@ -3508,10 +3532,11 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 if (sz <= 8) {
                     s += "{ uint64_t _p0,_p1; recomp_ldp" + std::to_string(bits) + "(c," + addr +
                          ",&_p0,&_p1); ";
-                    s += "memcpy(&c->vreg[" + std::to_string(rt) + "][0],&_p0," +
-                         std::to_string(sz) + "); c->vreg[" + std::to_string(rt) + "][1]=0; ";
-                    s += "memcpy(&c->vreg[" + std::to_string(rt2) + "][0],&_p1," +
-                         std::to_string(sz) + "); c->vreg[" + std::to_string(rt2) + "][1]=0; }";
+                    // The pair helper zero-extends S values; write the entire low half.
+                    s += "c->vreg[" + std::to_string(rt) + "][0]=_p0; c->vreg[" +
+                         std::to_string(rt) + "][1]=0; ";
+                    s += "c->vreg[" + std::to_string(rt2) + "][0]=_p1; c->vreg[" +
+                         std::to_string(rt2) + "][1]=0; }";
                 } else {
                     // 128-bit: one pair per register.
                     s += "recomp_ldp64(c," + addr + ",&c->vreg[" + std::to_string(rt) +
@@ -4251,7 +4276,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        // Overridable: -O1 suits a hybrid image, where the SIMD-heavy blocks stay
        // on the JIT anyway, but a JIT-free image owns those blocks and GCC does
        // not vectorise at all below -O2.
-       << "  set(RECOMP_OPT_FLAGS \"-O1\" CACHE STRING\n"
+       << "  set(RECOMP_OPT_FLAGS \"-O1 -foptimize-sibling-calls\" CACHE STRING\n"
           "      \"optimisation flags for the generated block bodies\")\n"
        << "  separate_arguments(_recomp_opt NATIVE_COMMAND \"${RECOMP_OPT_FLAGS}\")\n"
        << "  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "
@@ -4663,6 +4688,7 @@ void recomp_svc(GuestContext*,unsigned); void recomp_unhandled(GuestContext*,uin
 void recomp_barrier(void);
 /* AES S-box, forward or inverse. Built on first call. */
 const uint8_t* recomp_aes_sbox(int inverse);
+uint64_t recomp_fp_estimate(GuestContext*,uint64_t,unsigned,int);
 /* Load-exclusive: marks the address and returns its contents.
    Store-exclusive: returns 0 on success and 1 if the mark was lost, which is
    the sense of the status register STXR writes (0 = stored). */
@@ -4688,6 +4714,62 @@ int  recomp_save_exists(GuestContext* c, const char* name);
 int  recomp_load_segments(GuestContext* c, const char* data_dir);
 #endif
 )RT";
+}
+
+inline const char* EstimateRuntimeC() {
+    return R"EST(/* Isolated Armv8 S/D reciprocal-estimate prototype. Integer-only lane core.
+ * Exception flags accumulate in *fpsr. Exception traps are not delivered here.
+ * Interfaces deliberately do not depend on GuestContext or shared emitter code.
+ */
+
+uint64_t recomp_fp_estimate(GuestContext* c,uint64_t bits,unsigned width,int rsqrt){
+ uint32_t fpcr=(uint32_t)c->fpcr;
+ uint64_t *fpsr=&c->fpsr;
+ const unsigned fracbits=width==32?23:52;
+ const unsigned expbits=width==32?8:11;
+ const int bias=width==32?127:1023,emin=1-bias;
+ const uint64_t hidden=UINT64_C(1)<<fracbits;
+ const uint64_t fracmask=hidden-1,expmask=((UINT64_C(1)<<expbits)-1)<<fracbits;
+ const uint64_t sign=bits&(UINT64_C(1)<<(width-1));
+ const uint64_t quiet=hidden>>1,defnan=expmask|quiet;
+ uint64_t frac=bits&fracmask;
+ unsigned rawexp=(unsigned)((bits&expmask)>>fracbits);
+ if(rawexp==((1u<<expbits)-1)&&frac){
+  if(!(frac&quiet))*fpsr|=1;
+  return(fpcr&(1u<<25))?defnan:(bits|quiet);
+ }
+ if(!rawexp&&frac&&(fpcr&(1u<<24))){*fpsr|=128;frac=0;}
+ if(!rawexp&&!frac){*fpsr|=2;return sign|expmask;}
+ if(rsqrt&&sign){*fpsr|=1;return defnan;}
+ if(rawexp==((1u<<expbits)-1))return sign;
+ int exponent=rawexp?(int)rawexp-bias:emin;
+ uint64_t mant=rawexp?(hidden|frac):frac;
+ while(mant<hidden){mant<<=1;exponent--;}
+ if(!rsqrt){
+  if(exponent<emin-2){
+   unsigned rm=(fpcr>>22)&3;
+   int inf=rm==0||(rm==1&&!sign)||(rm==2&&sign);
+   *fpsr|=4|16;return sign|(inf?expmask:(expmask-1));
+  }
+  if((fpcr&(1u<<24))&&exponent>=-emin){*fpsr|=8;return sign;}
+  uint64_t scaled=mant>>(fracbits-8);
+  uint64_t estimate=(((UINT64_C(1)<<19)/(2*scaled+1)+1)/2)&255;
+  int out_exp=-exponent-1;
+  uint64_t sig=(256+estimate)<<(fracbits-8);
+  if(out_exp<emin)return sign|(sig>>(emin-out_exp));
+  return sign|((uint64_t)(out_exp+bias)<<fracbits)|(estimate<<(fracbits-8));
+ }
+ uint64_t a=mant>>(fracbits-((exponent%2==0)?7:8));
+ a=a<256?2*a+1:2*(a|1);
+ unsigned lo=512,hi=1024;
+ while(lo+1<hi){unsigned mid=(lo+hi)/2;if(a*mid*mid<(UINT64_C(1)<<28))lo=mid;else hi=mid;}
+ uint64_t estimate=((lo+1)/2)&255;
+ int neg=-exponent-1;
+ int out_exp=neg>=0?neg/2:-((-neg+1)/2);
+ return ((uint64_t)(out_exp+bias)<<fracbits)|(estimate<<(fracbits-8));
+}
+
+)EST";
 }
 
 inline const char* RuntimeC() {
@@ -5217,7 +5299,8 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
-    return text.c_str();
+    static const std::string with_estimates = text + EstimateRuntimeC();
+    return with_estimates.c_str();
 }
 
 } // namespace suyu::recomp
