@@ -648,19 +648,23 @@ struct ArmRecomp::Impl {
     static u64 HostLoad(void* user, u64 va, u32 size) {
         va &= 0xffffffffffffULL;
         auto& memory = static_cast<Impl*>(user)->system.ApplicationMemory();
-        switch (size) {
-        case 0: // Negotiated guard-v2 checked instruction read; zero is a valid word.
-            if (va > ~u64{0} - 3) return 0;
-            for (u64 offset = 0; offset < 4; ++offset) {
+        if (size == 0) {
+            u64 instruction = 0;
+            for (u32 offset = 0; offset < sizeof(u32); ++offset) {
                 if (!memory.IsValidVirtualAddress(va + offset)) return 0;
+                instruction |= static_cast<u64>(memory.Read8(va + offset)) << (offset * 8);
             }
-            return (u64{1} << 32) | memory.Read32(va);
-        case 1: return memory.Read8(va);
-        case 2: return memory.Read16(va);
-        case 4: return memory.Read32(va);
-        case 8: return memory.Read64(va);
-        default: return 0;
+            return (u64{1} << 32) | instruction;
         }
+        if ((size != 1 && size != 2 && size != 4 && size != 8) ||
+            size > 0x1000000000000ULL - va) {
+            return 0;
+        }
+        u64 value = 0;
+        for (u32 offset = 0; offset < size; ++offset) {
+            value |= static_cast<u64>(memory.Read8(va + offset)) << (offset * 8);
+        }
+        return value;
     }
 
     static void HostStore(void* user, u64 va, u32 size, u64 value) {

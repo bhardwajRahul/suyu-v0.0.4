@@ -85,6 +85,7 @@ class GeneratedMemory(unittest.TestCase):
         stub = r'''
 using u64=uint64_t; using u32=uint32_t; using u8=uint8_t;
 struct TestMemory {
+    bool IsValidVirtualAddress(u64) const { return true; }
     u8 Read8(u64 a) { return (u8)read_cb(nullptr,a,1); }
     void Write8(u64 a,u8 v) { write_cb(nullptr,a,1,v); }
 };
