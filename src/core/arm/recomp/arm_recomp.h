@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <memory>
 #include <map>
 #include <string>
@@ -98,6 +99,7 @@ struct RecompExecutionStats {
     u64 no_fallback{};
 };
 RecompExecutionStats GetRecompExecutionStats();
+std::array<u64, 4> GetRecompCurrentPcs();
 
 /**
  * CPU backend that executes statically recompiled AArch64 rather than JITing

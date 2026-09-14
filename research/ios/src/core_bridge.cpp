@@ -8,6 +8,7 @@
 #endif
 namespace SwitchAOT {
 namespace { std::unique_ptr<Registry> active; }
+extern "C" int switch_aot_enable_guards(void);
 // All three operations require a stopped core, with ALL guest threads joined.
 // Install BEFORE System::Load / KProcess::InitializeInterfaces.
 bool InstallStaticImages() {
@@ -16,6 +17,7 @@ bool InstallStaticImages() {
     const auto* modules = suyu_recomp_static_modules(&count);
     auto candidate = std::make_unique<Registry>(modules, count);
     if (!candidate->Error().empty()) return false;
+    if (!switch_aot_enable_guards()) return false;
     active = std::move(candidate);
     Core::SetRecompBaseSetter(nullptr);
     Core::SetRecompPrepareCallback([](const Core::RecompModules& inventory) {

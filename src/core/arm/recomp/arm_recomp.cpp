@@ -248,6 +248,7 @@ struct RecompCounters {
 };
 
 RecompCounters g_counters;
+std::array<std::atomic<u64>, 4> g_current_pcs{};
 std::atomic<int> g_live_instances{0};
 
 /// The block tally is incremented once per executed block by every guest
@@ -431,6 +432,14 @@ RecompExecutionStats GetRecompExecutionStats() {
     };
 }
 
+std::array<u64, 4> GetRecompCurrentPcs() {
+    std::array<u64, 4> result{};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        result[index] = g_current_pcs[index].load(std::memory_order_relaxed);
+    }
+    return result;
+}
+
 void SetRecompLookup(RecompLookupFn lookup) {
     g_recomp_lookup.store(lookup, std::memory_order_release);
 }
@@ -596,11 +605,19 @@ struct ArmRecomp::Impl {
 
     static u64 HostLoad(void* user, u64 va, u32 size) {
         va &= 0xffffffffffffULL;
+        auto& memory = static_cast<Impl*>(user)->system.ApplicationMemory();
+        if (size == 0) {
+            for (u32 i = 0; i < sizeof(u32); ++i) {
+                if (!memory.IsValidVirtualAddress(va + i)) {
+                    return 0;
+                }
+            }
+            return (u64{1} << 32) | memory.Read32(va);
+        }
         if ((size != 1 && size != 2 && size != 4 && size != 8) ||
             size > 0x1000000000000ULL - va) {
             return 0;
         }
-        auto& memory = static_cast<Impl*>(user)->system.ApplicationMemory();
         // Resolve each byte independently: adjacent guest pages need not have
         // adjacent host backing, including on 16 KiB hosts. Read8 preserves
         // unmapped/debug/GPU tracking behavior for every page touched.
@@ -1000,6 +1017,9 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
 }
 
 ArmRecomp::~ArmRecomp() {
+    if (impl->core_index < g_current_pcs.size()) {
+        g_current_pcs[impl->core_index].store(0, std::memory_order_relaxed);
+    }
     // Report on the *first* instance torn down, not the last. Waiting for the
     // last one means the report is lost whenever anything still holds a
     // reference at shutdown - which happens, and silently costs the whole run's
@@ -1176,6 +1196,9 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     impl->ctx.halted = 0;
 
     while (!impl->ctx.halted) {
+        if (impl->core_index < g_current_pcs.size()) {
+            g_current_pcs[impl->core_index].store(impl->ctx.pc, std::memory_order_relaxed);
+        }
         if (impl->interrupted.load(std::memory_order_relaxed)) {
             return HaltReason::BreakLoop;
         }
