@@ -6,6 +6,7 @@
 
 #include <QApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHeaderView>
@@ -513,19 +514,43 @@ void GameList::AddStaticBuildEntries() {
     if (builds.isEmpty()) {
         return;
     }
+
     auto* static_dir = new GameListStaticBuildsDir();
     for (const QString& executable : builds) {
         const QFileInfo info(executable);
+        QFile readme(info.dir().filePath(QStringLiteral("README_NATIVE_EXPORT.txt")));
+        const bool is_hybrid = readme.open(QIODevice::ReadOnly | QIODevice::Text) &&
+                               QString::fromUtf8(readme.readLine())
+                                   .contains(QStringLiteral("Hybrid AOT + JIT"), Qt::CaseInsensitive);
+        const QString backend_label =
+            is_hybrid ? tr("Hybrid AOT + JIT") : tr("suyu static (Experimental)");
         QList<QStandardItem*> row;
-        row.append(new GameListStaticBuildItem(executable, info.completeBaseName()));
+        auto* build_item =
+            new GameListStaticBuildItem(executable, info.completeBaseName(), backend_label);
+        build_item->setToolTip(
+            is_hybrid
+                ? tr("Recommended for best performance. Uses static AOT code with Dynarmic "
+                     "JIT fallback.")
+                : tr("Experimental static build. Loading and gameplay can be slower. "
+                     "Use Hybrid AOT + JIT for best performance."));
+        row.append(build_item);
         row.append(new GameListItem(QStringLiteral("Native")));
         row.append(new GameListItem);
-        row.append(new GameListItem(QStringLiteral("suyu static AOT")));
+        row.append(new GameListItem(backend_label));
         row.append(new GameListItemSize(static_cast<qulonglong>(info.size())));
         row.append(new GameListItemPlayTime(0));
         static_dir->appendRow(row);
     }
-    item_model->invisibleRootItem()->appendRow(static_dir);
+
+    int insert_at = item_model->invisibleRootItem()->rowCount();
+    if (insert_at > 0 &&
+        item_model->invisibleRootItem()
+                ->child(insert_at - 1)
+                ->data(GameListItem::TypeRole)
+                .value<GameListItemType>() == GameListItemType::AddDir) {
+        --insert_at;
+    }
+    item_model->invisibleRootItem()->insertRow(insert_at, static_dir);
     tree_view->setExpanded(static_dir->index(), true);
 }
 
@@ -709,7 +734,7 @@ void GameList::PopupContextMenu(const QPoint& menu_location) {
 }
 
 void GameList::AddStaticBuildPopup(QMenu& context_menu, const QString& executable) {
-    QAction* launch = context_menu.addAction(tr("Launch static build"));
+    QAction* launch = context_menu.addAction(tr("Launch AOT build"));
     QAction* open_folder = context_menu.addAction(tr("Open build folder"));
     connect(launch, &QAction::triggered, this,
             [this, executable] { emit LaunchStaticBuildRequested(executable); });

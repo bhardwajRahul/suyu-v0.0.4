@@ -134,6 +134,7 @@ signals:
     void RecompileGameRequested(const std::string& game_path);
     /// Run an already-built standalone recompiled build instead of emulating.
     void LaunchRecompiledRequested(const QString& game_name, const std::string& game_path);
+    /// Run a standalone static build selected from the dedicated static library.
     void LaunchStaticBuildRequested(const QString& executable);
     void NavigateToGamedbEntryRequested(u64 program_id,
                                         const CompatibilityList& compatibility_list);

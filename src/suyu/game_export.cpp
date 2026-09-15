@@ -331,10 +331,12 @@ void GameExportDialog::SetupUi() {
     auto* backend_row = new QHBoxLayout();
     backend_row->addWidget(new QLabel(tr("CPU Backend:"), this));
     backend_combo = new QComboBox(this);
-    backend_combo->addItem(tr("suyu static AOT"),
+    backend_combo->addItem(tr("suyu static (Experimental)"),
                            static_cast<int>(RecompileBackend::SuyuStatic));
 #ifndef SUYU_NO_JIT
-    backend_combo->addItem(tr("Dynarmic JIT"),
+    backend_combo->addItem(tr("Hybrid AOT + JIT"),
+                           static_cast<int>(RecompileBackend::Hybrid));
+    backend_combo->addItem(tr("Dynarmic JIT (Baseline)"),
                            static_cast<int>(RecompileBackend::Dynarmic));
 #endif
     backend_combo->setCurrentIndex(0);
@@ -367,7 +369,7 @@ void GameExportDialog::SetupUi() {
     steam_replace_rom_checkbox->setEnabled(false);
 
     fallback_to_interpreter_checkbox = new QCheckBox(
-        tr("Fall back to interpreter if a module fails to recompile"), this);
+        tr("Allow Dynarmic fallback if a module fails to recompile"), this);
     fallback_to_interpreter_checkbox->setChecked(true);
     fallback_to_interpreter_checkbox->setToolTip(
         tr("When checked: if a module cannot be recompiled (e.g. too complex, "
@@ -445,25 +447,34 @@ void GameExportDialog::SetupUi() {
     connect(rom_browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseRom);
     connect(browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseOutput);
     connect(export_button, &QPushButton::clicked, this, &GameExportDialog::OnExport);
+    const auto update_backend_options = [this, note_label](int) {
+        const auto backend =
+            static_cast<RecompileBackend>(backend_combo->currentData().toInt());
+        const bool uses_aot = backend != RecompileBackend::Dynarmic;
+        const bool is_hybrid = backend == RecompileBackend::Hybrid;
+        aot_full_scan_checkbox->setEnabled(uses_aot);
+        fallback_to_interpreter_checkbox->setEnabled(is_hybrid);
+        fallback_to_interpreter_checkbox->setChecked(is_hybrid);
+        output_format_combo->setEnabled(uses_aot);
+        if (backend == RecompileBackend::SuyuStatic) {
+            note_label->setText(
+                tr("Experimental: translates the game's ARM64 code ahead of time with no JIT "
+                   "fallback. Loading and gameplay can be slower. Uncovered code stops execution; "
+                   "compatibility must be checked for each title. Use Hybrid AOT + JIT for best "
+                   "performance."));
+        } else if (is_hybrid) {
+            note_label->setText(
+                tr("Recommended for best performance. Runs recompiled AOT code first and uses "
+                   "Dynarmic JIT for uncovered blocks or modules."));
+        } else {
+            note_label->setText(
+                tr("Packages the game with Dynarmic as a JIT baseline for direct comparison. "
+                   "No AOT source is generated."));
+        }
+    };
     connect(backend_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this, note_label](int) {
-                const auto backend =
-                    static_cast<RecompileBackend>(backend_combo->currentData().toInt());
-                const bool is_static = backend == RecompileBackend::SuyuStatic;
-                aot_full_scan_checkbox->setEnabled(is_static);
-                fallback_to_interpreter_checkbox->setEnabled(is_static);
-                output_format_combo->setEnabled(is_static);
-                note_label->setText(
-                    is_static
-                        ? tr("Translates the game's ARM64 code into C. Output mirrors the ROM "
-                             "structure: exefs/ holds one C project per module (main, rtld, sdk, "
-                             "...). Build has suyu compile it for you (slow on large titles). "
-                             "Source gives you the C + CMakeLists.txt to compile yourself. With "
-                             "fallback enabled, modules that fail recompile use the dynarmic JIT "
-                             "at runtime.")
-                        : tr("Packages the game with Dynarmic as a JIT baseline for direct "
-                             "comparison with suyu static AOT. No AOT source is generated."));
-            });
+            update_backend_options);
+    update_backend_options(backend_combo->currentIndex());
 }
 
 void GameExportDialog::SetLibraryEntries(QVector<LibraryEntry> entries) {
@@ -498,7 +509,36 @@ void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QS
     }
     SetRomPath(rom_path);
     output_path_edit->setText(output_dir);
+    test_driven_export = true;
+    test_export_has_result = false;
+    test_export_succeeded = false;
+    test_export_output.clear();
     OnExport();
+    test_driven_export = false;
+}
+
+bool GameExportDialog::IsExportInProgressForTesting() const {
+    return export_in_progress;
+}
+
+bool GameExportDialog::HasExportResultForTesting() const {
+    return test_export_has_result;
+}
+
+bool GameExportDialog::ExportSucceededForTesting() const {
+    return test_export_succeeded;
+}
+
+int GameExportDialog::ExportProgressForTesting() const {
+    return progress_bar ? progress_bar->value() : 0;
+}
+
+QString GameExportDialog::ExportStatusForTesting() const {
+    return status_label ? status_label->text() : QString{};
+}
+
+QString GameExportDialog::ExportOutputForTesting() const {
+    return test_export_output;
 }
 
 void GameExportDialog::OnBrowseRom() {
@@ -1511,6 +1551,7 @@ bool GameExportDialog::WantsCompiledOutput() const {
 
 QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                            const QString& cache_dir,
+                                           RecompileBackend backend,
                                            const QString& game_name) {
     QDir().mkpath(cache_dir);
 
@@ -1538,8 +1579,10 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     }
 
     const bool full_scan = aot_full_scan_checkbox->isChecked();
-    const QString requested_backend_name = QStringLiteral("suyu-static");
-    const QString effective_backend_name = QStringLiteral("suyu-static");
+    const bool is_hybrid = backend == RecompileBackend::Hybrid;
+    const QString requested_backend_name =
+        is_hybrid ? QStringLiteral("suyu-hybrid") : QStringLiteral("suyu-static");
+    const QString effective_backend_name = requested_backend_name;
 
     // A completed export is immutable for a given game/output directory and
     // scan mode. Reusing it makes re-opening the export dialog or packaging
@@ -1706,7 +1749,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         }
     }
 
-    const bool fallback_enabled = fallback_to_interpreter_checkbox &&
+    const bool fallback_enabled = is_hybrid && fallback_to_interpreter_checkbox &&
                                   fallback_to_interpreter_checkbox->isChecked();
 
     u64 recomp_total_blocks = 0;
@@ -1795,7 +1838,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             if (!fallback_enabled) {
                 QMessageBox::critical(
                     this, tr("Export Failed"),
-                    tr("Module '%1' could not be recompiled.\n\nEnable 'Fall back to interpreter' "
+                    tr("Module '%1' could not be recompiled.\n\nChoose Hybrid AOT + JIT "
                        "to skip failed modules and use the dynarmic JIT for them at runtime.")
                         .arg(mod.name));
                 return {};
@@ -1869,7 +1912,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     QMessageBox::critical(
                         this, tr("Build Failed"),
                         tr("Compiling module '%1' failed.\n\nThe generated sources are still in:\n"
-                           "%2\n\nEnable 'Fall back to interpreter' to continue despite build "
+                           "%2\n\nChoose Hybrid AOT + JIT to continue despite build "
                            "failures. See the suyu log for compiler output.")
                             .arg(mod.name, mod_dir));
                     return {};
@@ -1886,7 +1929,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 QMessageBox::critical(
                     this, tr("Build Failed"),
                     tr("CMake could not configure module '%1'.\n\nThe generated sources are in:\n"
-                       "%2\n\nEnable 'Fall back to interpreter' to continue despite failures.")
+                       "%2\n\nChoose Hybrid AOT + JIT to continue despite failures.")
                         .arg(mod.name, mod_dir));
                 return {};
             }
@@ -1981,6 +2024,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                  "typedef void (*SuyuRecompBlockFn)(void*);\n\n";
             for (const auto& m : ordered) {
                 o << "extern SuyuRecompBlockFn recomp_image_lookup_" << m << "(uint64_t);\n"
+                  << "extern unsigned recomp_image_guard_v2_" << m << "(unsigned);\n"
+                  << "extern unsigned recomp_image_abi_" << m << "(void);\n"
+                  << "extern void recomp_image_run_slice_" << m << "(void*);\n"
                   << "extern void recomp_image_set_base_" << m << "(uint64_t);\n"
                   << "extern uint64_t g_module_base_" << m << ";\n";
             }
@@ -1988,18 +2034,37 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                  "    const char* name;\n"
                  "    SuyuRecompBlockFn (*lookup)(uint64_t);\n"
                  "    void (*set_base)(uint64_t);\n"
+                 "    SuyuRecompBlockFn run_slice;\n"
+                 "    unsigned (*image_abi)(void);\n"
                  "} SuyuRecompStaticModule;\n\n"
                  "static const SuyuRecompStaticModule s_modules[] = {\n";
             for (const auto& m : ordered) {
                 o << "    { \"" << m << "\", recomp_image_lookup_" << m
-                  << ", recomp_image_set_base_" << m << " },\n";
+                  << ", recomp_image_set_base_" << m << ", recomp_image_run_slice_" << m
+                  << ", recomp_image_abi_" << m << " },\n";
             }
             o << "};\n\n"
-                 "const SuyuRecompStaticModule* suyu_recomp_static_modules(unsigned* count) {\n"
+                 "const SuyuRecompStaticModule* suyu_recomp_static_modules_v4(unsigned* count) {\n"
                  "    *count = (unsigned)(sizeof(s_modules) / sizeof(s_modules[0]));\n"
                  "    return s_modules;\n"
                  "}\n";
+            o << "int suyu_recomp_static_guard_v2(unsigned version) {\n  int ready=version==2;\n";
+            for (const auto& m : ordered) {
+                o << "  if(recomp_image_guard_v2_" << m << "(0)!=2) ready=0;\n";
+            }
+            for (const auto& m : ordered) {
+                o << "  recomp_image_guard_v2_" << m << "(ready?2:0);\n";
+            }
+            o << "  return ready;\n}\n";
             reg.close();
+            QFile abi_marker(recomp_root + QDir::separator() + QStringLiteral("recomp_abi_v4.h"));
+            if (abi_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                abi_marker.write("/* ABI 4 registry includes nonrecursive slice and image ABI exports. */\n");
+            }
+            QFile guard_marker(recomp_root + QDir::separator() + QStringLiteral("recomp_guard_v2.h"));
+            if (guard_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                guard_marker.write("/* Separate guarded-code registration; legacy module registry ABI unchanged. */\n");
+            }
         }
 
         // Locate the suyu build tree this frontend was built from. The static
@@ -2125,7 +2190,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     conf, candidate,
                     {QStringLiteral("-S"), source_tree, QStringLiteral("-B"), build_tree,
                      QStringLiteral("-DSUYU_CMD_RECOMP_DIR=") +
-                         QDir::fromNativeSeparators(recomp_root)},
+                         QDir::fromNativeSeparators(recomp_root),
+                     QStringLiteral("-DSUYU_RECOMP_HYBRID=") +
+                         (is_hybrid ? QStringLiteral("ON") : QStringLiteral("OFF"))},
                     &conf_log);
                 if (conf_rc == 0) {
                     cmake_exe = candidate;
@@ -2350,24 +2417,28 @@ static QString AotCacheDirFor(const QString& output_dir, const QString& game_nam
 bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QString& cache_dir,
                                            const QString& output_dir, const QString& game_name,
                                            TargetPlatform platform, RecompileBackend backend) {
-    const bool is_static = backend == RecompileBackend::SuyuStatic;
+    const bool uses_aot = backend != RecompileBackend::Dynarmic;
+    const bool is_hybrid = backend == RecompileBackend::Hybrid;
     const QString package_name =
-        is_static ? game_name : game_name + QStringLiteral(" - Dynarmic JIT");
+        backend == RecompileBackend::SuyuStatic
+            ? game_name
+            : game_name + (is_hybrid ? QStringLiteral(" - Hybrid AOT + JIT")
+                                     : QStringLiteral(" - Dynarmic JIT"));
     // The original ROM used to be copied into every package. It is not needed
     // there: the recompiled project carries the guest segments it executes in
     // <module>/data, and nothing in the package or in suyu ever opened the copy.
     // All it did was add the ROM's full size - several gigabytes for an XCI - to
     // an output that is otherwise tens of megabytes of C. The source is recorded
     // by path instead, so the export can still be traced back to it.
-    const auto write_source_reference = [&rom_path, is_static](const QString& dir) {
+    const auto write_source_reference = [&rom_path, uses_aot](const QString& dir) {
         QFile ref(dir + QDir::separator() + QStringLiteral("game_source.txt"));
         if (!ref.open(QIODevice::WriteOnly | QIODevice::Text)) {
             return;
         }
         QTextStream out(&ref);
-        out << (is_static ? "Recompiled from: " : "JIT baseline exported from: ")
+        out << (uses_aot ? "Recompiled from: " : "JIT baseline exported from: ")
             << QDir::toNativeSeparators(rom_path) << "\n";
-        if (is_static) {
+        if (uses_aot) {
             out << "The ROM is referenced, not bundled - the generated project runs from the guest\n"
                 << "segments in aot_cache/recompiled/<module>/data and does not read this file.\n";
         } else {
@@ -2390,7 +2461,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // just sits there looking like part of the new export. Strip it so a
         // format switch on the same output folder doesn't leave orphaned
         // binaries next to freshly generated C source.
-        if (is_static && !WantsCompiledOutput()) {
+        if (uses_aot && !WantsCompiledOutput()) {
             QFile::remove(pkg_dir + QDir::separator() + package_name + QStringLiteral(".exe"));
             for (const char* dll : {"avcodec-61.dll", "avformat-61.dll", "avutil-59.dll",
                                      "dxcompiler.dll", "dxil.dll", "libcrypto.dll", "libssl.dll",
@@ -2444,7 +2515,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // where the static link could not be produced.
         const QString static_launcher =
             cache_dir + QStringLiteral("/launcher/static_launcher.exe");
-        const bool has_static_launcher = is_static && QFile::exists(static_launcher);
+        const bool has_static_launcher = uses_aot && QFile::exists(static_launcher);
 
         // The generated C source and per-module build trees under aot_cache/
         // are compile-time-only: once the static launcher exists, everything
@@ -2454,7 +2525,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // it" rather than a native game) only makes sense for Source-format
         // exports, where the user asked for the C project instead of a
         // compiled binary.
-        if (is_static && !has_static_launcher) {
+        if (uses_aot && !has_static_launcher) {
             write_source_reference(pkg_dir);
             if (!CopyDirectoryUnlessInPlace(
                     cache_dir, pkg_dir + QDir::separator() + QStringLiteral("aot_cache"))) {
@@ -2468,7 +2539,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // That produces the misleading "game.exe + ROM" bundle which still
         // depends on recompiled DLLs (or falls back to JIT), rather than the
         // self-contained executable promised by this export mode.
-        if (is_static && WantsCompiledOutput() && !has_static_launcher) {
+        if (uses_aot && WantsCompiledOutput() && !has_static_launcher) {
             LOG_ERROR(Frontend, "Static recompiled launcher was not produced: {}",
                       static_launcher.toStdString());
             // Built explicitly rather than via QMessageBox::critical so the text
@@ -2489,7 +2560,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         const QString launcher_src = has_static_launcher
                                          ? static_launcher
                                          : bin_dir + QStringLiteral("/suyu-cmd.exe");
-        if (!is_static && !QFile::exists(launcher_src)) {
+        if (!uses_aot && !QFile::exists(launcher_src)) {
             LOG_ERROR(Frontend, "Dynarmic baseline launcher was not found: {}",
                       launcher_src.toStdString());
             return false;
@@ -2579,7 +2650,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // weight sitting in what's supposed to be a tidy, standalone game
         // folder. Delete it; a repeat export just recompiles (fast, thanks
         // to the /O1 + /MP codegen flags) rather than reusing this cache.
-        if (has_static_launcher || !is_static) {
+        if (has_static_launcher || !uses_aot) {
             QDir(cache_dir).removeRecursively();
         } else {
             QDir(pkg_dir + QStringLiteral("/aot_cache/launcher")).removeRecursively();
@@ -2592,34 +2663,42 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         QFile readme(pkg_dir + QDir::separator() + QStringLiteral("README_NATIVE_EXPORT.txt"));
         if (readme.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream out(&readme);
-            if (!is_static) {
-                out << "Dynarmic JIT baseline — standalone comparison package\n\n"
+            if (!uses_aot) {
+                out << "Dynarmic JIT (Baseline) — standalone comparison package\n\n"
                     << "Run: double-click launch.bat (or " << package_name << ".exe directly)\n\n"
                     << "The game's extracted ARM64 code runs through the Dynarmic JIT. This build\n"
-                    << "is intended as the baseline for comparing suyu static AOT.\n"
+                    << "is the baseline for comparing suyu static (Experimental) and Hybrid AOT + JIT.\n"
                     << "No original ROM or decryption keys are needed at runtime.\n";
                 readme.close();
                 MaybeAddToSteam(package_name, launcher_dst);
                 return true;
             }
-            out << "Recompiled native build — fully standalone, no ROM or keys needed to run\n\n";
-            out << "Run: double-click launch.bat (or " << game_name << ".exe directly)\n\n";
+            out << (is_hybrid
+                        ? "Recompiled native build — Hybrid AOT + JIT\n\n"
+                        : "Recompiled native build — suyu static (Experimental), no JIT fallback\n\n");
+            out << "Run: double-click launch.bat (or " << package_name << ".exe directly)\n\n";
             out << "This is the game itself, statically recompiled to x86 machine code and\n";
-            out << "linked into " << game_name << ".exe alongside suyu's HLE/GPU/audio backend\n";
+            out << "linked into " << package_name << ".exe alongside suyu's HLE/GPU/audio backend\n";
             out << "- no emulator install and no separate DLLs for the game code.\n\n";
             out << "What runs native vs emulated:\n";
-            out << "- Native  : the game's own CPU code, translated ahead of time to C and\n";
-            out << "            compiled into this exe. No instruction decoding at run time.\n";
+            out << "- Native  : AOT CPU code, translated ahead of time to C and compiled into\n";
+            out << "            this exe. This portion needs no instruction decoding at runtime.\n";
             out << "- Emulated: system calls, OS services (filesystem, input, audio, sockets)\n";
             out << "            and the GPU, all served by suyu's HLE backend built into the\n";
             out << "            same exe. A console game cannot run without these.\n";
-            out << "- Fallback: a small interpreter covers the few instructions the static\n";
-            out << "            recompiler cannot translate yet (mostly rare SIMD forms) and\n";
-            out << "            code only reachable through computed branches. It runs on\n";
-            out << "            demand and hands control straight back; correctness never\n";
-            out << "            depends on how much of the program it covers.\n\n";
+            if (is_hybrid) {
+                out << "- Fallback: Dynarmic JIT executes blocks or modules not covered by the\n"
+                    << "            static image, then returns control to AOT code.\n\n";
+                out << "Recommended for best performance.\n\n";
+            } else {
+                out << "- Fallback: disabled. Uncovered code stops execution. A successful run\n"
+                    << "            validates only the paths exercised in that run.\n\n";
+                out << "Experimental: loading and gameplay can be slower. Compatibility must be\n"
+                    << "checked for each title. Use Hybrid AOT + JIT for best performance.\n\n";
+            }
             out << "Contents:\n";
-            out << "- " << game_name << ".exe : the game (recompiled code + HLE/GPU backend, one file)\n";
+            out << "- " << package_name
+                << ".exe : the game (recompiled code + HLE/GPU backend, one file)\n";
             out << "- launch.bat      : one-click launcher\n";
             out << "- exefs/          : the game's own executables and data, extracted once at\n";
             out << "                    export time so no ROM or decryption keys are needed to run\n";
@@ -2637,7 +2716,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
 
     case TargetPlatform::Linux: {
         const QString appdir =
-            output_dir + QDir::separator() + game_name + QStringLiteral(".AppDir");
+            output_dir + QDir::separator() + package_name + QStringLiteral(".AppDir");
         const QString bin_dir = appdir + QDir::separator() + QStringLiteral("usr/bin");
         if (!QDir().mkpath(bin_dir)) {
             return false;
@@ -2665,7 +2744,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
 
     case TargetPlatform::MacOS: {
         const QString app_bundle =
-            output_dir + QDir::separator() + game_name + QStringLiteral(".app");
+            output_dir + QDir::separator() + package_name + QStringLiteral(".app");
         const QString contents_dir = app_bundle + QDir::separator() + QStringLiteral("Contents");
         const QString res_dir = contents_dir + QDir::separator() + QStringLiteral("Resources");
         if (!QDir().mkpath(contents_dir) || !QDir().mkpath(res_dir)) {
@@ -2733,6 +2812,7 @@ QStringList GameExportDialog::RecompileOutputRoots() {
 
 QStringList GameExportDialog::FindAllRecompiledExecutables() {
     QStringList builds;
+
     for (const QString& root : RecompileOutputRoots()) {
         const QDir root_dir(root);
         const QFileInfoList packages =
@@ -2744,6 +2824,7 @@ QStringList GameExportDialog::FindAllRecompiledExecutables() {
                 !readme.readAll().contains("Recompiled native build")) {
                 continue;
             }
+
             const QString base = package.fileName();
             const QStringList candidates = {
                 package_dir.filePath(base + QStringLiteral(".exe")),
@@ -2766,6 +2847,7 @@ QStringList GameExportDialog::FindAllRecompiledExecutables() {
             }
         }
     }
+
     std::stable_sort(builds.begin(), builds.end(), [](const QString& lhs, const QString& rhs) {
         return QFileInfo(lhs).lastModified() > QFileInfo(rhs).lastModified();
     });
@@ -2974,8 +3056,9 @@ void GameExportDialog::OnExport() {
         static_cast<TargetPlatform>(platform_combo->currentData().toInt());
     const auto backend =
         static_cast<RecompileBackend>(backend_combo->currentData().toInt());
-    const bool is_static = backend == RecompileBackend::SuyuStatic;
-    if (!is_static && platform != TargetPlatform::Windows) {
+    const bool uses_aot = backend != RecompileBackend::Dynarmic;
+    const bool is_hybrid = backend == RecompileBackend::Hybrid;
+    if (!uses_aot && platform != TargetPlatform::Windows) {
         QMessageBox::warning(
             this, tr("Unsupported JIT Target"),
             tr("The Dynarmic comparison package is currently available for Windows targets only."));
@@ -3028,8 +3111,12 @@ void GameExportDialog::OnExport() {
             }
         }
     }
+
     const QString export_name =
-        is_static ? game_name : game_name + QStringLiteral(" - Dynarmic JIT");
+        backend == RecompileBackend::SuyuStatic
+            ? game_name
+            : game_name + (is_hybrid ? QStringLiteral(" - Hybrid AOT + JIT")
+                                     : QStringLiteral(" - Dynarmic JIT"));
 
     // Recorded before the run rather than after: even a half-finished export
     // leaves buildable output here, and this is how the library later finds it.
@@ -3038,8 +3125,10 @@ void GameExportDialog::OnExport() {
     export_button->setEnabled(false);
     progress_bar->setVisible(true);
     progress_bar->setValue(0);
-    status_label->setText(is_static ? tr("Preparing AOT export...")
-                                    : tr("Preparing Dynarmic JIT baseline..."));
+    status_label->setText(
+        uses_aot ? (is_hybrid ? tr("Preparing hybrid AOT + JIT export...")
+                              : tr("Preparing suyu static (Experimental) export..."))
+                 : tr("Preparing Dynarmic JIT (Baseline)..."));
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
     try {
@@ -3053,13 +3142,16 @@ void GameExportDialog::OnExport() {
     // copy it across meant writing 12 GB and holding both at once, which is
     // where large exports were failing during packaging.
     const QString cache_work =
-        is_static ? AotCacheDirFor(output_dir, game_name, platform)
-                  : work_dir + QDir::separator() + QStringLiteral("jit_baseline");
+        uses_aot ? AotCacheDirFor(output_dir, export_name, platform)
+                 : work_dir + QDir::separator() + QStringLiteral("jit_baseline");
     QDir().mkpath(cache_work);
     progress_bar->setValue(5);
 
-    if (is_static) {
+    if (uses_aot) {
         QDir().mkpath(exefs_work);
+
+        // Step 2: ExeFS extraction is handled inside RunAotPrecompile via VFS.
+        // For extracted directories, we copy them to the work area here.
         status_label->setText(tr("Scanning for ExeFS content..."));
         QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
@@ -3075,13 +3167,20 @@ void GameExportDialog::OnExport() {
             }
         }
 
+        // For packaged ROM files (NSP/XCI/NCA), the AOT step uses VFS to extract ExeFS directly.
         progress_bar->setValue(15);
-        status_label->setText(tr("Running AOT pre-compilation (suyu static AOT)..."));
+        status_label->setText(
+            is_hybrid ? tr("Running AOT pre-compilation (Hybrid AOT + JIT)...")
+                      : tr("Running AOT pre-compilation: suyu static (Experimental)..."));
         QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-        if (RunAotPrecompile(exefs_work, cache_work, game_name).isEmpty()) {
+
+        if (RunAotPrecompile(exefs_work, cache_work, backend, game_name).isEmpty()) {
             status_label->setText(tr("AOT pre-compilation failed."));
             progress_bar->setValue(0);
             export_button->setEnabled(true);
+            test_export_has_result = test_driven_export;
+            test_export_succeeded = false;
+            test_export_output.clear();
             emit ExportFinished(false, {});
             return;
         }
@@ -3098,6 +3197,9 @@ void GameExportDialog::OnExport() {
         status_label->setText(tr("Packaging failed."));
         progress_bar->setValue(0);
         export_button->setEnabled(true);
+        test_export_has_result = test_driven_export;
+        test_export_succeeded = false;
+        test_export_output.clear();
         emit ExportFinished(false, {});
         return;
     }
@@ -3116,10 +3218,10 @@ void GameExportDialog::OnExport() {
             pkg_root = output_dir + QDir::separator() + export_name;
             break;
         case TargetPlatform::Linux:
-            pkg_root = output_dir + QDir::separator() + game_name + QStringLiteral(".AppDir");
+            pkg_root = output_dir + QDir::separator() + export_name + QStringLiteral(".AppDir");
             break;
         case TargetPlatform::MacOS:
-            pkg_root = output_dir + QDir::separator() + game_name + QStringLiteral(".app");
+            pkg_root = output_dir + QDir::separator() + export_name + QStringLiteral(".app");
             break;
         }
 
@@ -3141,10 +3243,10 @@ void GameExportDialog::OnExport() {
         final_path = output_dir + QDir::separator() + export_name;
         break;
     case TargetPlatform::Linux:
-        final_path = output_dir + QDir::separator() + game_name + QStringLiteral(".AppDir");
+        final_path = output_dir + QDir::separator() + export_name + QStringLiteral(".AppDir");
         break;
     case TargetPlatform::MacOS:
-        final_path = output_dir + QDir::separator() + game_name + QStringLiteral(".app");
+        final_path = output_dir + QDir::separator() + export_name + QStringLiteral(".app");
         break;
     }
 
@@ -3152,16 +3254,33 @@ void GameExportDialog::OnExport() {
     status_label->setText(tr("Export completed: %1").arg(final_path));
     emit ExportFinished(true, final_path);
 
-    if (!is_static) {
+    if (test_driven_export) {
+        test_export_has_result = true;
+        test_export_succeeded = true;
+        test_export_output = final_path;
+        return;
+    }
+
+    if (!uses_aot) {
         QMessageBox::information(
             this, tr("JIT Baseline Export Complete"),
-            tr("The Dynarmic JIT comparison package was exported to:\n%1\n\n"
-               "Run %2.exe and compare it with the suyu static AOT export of the same game.")
+            tr("The Dynarmic JIT (Baseline) package was exported to:\n%1\n\n"
+               "Run %2.exe and compare it with the suyu static (Experimental) export of the "
+               "same game.")
                 .arg(final_path, export_name));
+    } else if (is_hybrid) {
+        QMessageBox::information(
+            this, tr("Hybrid Export Complete"),
+            tr("The Hybrid AOT + JIT package was exported to:\n%1\n\n"
+               "Recommended for best performance. It runs static code first and falls back to "
+               "Dynarmic for uncovered code.")
+                .arg(final_path));
     } else if (WantsCompiledOutput()) {
         QMessageBox::information(
-            this, tr("AOT Export Complete"),
+            this, tr("suyu static (Experimental) Export Complete"),
             tr("Game exported and compiled to a standalone executable at:\n%1\n\n"
+               "This experimental build disables JIT fallback and can load or run more slowly. "
+               "Use Hybrid AOT + JIT for best performance.\n\n"
                "The package contains:\n"
                "- %2.exe — the recompiled game, statically linked with suyu's HLE/GPU backend "
                "(no separate DLLs, no emulator installation required)\n"
@@ -3190,17 +3309,27 @@ void GameExportDialog::OnExport() {
         export_button->setEnabled(true);
         progress_bar->setValue(0);
         status_label->setText(tr("Export failed."));
-        QMessageBox::critical(this, tr("Export Failed"),
-                              tr("An error occurred during game export:\n%1")
-                                  .arg(QString::fromUtf8(e.what())));
+        test_export_has_result = true;
+        test_export_succeeded = false;
+        test_export_output.clear();
+        if (!test_driven_export) {
+            QMessageBox::critical(this, tr("Export Failed"),
+                                  tr("An error occurred during game export:\n%1")
+                                      .arg(QString::fromUtf8(e.what())));
+        }
         emit ExportFinished(false, {});
     } catch (...) {
         LOG_ERROR(Frontend, "Unknown exception during game export");
         export_button->setEnabled(true);
         progress_bar->setValue(0);
         status_label->setText(tr("Export failed."));
-        QMessageBox::critical(this, tr("Export Failed"),
-                              tr("An unexpected error occurred during game export."));
+        test_export_has_result = true;
+        test_export_succeeded = false;
+        test_export_output.clear();
+        if (!test_driven_export) {
+            QMessageBox::critical(this, tr("Export Failed"),
+                                  tr("An unexpected error occurred during game export."));
+        }
         emit ExportFinished(false, {});
     }
 }

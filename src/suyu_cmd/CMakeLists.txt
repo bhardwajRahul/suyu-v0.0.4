@@ -45,6 +45,10 @@ if (SUYU_CMD OR YUZU_CMD)
     # This is an *additional* target - plain suyu-cmd stays game-agnostic.
     # ---------------------------------------------------------------------
     if (SUYU_CMD_RECOMP_DIR AND EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_registration.c")
+        if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_abi_v4.h")
+            message(FATAL_ERROR
+                "This static module registry predates ABI 4. Re-export the title before building.")
+        endif()
         enable_language(C)
         # Tells the generated module projects to emit only the static library,
         # skipping their portable standalone exe (whose target name would
@@ -100,6 +104,16 @@ if (SUYU_CMD OR YUZU_CMD)
             add_executable(suyu-cmd-static ${SUYU_CMD_SOURCES}
                            "${SUYU_CMD_RECOMP_DIR}/recomp_registration.c")
             target_compile_definitions(suyu-cmd-static PRIVATE SUYU_CMD_STATIC_RECOMP=1)
+            if (NOT SUYU_RECOMP_HYBRID)
+                target_compile_definitions(suyu-cmd-static PRIVATE
+                                           SUYU_CMD_STATIC_RECOMP_STRICT=1)
+            else()
+                target_compile_definitions(suyu-cmd-static PRIVATE
+                                           SUYU_CMD_STATIC_RECOMP_HYBRID=1)
+            endif()
+            if (EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_guard_v2.h")
+                target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_GUARD_V2=1)
+            endif()
             target_link_libraries(suyu-cmd-static PRIVATE ${_recomp_libs})
             list(APPEND SUYU_CMD_TARGETS suyu-cmd-static)
         else()

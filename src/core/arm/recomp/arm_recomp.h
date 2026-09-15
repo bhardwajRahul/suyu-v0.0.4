@@ -45,6 +45,12 @@ using RecompLookupFn = RecompBlockFn (*)(u64 pc);
  * own.
  */
 void SetRecompLookup(RecompLookupFn lookup);
+/// Selects the maximum nonrecursive module-local slice for the loaded image ABI.
+/// Legacy direct-call images must remain at 32 to fit the guest fiber stack.
+void SetRecompLongSlices(bool enabled);
+/// True only after every loaded compiled module negotiated guard version 2.
+void SetRecompCodeGuardReady(bool ready);
+bool IsRecompCodeGuardReady();
 
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by
@@ -73,6 +79,8 @@ RecompLookupFn GetRecompLookup();
 struct RecompLiveStats {
     u64 static_blocks;      ///< blocks executed from recompiled images
     u64 jit_transitions;    ///< times execution had to leave them
+    u64 forced_cutoff_pc;   ///< diagnostic static-block cutoff handoff PC
+    u64 forced_cutoff_blocks;
     bool backend_active;    ///< ArmRecomp is the CPU for this process
     bool jit_available;     ///< false when built without a dynamic recompiler
 };

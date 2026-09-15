@@ -15,7 +15,7 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 <p align="center">
   <a href="#status">Status</a> |
   <a href="#static-recompilation">Static recompilation</a> |
-  <a href="#changes-in-v005">Changes in v0.0.5</a> |
+  <a href="docs/releases/v0.0.9.md">Changes in v0.0.9</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
@@ -26,11 +26,11 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 >
 > [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
 > archive and no further development was planned there. This fork picks it up
-> from commit `d1d09321d7` and continues the numbering: **v0.0.5**.
+> from commit `d1d09321d7` and continues the numbering: **v0.0.9**.
 >
 > The name and version line are kept deliberately, so the lineage stays legible.
-> `BUILD_FULLNAME` reads `suyu v0.0.5 (mk8-recomp)` — the suffix says *which*
-> 0.0.5 a binary is, since the archived repository could in principle be picked
+> `BUILD_FULLNAME` reads `suyu v0.0.9 (mk8-recomp)` — the suffix says *which*
+> 0.0.9 a binary is, since the archived repository could in principle be picked
 > up by others too. See [PROVENANCE.md](PROVENANCE.md).
 >
 > Work happens on the `mk8-recomp` branch, driven by
@@ -50,7 +50,7 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Current version: **v0.0.5**, continuing from the archived v0.04.
+Current version: **v0.0.9**, continuing from the archived v0.04.
 
 Upstream was inconsistent about its own version — the repository is named
 `suyu-v0.0.4`, the tag reads `v0.04-latest`, and `BUILD_FULLNAME` was hardcoded
@@ -79,55 +79,25 @@ resolved only where CPM had fetched boost.
 
 ## Static recompilation
 
-The recompiler translates a title's AArch64 code to C ahead of time, compiles it
-to native shared objects, and loads them in place of running that code on the
-JIT. As of v0.0.5 it does not need the JIT behind it at all.
+[v0.0.9 downloads](https://github.com/dougchansan/suyu-v0.0.4/releases/tag/v0.0.9) are an experimental static execution checkpoint. **Use Hybrid AOT + JIT for best performance.** Static can load and run more slowly; this is a compatibility milestone, with optimization still in progress.
 
-Measured on one title with a recorded 10,692-frame input replay, timed to
-completion at unlimited speed so both engines do identical guest work. Four
-reps, the three configurations interleaved within each rep, every rep taken with
-the machine idle:
+| Mode | Purpose |
+|---|---|
+| suyu static (Experimental) | Ahead-of-time AArch64 code with suyu HLE; use the separate `no-jit` binaries for a host with Dynarmic entirely absent. |
+| Dynarmic JIT (Baseline) | Dynamic compilation for comparison and general compatibility. |
+| Hybrid AOT + JIT | Static code with JIT fallback; recommended for normal play and performance. |
 
-| CPU | ms/frame | relative |
-|---|---|---|
-| dynarmic (JIT only) | 2.812 | 1.00x |
-| static images + JIT for what they miss | 1.650 | **1.70x faster** |
-| static images only, no JIT | 1.816 | **1.55x faster** |
+The `no-jit` downloads are compiled with `-DSUYU_NO_JIT=ON` and audited for Dynarmic build inputs and executable symbols. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
-The middle row is faster than the bottom one because two instruction families
-are deliberately left untranslated there: the JIT compiles those particular
-blocks better than the emitter does, so paying a transition to stay on it beats
-owning them. A build with no JIT has no such option.
+**Regenerate existing static modules for ABI 4.** Instruction side entries cover aligned addresses inside discovered blocks, and a bounded nonrecursive module loop reduces host dispatch. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
 
-"No JIT" is meant literally. Built with `-DSUYU_NO_JIT=ON`, dynarmic is not
-linked into any target and `libdynarmic.a` is never built — the resulting binary
-has zero `Dynarmic::` symbols and still completes the same replay, executing 1.7
-billion blocks of statically recompiled code with nothing to fall back to.
+Current local testing reaches controller prompts, menus, attract rendering and the race starting grid without fallback. The starting grid was verified during a bounded idle observation after the replay ended. Race transitions outlast the JIT fixture; matching timing and full-race validation remain open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
 
-```sh
-cmake -S . -B build-nojit -G Ninja -DCMAKE_BUILD_TYPE=Release -DSUYU_NO_JIT=ON
-```
+Recording and playback are armed at boot. Use separate functional fixtures when loading times differ, record screenshots at milestones, and retain a bounded idle observation after EOF. Keep exact EOF and later milestone verdicts separate. Compare performance only with identical work, interleaved arms and an idle machine.
 
-Three things go with dynarmic, by design:
+Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe v0.0.9 gameplay performance. The current slowdown is being profiled; no new speedup is claimed.
 
-- a title without a complete static image has no engine that can run it
-- AArch32 titles cannot run at all
-- the guest-facing `jit:u` plugin service is not registered, so a title that
-  asks for it is told there is no such service rather than given a wrong answer
-
-Keep an ordinary build around. It is the one that can tell you *what* is missing
-when something is; a build with no JIT can only tell you that something was.
-
-Two pieces make the JIT unnecessary rather than merely unused. Block discovery
-follows branches it can see, so a block only ever reached through a computed
-target is invisible to it — the dispatcher can record every address it fails to
-resolve (`SUYU_RECOMP_RECORD_MISSES`) and the exporter seeds discovery with them
-(`SUYU_AOT_EXTRA_ROOTS`), which converges in a few rounds. And
-`SUYU_RECOMP_STRICT=1` refuses the fallback outright, turning an uncovered
-address from a silent transition into a failure that names it.
-
-The export procedure, and the measurements behind the table, are in
-[mk8-recomp](https://github.com/dougchansan/mk8-recomp).
+See [release notes](docs/releases/v0.0.9.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
 
 ## Changes in v0.0.5
 

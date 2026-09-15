@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <filesystem>
@@ -99,9 +101,14 @@ struct SuyuRecompStaticModule {
     const char* name;
     void (*(*lookup)(u64))(void*);
     void (*set_base)(u64);
+    void (*run_slice)(void*);
+    unsigned (*image_abi)();
 };
 #ifdef SUYU_CMD_STATIC_RECOMP
-const SuyuRecompStaticModule* suyu_recomp_static_modules(unsigned* count);
+const SuyuRecompStaticModule* suyu_recomp_static_modules_v4(unsigned* count);
+#ifdef SUYU_RECOMP_GUARD_V2
+int suyu_recomp_static_guard_v2(unsigned version);
+#endif
 #endif
 }
 
@@ -399,7 +406,8 @@ static int ProbeIsaList(const std::string& list_path, const std::string& out_pat
 static int ProbeDecodeList(const std::string& list_path, const std::string& out_path) {
     std::ifstream list{list_path};
     std::ofstream out{out_path, std::ios::trunc};
-    if (!list || !out) {
+    std::ofstream encodings{out_path + ".encodings.tsv", std::ios::trunc};
+    if (!list || !out || !encodings) {
         return 1;
     }
 
@@ -441,10 +449,12 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
             continue;
         }
 
-        const auto emit = [&out, &rom_path](std::string_view status, u64 tid, u64 total,
+        u64 zero_words = 0, udf_words = 0, reserved_low_words = 0;
+        const auto emit = [&out, &rom_path, &zero_words, &udf_words, &reserved_low_words](std::string_view status, u64 tid, u64 total,
                                             u64 unhandled, std::string_view note) {
             out << status << '\t' << fmt::format("{:016X}", tid) << '\t' << total << '\t'
-                << unhandled << '\t' << note << '\t' << rom_path << '\n';
+                << unhandled << '\t' << note << '\t' << rom_path << '\t' << zero_words
+                << '\t' << udf_words << '\t' << reserved_low_words << '\n';
             out.flush();
         };
 
@@ -455,6 +465,13 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
             if (!file) {
                 emit("ERROR", 0, 0, 0, "open failed");
                 continue;
+            }
+            // These probes open encrypted archives. Report the prerequisite
+            // before the storage layer attempts to use an uninitialized cipher.
+            if (!Core::Crypto::KeyManager::Instance().HasKey(Core::Crypto::S256KeyType::Header)) {
+                emit("ERROR", 0, 0, 0,
+                     fmt::format("{}", fmt::streamed(Loader::ResultStatus::ErrorMissingHeaderKey)));
+                return 1;
             }
             std::string name = file->GetName();
             std::string ext;
@@ -499,6 +516,8 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
         u64 total = 0;
         u64 unhandled_count = 0;
         std::map<u32, u64> unhandled_sig;
+        std::map<u32, u32> unhandled_example;
+        std::map<u32, u64> unhandled_encodings;
         try {
             for (const auto& nso_file : exefs->GetFiles()) {
                 if (!nso_file || nso_file->GetSize() < sizeof(Loader::NSOHeader)) {
@@ -546,6 +565,13 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
                         if (miss) {
                             ++unhandled_count;
                             ++unhandled_sig[insn & 0xFFC00000u];
+                            unhandled_example.try_emplace(insn & 0xFFC00000u, insn);
+                            ++unhandled_encodings[insn];
+                            // Signature zero is wider than UDF's imm16. Keep
+                            // its parts separate before drawing padding conclusions.
+                            if (insn == 0) ++zero_words;
+                            else if ((insn & 0xFFFF0000u) == 0) ++udf_words;
+                            else if ((insn & 0xFFC00000u) == 0) ++reserved_low_words;
                         }
                     }
                 }
@@ -560,13 +586,24 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
             continue;
         }
 
+        // Exact encodings permit mnemonic-level ranking and fast decoder-only
+        // rechecks without reopening archives. Keep this artifact with the survey.
+        for (const auto& [insn, count] : unhandled_encodings) {
+            encodings << fmt::format("{:016X}\t{:08X}\t{}\t{}\n", title_id, insn, count, rom_path);
+        }
+        encodings.flush();
+        if (!encodings) return 1;
+
         // Ranked, so the note says what is missing and not only how much.
         std::vector<std::pair<u32, u64>> ranked{unhandled_sig.begin(), unhandled_sig.end()};
         std::sort(ranked.begin(), ranked.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
+                  [](const auto& a, const auto& b) {
+                      return a.second != b.second ? a.second > b.second : a.first < b.first;
+                  });
         std::string note;
-        for (size_t i = 0; i < ranked.size() && i < 4; ++i) {
-            note += fmt::format("{}{:08X}:{}", i ? " " : "", ranked[i].first, ranked[i].second);
+        for (size_t i = 0; i < ranked.size(); ++i) {
+            note += fmt::format("{}{:08X}:{}:{:08X}", i ? " " : "", ranked[i].first,
+                                ranked[i].second, unhandled_example.at(ranked[i].first));
         }
         if (note.empty()) {
             note = "-";
@@ -577,6 +614,19 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
 }
 
 int main(int argc, char** argv) {
+#ifdef SUYU_CMD_STATIC_RECOMP_STRICT
+#ifdef _WIN32
+    _putenv_s("SUYU_RECOMP_STRICT", "1");
+#else
+    setenv("SUYU_RECOMP_STRICT", "1", 1);
+#endif
+#elif defined(SUYU_CMD_STATIC_RECOMP_HYBRID)
+#ifdef _WIN32
+    _putenv_s("SUYU_RECOMP_STRICT", "0");
+#else
+    setenv("SUYU_RECOMP_STRICT", "0", 1);
+#endif
+#endif
 #ifdef _WIN32
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "wb", stdout);
@@ -865,8 +915,12 @@ int main(int argc, char** argv) {
     struct RecompModule {
         Core::RecompBlockFn (*lookup)(u64){};
         void (*set_base)(u64){};
+        Core::RecompBlockFn run_slice{};
+        unsigned image_abi{};
+        unsigned (*guard_v2)(unsigned){};
     };
     static std::vector<RecompModule> s_recomp_modules;
+    bool recomp_guard_ready = false;
 
     // Preferred path: modules compiled straight into this executable. Nothing
     // to find on disk, nothing to load, and no version skew between the exe and
@@ -874,12 +928,16 @@ int main(int argc, char** argv) {
 #ifdef SUYU_CMD_STATIC_RECOMP
     {
         unsigned count = 0;
-        const SuyuRecompStaticModule* mods = suyu_recomp_static_modules(&count);
+        const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v4(&count);
         for (unsigned i = 0; i < count; ++i) {
-            s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base});
+            s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].run_slice,
+                                        mods[i].image_abi ? mods[i].image_abi() : 0, nullptr});
             LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
                      mods[i].name ? mods[i].name : "?");
         }
+#ifdef SUYU_RECOMP_GUARD_V2
+        recomp_guard_ready = suyu_recomp_static_guard_v2(2) != 0;
+#endif
     }
 #endif
 
@@ -917,10 +975,24 @@ int main(int argc, char** argv) {
             auto lkp = reinterpret_cast<LookupFn>(GetProcAddress(h, "recomp_image_lookup"));
             auto sbf = reinterpret_cast<SetBaseFn>(GetProcAddress(h, "recomp_image_set_base"));
             if (lkp) {
-                s_recomp_modules.push_back({lkp, sbf});
+                auto run_slice = reinterpret_cast<Core::RecompBlockFn>(
+                    GetProcAddress(h, "recomp_image_run_slice"));
+                auto image_abi = reinterpret_cast<unsigned (*)()>(
+                    GetProcAddress(h, "recomp_image_abi"));
+                const unsigned abi = image_abi ? image_abi() : 0;
+                if (abi < 4) run_slice = nullptr;
+                auto guard = reinterpret_cast<unsigned (*)(unsigned)>(GetProcAddress(h, "recomp_image_guard_v2"));
+                s_recomp_modules.push_back({lkp, sbf, run_slice, abi, guard});
                 LOG_INFO(Frontend, "Native recompiled module [{}] loaded from {} — ArmRecomp active",
                          s_recomp_modules.size() - 1, Common::UTF16ToUTF8(dll_name));
             }
+        }
+        recomp_guard_ready = !s_recomp_modules.empty();
+        for (const auto& module : s_recomp_modules) {
+            if (!module.guard_v2 || module.guard_v2(0) != 2) recomp_guard_ready = false;
+        }
+        for (const auto& module : s_recomp_modules) {
+            if (module.guard_v2) module.guard_v2(recomp_guard_ready ? 2 : 0);
         }
     }
 #endif
@@ -929,10 +1001,18 @@ int main(int argc, char** argv) {
         // Combined lookup: try each module's lookup until one returns non-null.
         Core::SetRecompLookup([](u64 pc) -> Core::RecompBlockFn {
             for (const auto& m : s_recomp_modules) {
-                if (auto fn = m.lookup(pc)) return fn;
+                if (auto fn = m.lookup(pc)) return m.run_slice ? m.run_slice : fn;
             }
             return nullptr;
         });
+        const bool long_slices = std::all_of(
+            s_recomp_modules.cbegin(), s_recomp_modules.cend(), [](const RecompModule& module) {
+                return module.image_abi >= 4 && module.run_slice != nullptr;
+            });
+        Core::SetRecompLongSlices(long_slices);
+        Core::SetRecompCodeGuardReady(recomp_guard_ready);
+        LOG_INFO(Frontend, "Recompiled instruction guard-v2: {}",
+                 recomp_guard_ready ? "ready" : "not negotiated");
         // Route base to the module at the same index in load order.
         // rtld=index0, main=index1, subsdk0=index2, ..., sdk=last.
         Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {

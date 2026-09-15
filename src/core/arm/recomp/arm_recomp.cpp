@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <map>
@@ -19,6 +20,7 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/arm/debug.h"
 #ifndef SUYU_NO_JIT
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -146,19 +148,31 @@ static_assert(offsetof(GuestContextView, chain_budget) == 864);
 // Refuse the JIT entirely. Without this, "the JIT was never reached" is an
 // observation about one run; with it, reaching the JIT is a loud, fatal failure
 // that names the address, which is the difference between evidence and proof.
-const bool kStrictNoFallback = [] {
+bool StrictNoFallback() {
     const char* e = std::getenv("SUYU_RECOMP_STRICT");
+    return e && *e && *e != '0';
+}
+
+const int kChainBudgetOverride = [] {
+    const char* e = std::getenv("SUYU_RECOMP_CHAIN_BUDGET");
+    if (!e) {
+        return 0;
+    }
+    const int v = std::atoi(e);
+    return (v >= 1 && v <= 8192) ? v : 0;
+}();
+std::atomic<int> g_recomp_chain_budget{32};
+
+int RecompChainBudget() {
+    return kChainBudgetOverride ? kChainBudgetOverride
+                                : g_recomp_chain_budget.load(std::memory_order_relaxed);
+}
+
+const bool kSamplePc = [] {
+    const char* e = std::getenv("SUYU_RECOMP_SAMPLE_PC");
     return e && *e && *e != '0';
 }();
 
-const int kChainBudget = [] {
-    const char* e = std::getenv("SUYU_RECOMP_CHAIN_BUDGET");
-    if (!e) {
-        return 32;
-    }
-    const int v = std::atoi(e);
-    return (v >= 1 && v <= 8192) ? v : 32;
-}();
 static_assert(offsetof(GuestContextView, host_mem) == 832);
 static_assert(offsetof(GuestContextView, tpidrro_el0) == 840);
 static_assert(offsetof(GuestContextView, fpcr) == 848);
@@ -172,6 +186,12 @@ constexpr u64 kNoPendingSvc = ~0ULL;
 // with this parked its PC on an instruction the decoder cannot translate and
 // is asking for that address to be executed by the interpreter fallback.
 constexpr int kHaltUnhandled = 2;
+// Mirrors RECOMP_HALT_BREAKPOINT. PC already names the faulting instruction.
+constexpr int kHaltBreakpoint = 3;
+constexpr int kHaltIcIvau = 4;
+std::atomic<bool> g_code_guard_ready{false};
+std::atomic<u64> g_forced_cutoff_pc{0};
+std::atomic<u64> g_forced_cutoff_blocks{0};
 
 // An unresolved GOT/JUMP_SLOT relocation used to be left untouched, which
 // means a call through it branches to whatever the raw NSO file already had
@@ -193,6 +213,7 @@ constexpr u64 kUnresolvedImportTrap = 0xFFFF'FFFF'0000'0000ULL;
 namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
+std::mutex g_process_init_lock;
 
 /// Execution coverage for the AOT path (mk8-recomp #13).
 ///
@@ -218,6 +239,7 @@ struct RecompCounters {
     std::map<u32, u64> unhandled_insn;  ///< guest encoding -> times it forced a fallback
     std::map<u64, u64> miss_pc;         ///< PC with no block -> times it forced a fallback
     std::map<u32, u64> svc_numbers;     ///< SVC imm -> times the guest issued it
+    std::map<u64, u64> sampled_pc;      ///< sparse samples for zero-transition stalls
     /// Load address -> module name, so a PC in this report can be resolved to
     /// module+offset. Without it the addresses mean nothing except beside the
     /// matching boot log, and a report read against another run's log resolves
@@ -241,6 +263,10 @@ struct RecompCounters {
     void RecordMiss(u64 pc) {
         std::scoped_lock lk{hist_lock};
         ++miss_pc[pc];
+    }
+    void RecordSample(u64 pc) {
+        std::scoped_lock lk{hist_lock};
+        ++sampled_pc[pc];
     }
 };
 
@@ -360,6 +386,25 @@ std::string FormatRecompCoverage() {
         }
     }
 
+    if (!g_counters.sampled_pc.empty()) {
+        const auto resolve = [](u64 pc) -> std::string {
+            u64 best = 0;
+            const std::string* name = nullptr;
+            for (const auto& [base, module_name] : g_counters.modules) {
+                if (pc >= base && base >= best) {
+                    best = base;
+                    name = &module_name;
+                }
+            }
+            return name ? fmt::format("  {}+{:#x}", *name, pc - best) : std::string{};
+        };
+        o += "  --- sampled PCs by count ---\n";
+        for (const auto& [pc, count] : TopN(g_counters.sampled_pc, 16)) {
+            o += fmt::format("    {:#018x}  {:>10}{}\n", pc, count, resolve(pc));
+        }
+        o += fmt::format("    {} distinct sampled PCs\n", g_counters.sampled_pc.size());
+    }
+
     if (!g_counters.miss_pc.empty()) {
         // Resolved here rather than left to the reader: a bare guest PC
         // needs this run's load addresses to mean anything, and pairing a
@@ -386,7 +431,11 @@ std::string FormatRecompCoverage() {
 }
 
 void WriteRecompCoverageFile(const std::string& text) {
-    const auto path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_coverage.txt";
+    const char* explicit_path = std::getenv("SUYU_RECOMP_COVERAGE_PATH");
+    const auto path = explicit_path && *explicit_path
+                          ? std::filesystem::path{explicit_path}
+                          : Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) /
+                                "recomp_coverage.txt";
     std::ofstream out(path, std::ios::trunc);
     if (out) {
         out << text;
@@ -419,7 +468,21 @@ void ReportRecompCoverage() {
 } // namespace
 
 void SetRecompLookup(RecompLookupFn lookup) {
+    std::scoped_lock lock{g_process_init_lock};
+    g_code_guard_ready.store(false, std::memory_order_release);
     g_recomp_lookup.store(lookup, std::memory_order_release);
+}
+
+void SetRecompLongSlices(bool enabled) {
+    g_recomp_chain_budget.store(enabled ? 4096 : 32, std::memory_order_relaxed);
+}
+
+void SetRecompCodeGuardReady(bool ready) {
+    g_code_guard_ready.store(ready, std::memory_order_release);
+}
+
+bool IsRecompCodeGuardReady() {
+    return g_code_guard_ready.load(std::memory_order_acquire);
 }
 
 void SetRecompBaseSetter(RecompBaseFn setter) {
@@ -431,6 +494,8 @@ RecompLiveStats GetRecompLiveStats() {
         TotalStaticBlocks(),
         g_counters.fallback_from_miss.load(std::memory_order_relaxed) +
             g_counters.fallback_from_unhandled.load(std::memory_order_relaxed),
+        g_forced_cutoff_pc.load(std::memory_order_relaxed),
+        g_forced_cutoff_blocks.load(std::memory_order_relaxed),
         g_live_instances.load(std::memory_order_relaxed) > 0,
 #ifdef SUYU_NO_JIT
         false,
@@ -576,6 +641,12 @@ struct ArmRecomp::Impl {
     static u64 HostLoad(void* user, u64 va, u32 size) {
         auto& memory = static_cast<Impl*>(user)->system.ApplicationMemory();
         switch (size) {
+        case 0: // Negotiated guard-v2 checked instruction read; zero is a valid word.
+            if (va > ~u64{0} - 3) return 0;
+            for (u64 offset = 0; offset < 4; ++offset) {
+                if (!memory.IsValidVirtualAddress(va + offset)) return 0;
+            }
+            return (u64{1} << 32) | memory.Read32(va);
         case 1: return memory.Read8(va);
         case 2: return memory.Read16(va);
         case 4: return memory.Read32(va);
@@ -983,7 +1054,7 @@ bool ArmRecomp::EnterFallback() {
     if (impl->fallback_unavailable) {
         return false;
     }
-    if (kStrictNoFallback) {
+    if (StrictNoFallback()) {
         // Latched, so the caller's own critical log naming the PC is what gets
         // read, and the second thread to arrive does not repeat this one.
         impl->fallback_unavailable = true;
@@ -1070,19 +1141,18 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
 
     impl->RefreshPageTable();
 
-    // Registering every loaded image's base with the host dispatcher is a
-    // side effect of this call, not something its return value is used for
-    // here - the dispatcher needs it done once before the first lookup, or
-    // every image's base stays 0 and every lookup misses.
-    static bool bases_registered = false;
-    if (!bases_registered) {
-        bases_registered = true;
-        impl->ModuleBaseFor(thread, impl->ctx.pc);
-    }
-
     if (!impl->rela_applied) {
-        impl->rela_applied = true;
-        impl->ApplyAllRelocations(impl->modules);
+        // Every CPU Impl needs its own complete module map and relocation pass.
+        // Collapsing this to once per KProcess left later Impls incompletely
+        // initialized and changed MK8's execution despite zero lookup misses.
+        // Serialize the shared guest-memory writes to retain the original
+        // per-Impl behavior without the original multicore race.
+        std::scoped_lock lock{g_process_init_lock};
+        if (!impl->rela_applied) {
+            impl->ModuleBaseFor(thread, impl->ctx.pc);
+            impl->ApplyAllRelocations(impl->modules);
+            impl->rela_applied = true;
+        }
     }
 
     // A previous miss handed this thread to the JIT; keep running there until
@@ -1156,6 +1226,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // hit a gap. Unset in normal runs.
         {
             static const char* const force_miss = std::getenv("SUYU_RECOMP_FORCE_MISS_AFTER");
+            static const char* const force_miss_static_blocks =
+                std::getenv("SUYU_RECOMP_FORCE_MISS_AFTER_STATIC_BLOCKS");
             static std::atomic<int> blocks_run{0};
             if (force_miss) {
                 const int n = blocks_run.fetch_add(1, std::memory_order_relaxed);
@@ -1167,6 +1239,24 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                     LOG_ERROR(Core_ARM, "recomp: block #{} pc={:#x}", n, impl->ctx.pc);
                 }
                 if (n >= limit) {
+                    block = nullptr;
+                }
+            }
+            if (force_miss_static_blocks) {
+                const u64 limit = std::strtoull(force_miss_static_blocks, nullptr, 10);
+                const u64 executed = TotalStaticBlocks();
+                if (executed >= limit) {
+                    u64 unset = 0;
+                    if (g_forced_cutoff_pc.compare_exchange_strong(
+                            unset, impl->ctx.pc, std::memory_order_relaxed)) {
+                        g_forced_cutoff_blocks.store(executed, std::memory_order_relaxed);
+                    }
+                    static std::atomic<int> static_cutoff_logs{0};
+                    if (static_cutoff_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        LOG_ERROR(Core_ARM,
+                                  "recomp: forced static-block cutoff {} reached at {} pc={:#x}",
+                                  limit, executed, impl->ctx.pc);
+                    }
                     block = nullptr;
                 }
             }
@@ -1273,15 +1363,40 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // The budget bounds that chain, and what is left of it afterwards says
         // how many blocks actually ran - without which every count here would
         // report chains rather than blocks.
-        impl->ctx.chain_budget = kChainBudget;
+        const int chain_budget = RecompChainBudget();
+        impl->ctx.chain_budget = chain_budget;
         block(&impl->ctx);
         {
-            const int spent = kChainBudget - impl->ctx.chain_budget;
-            if (spent > 1) {
-                t_blocks.slot->n.store(t_blocks.slot->n.load(std::memory_order_relaxed) +
-                                           static_cast<u64>(spent - 1),
-                                       std::memory_order_relaxed);
+            const int spent = chain_budget - impl->ctx.chain_budget;
+            u64 after = seen;
+            if (spent > 0) {
+                // The first block is already in `seen`. A decrement to zero
+                // parks the next PC without entering it, so that final attempt
+                // contributes no executed block.
+                after += static_cast<u64>(spent - (impl->ctx.chain_budget == 0 ? 1 : 0));
+                t_blocks.slot->n.store(after, std::memory_order_relaxed);
             }
+            if (kSamplePc && (seen >> 18) != (after >> 18)) {
+                g_counters.RecordSample(impl->ctx.pc);
+            }
+        }
+
+        if (impl->ctx.halted == kHaltIcIvau) {
+            if (!g_code_guard_ready.load(std::memory_order_acquire)) {
+                LOG_CRITICAL(Core_ARM, "recomp: IC IVAU requires guard-v2 host and all guarded modules");
+                std::abort();
+            }
+            const u64 address = impl->ctx.pending_svc;
+            impl->ctx.pending_svc = kNoPendingSvc;
+            for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
+                if (auto* cpu = thread->GetOwnerProcess()->GetArmInterface(core)) cpu->InvalidateCacheRange(address, 64);
+            }
+            impl->ctx.pc += 4;
+            impl->ctx.halted = 0;
+            continue;
+        }
+        if (impl->ctx.halted == kHaltBreakpoint) {
+            return HaltReason::InstructionBreakpoint;
         }
 
         // The block stopped on an instruction the decoder has no translation
@@ -1291,6 +1406,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // plausible-looking null that only surfaced as a crash much later, in
         // whatever code eventually dereferenced it.
         if (impl->ctx.halted == kHaltUnhandled) {
+            if ((static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)) & 0xffffffe0U) == 0xd50b7520U) {
+                LOG_CRITICAL(Core_ARM, "recomp: legacy unguarded IC IVAU refused at {:#x}", impl->ctx.pc);
+                std::abort();
+            }
             impl->ctx.halted = 0;
             // The generated code knows the encoding but cannot pass it back
             // through the halt contract, so read it out of guest memory - the
@@ -1338,7 +1457,32 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     if (!block) {
         return HaltReason::PrefetchAbort;
     }
+    impl->ctx.halted = 0;
+    impl->ctx.pending_svc = kNoPendingSvc;
+    impl->ctx.chain_budget = 1;
     block(&impl->ctx);
+    if (impl->ctx.halted == kHaltIcIvau) {
+        if (!g_code_guard_ready.load(std::memory_order_acquire)) {
+            LOG_CRITICAL(Core_ARM, "recomp: IC IVAU requires guard-v2 host and all guarded modules");
+            std::abort();
+        }
+        const u64 address = impl->ctx.pending_svc;
+        impl->ctx.pending_svc = kNoPendingSvc;
+        for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
+            if (auto* cpu = thread->GetOwnerProcess()->GetArmInterface(core)) cpu->InvalidateCacheRange(address, 64);
+        }
+        impl->ctx.pc += 4;
+        impl->ctx.halted = 0;
+        return HaltReason::StepThread;
+    }
+    if (impl->ctx.halted == kHaltBreakpoint) {
+        return HaltReason::InstructionBreakpoint;
+    }
+    if (impl->ctx.halted == kHaltUnhandled &&
+        (static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)) & 0xffffffe0U) == 0xd50b7520U) {
+        LOG_CRITICAL(Core_ARM, "recomp: legacy unguarded IC IVAU refused while stepping at {:#x}", impl->ctx.pc);
+        std::abort();
+    }
     if (impl->ctx.pending_svc != kNoPendingSvc) {
         return HaltReason::SupervisorCall;
     }
@@ -1346,13 +1490,16 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
 }
 
 void ArmRecomp::ClearInstructionCache() {
-    // Statically recompiled code is fixed at build time; there is no
-    // translation cache to invalidate. Self-modifying guest code is
-    // consequently unsupported by this backend by construction.
+#ifndef SUYU_NO_JIT
+    if (impl->fallback) impl->fallback->ClearInstructionCache();
+#endif
+    // Compiled blocks validate their bytes on every entry, including chains.
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
-    // See ClearInstructionCache.
+#ifndef SUYU_NO_JIT
+    if (impl->fallback) impl->fallback->InvalidateCacheRange(addr, size);
+#endif
 }
 
 void ArmRecomp::GetContext(Kernel::Svc::ThreadContext& ctx) const {

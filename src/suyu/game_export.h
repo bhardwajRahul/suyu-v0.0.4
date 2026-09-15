@@ -61,6 +61,12 @@ public:
     ///        (0 = Source, 1 = Build); negative leaves the current selection.
     void TriggerExportForTesting(const QString& rom_path, const QString& output_dir,
                                  int format_index = -1);
+    bool IsExportInProgressForTesting() const;
+    bool HasExportResultForTesting() const;
+    bool ExportSucceededForTesting() const;
+    int ExportProgressForTesting() const;
+    QString ExportStatusForTesting() const;
+    QString ExportOutputForTesting() const;
 
     /// Every standalone recompiled executable that has already been built for
     /// this game, one per recompiled module, newest-looking first. Empty when
@@ -88,6 +94,7 @@ public:
 
     enum class RecompileBackend {
         SuyuStatic, ///< In-tree AArch64-to-C ahead-of-time recompiler
+        Hybrid,     ///< Static AOT with Dynarmic fallback for uncovered code
         Dynarmic,   ///< JIT baseline for comparison
     };
 
@@ -119,11 +126,15 @@ private:
     /// can call TriggerExportForTesting() from the event loop that the export
     /// is pumping, and two exports writing the same cache directory corrupt it.
     bool export_in_progress{false};
+    bool test_driven_export{false};
+    bool test_export_has_result{false};
+    bool test_export_succeeded{false};
+    QString test_export_output;
 
     /// AOT export: scan ARM code and serialize translated compiler artifacts.
     /// Returns path to the generated cache directory, or empty string on failure.
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,
-                             const QString& game_name);
+                             RecompileBackend backend, const QString& game_name);
 
     /// Package the translated output into a platform-specific export bundle.
     bool PackageNativeExport(const QString& rom_path, const QString& cache_dir,
