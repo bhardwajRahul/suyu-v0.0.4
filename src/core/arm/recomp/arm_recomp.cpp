@@ -719,6 +719,7 @@ struct ArmRecomp::Impl {
         std::string name;
         u64 value = 0;
         bool defined = false;
+        bool weak = false;
     };
     SymInfo ReadSymbol(const DynInfo& d, u32 index) {
         auto& mem = system.ApplicationMemory();
@@ -734,6 +735,10 @@ struct ArmRecomp::Impl {
         const u16 shndx = mem.Read16(sym_va + 6);
         s.value = mem.Read64(sym_va + 8);
         s.defined = shndx != 0; // SHN_UNDEF == 0
+        // st_info is the byte at +4; the binding is its high nibble.
+        // STB_WEAK == 2. An undefined weak symbol must resolve to 0, which is
+        // how the guest's own rtld leaves it - see the fallthrough below.
+        s.weak = (static_cast<u8>(mem.Read8(sym_va + 4)) >> 4) == 2;
         if (d.strtab_va) {
             std::string name;
             for (u64 i = 0; i < 512; ++i) {
@@ -871,9 +876,18 @@ struct ArmRecomp::Impl {
                         LOG_ERROR(Core_ARM, "recomp: unresolved GOT/PLT symbol '{}' for module base={:#x}",
                                   sym.name.empty() ? "<no name>" : sym.name, d.mod_base);
                     }
-                    // Patch to the trap sentinel rather than leaving the slot
-                    // as whatever the raw file had - see kUnresolvedImportTrap.
-                    mem.Write64(d.mod_base + r_offset, d.trap_va ? d.trap_va : kUnresolvedImportTrap);
+                    // An undefined *weak* symbol resolves to 0 by ABI, and that
+                    // is what rtld leaves under dynarmic. Patching it to a
+                    // callable stub instead breaks the `if (&weak) weak(...)`
+                    // idiom: the null check passes and the guest calls a
+                    // function that only returns 0. Smash guards
+                    // nu::VirtualAllocHook/VirtualFreeHook that way at 5489
+                    // sites on its allocator path, so every allocation took the
+                    // hook branch and got nothing back.
+                    // Strong symbols keep the trap sentinel.
+                    mem.Write64(d.mod_base + r_offset,
+                                sym.weak ? 0
+                                         : (d.trap_va ? d.trap_va : kUnresolvedImportTrap));
                 }
             }
         }
@@ -1055,6 +1069,16 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
 }
 
 HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
+    // The monitor is keyed by core, not by guest thread, so a reservation left
+    // behind by a preempted thread survives into whichever thread is scheduled
+    // onto this core next. That next thread's STXR can then succeed against a
+    // reservation it never took. nn::os releases a mutex with
+    // ldaxr / test waiters / stlxr, so a stale success skips the wake branch
+    // and the waiters are never signalled. Dynarmic clears here for the same
+    // reason - see ArmDynarmic64::RunThread.
+    if (impl->exclusive_monitor) {
+        impl->exclusive_monitor->ClearExclusive(impl->core_index);
+    }
     // Logged once so it is obvious from a log whether the backend was ever
     // entered at all. A run with no errors is otherwise indistinguishable from
     // a run where the guest thread was never scheduled onto it.
@@ -1329,6 +1353,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
 }
 
 HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
+    // Same reservation hand-off as RunThread.
+    if (impl->exclusive_monitor) {
+        impl->exclusive_monitor->ClearExclusive(impl->core_index);
+    }
     // Block granularity is the finest this backend can step: recompiled blocks
     // are straight-line C with no per-instruction re-entry point.
     if (!impl->lookup) {
