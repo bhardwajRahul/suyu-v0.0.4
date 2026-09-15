@@ -15,7 +15,7 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 <p align="center">
   <a href="#status">Status</a> |
   <a href="#static-recompilation">Static recompilation</a> |
-  <a href="docs/releases/v0.0.9.md">Changes in v0.0.9</a> |
+  <a href="docs/releases/v0.0.10.md">Changes in v0.0.10</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
@@ -26,11 +26,11 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 >
 > [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
 > archive and no further development was planned there. This fork picks it up
-> from commit `d1d09321d7` and continues the numbering: **v0.0.9**.
+> from commit `d1d09321d7` and continues the numbering: **v0.0.10**.
 >
 > The name and version line are kept deliberately, so the lineage stays legible.
-> `BUILD_FULLNAME` reads `suyu v0.0.9 (mk8-recomp)` — the suffix says *which*
-> 0.0.9 a binary is, since the archived repository could in principle be picked
+> `BUILD_FULLNAME` reads `suyu v0.0.10 (mk8-recomp)` — the suffix says *which*
+> 0.0.10 a binary is, since the archived repository could in principle be picked
 > up by others too. See [PROVENANCE.md](PROVENANCE.md).
 >
 > Work happens on the `mk8-recomp` branch, driven by
@@ -50,7 +50,7 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Current version: **v0.0.9**, continuing from the archived v0.04.
+Current version: **v0.0.10**, continuing from the archived v0.04.
 
 Upstream was inconsistent about its own version — the repository is named
 `suyu-v0.0.4`, the tag reads `v0.04-latest`, and `BUILD_FULLNAME` was hardcoded
@@ -79,7 +79,7 @@ resolved only where CPM had fetched boost.
 
 ## Static recompilation
 
-[v0.0.9 downloads](https://github.com/dougchansan/suyu-v0.0.4/releases/tag/v0.0.9) are an experimental static execution checkpoint. **Use Hybrid AOT + JIT for best performance.** Static can load and run more slowly; this is a compatibility milestone, with optimization still in progress.
+[v0.0.10 downloads](https://github.com/dougchansan/suyu-v0.0.4/releases/tag/v0.0.10) are an experimental static execution checkpoint. **Use Hybrid AOT + JIT for best performance.** Static can load and run more slowly; this is a compatibility milestone, with optimization still in progress.
 
 | Mode | Purpose |
 |---|---|
@@ -95,9 +95,9 @@ Current local testing reaches controller prompts, menus, attract rendering and t
 
 Recording and playback are armed at boot. Use separate functional fixtures when loading times differ, record screenshots at milestones, and retain a bounded idle observation after EOF. Keep exact EOF and later milestone verdicts separate. Compare performance only with identical work, interleaved arms and an idle machine.
 
-Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe v0.0.9 gameplay performance. The current slowdown is being profiled; no new speedup is claimed.
+Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe v0.0.10 gameplay performance. The current slowdown is being profiled; no new speedup is claimed.
 
-See [release notes](docs/releases/v0.0.9.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
+See [release notes](docs/releases/v0.0.10.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
 
 ## Changes in v0.0.5
 

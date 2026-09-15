@@ -6853,11 +6853,13 @@ QString GMainWindow::FindRecompiledImageDirFor(const QString& game_path, u64 tit
     });
 
 #ifdef _WIN32
-    const QString pattern = QStringLiteral("recompiled_*.dll");
+    const QStringList patterns{QStringLiteral("recompiled_*.dll")};
 #elif defined(__APPLE__)
-    const QString pattern = QStringLiteral("recompiled_*.dylib");
+    const QStringList patterns{QStringLiteral("recompiled_*.dylib"),
+                               QStringLiteral("librecompiled_*.dylib")};
 #else
-    const QString pattern = QStringLiteral("recompiled_*.so");
+    const QStringList patterns{QStringLiteral("recompiled_*.so"),
+                               QStringLiteral("librecompiled_*.so")};
 #endif
 
     for (const QString& candidate : candidates) {
@@ -6868,7 +6870,7 @@ QString GMainWindow::FindRecompiledImageDirFor(const QString& game_path, u64 tit
         // sources until someone builds it. Pointing the loader at an unbuilt
         // tree would just log a failure, so treat "no built image" as "no
         // images" and let the game boot on the JIT.
-        QDirIterator probe(candidate, {pattern}, QDir::Files, QDirIterator::Subdirectories);
+        QDirIterator probe(candidate, patterns, QDir::Files, QDirIterator::Subdirectories);
         if (probe.hasNext()) {
             return candidate;
         }
@@ -6895,11 +6897,13 @@ void GMainWindow::EnterSingleGameMode() {
 int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_current_abi,
                                            u64 expected_title_id) {
 #ifdef _WIN32
-    const QString pattern = QStringLiteral("recompiled_*.dll");
+    const QStringList patterns{QStringLiteral("recompiled_*.dll")};
 #elif defined(__APPLE__)
-    const QString pattern = QStringLiteral("recompiled_*.dylib");
+    const QStringList patterns{QStringLiteral("recompiled_*.dylib"),
+                               QStringLiteral("librecompiled_*.dylib")};
 #else
-    const QString pattern = QStringLiteral("recompiled_*.so");
+    const QStringList patterns{QStringLiteral("recompiled_*.so"),
+                               QStringLiteral("librecompiled_*.so")};
 #endif
 
     const auto refuse_bundle = [&](const QString& reason) {
@@ -7010,7 +7014,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
         }
 
         QStringList actual_images;
-        QDirIterator actual_it(dir, {pattern}, QDir::Files, QDirIterator::Subdirectories);
+        QDirIterator actual_it(dir, patterns, QDir::Files, QDirIterator::Subdirectories);
         while (actual_it.hasNext()) {
             const QString actual = QFileInfo(actual_it.next()).canonicalFilePath();
             if (!actual.isEmpty()) {
@@ -7030,7 +7034,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
             }
         }
     } else {
-        QDirIterator it(dir, {pattern}, QDir::Files, QDirIterator::Subdirectories);
+        QDirIterator it(dir, patterns, QDir::Files, QDirIterator::Subdirectories);
         while (it.hasNext()) {
             image_paths.append(it.next());
         }
