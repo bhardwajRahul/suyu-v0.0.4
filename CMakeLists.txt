@@ -621,7 +621,12 @@ if (ENABLE_QT)
     ## Components ##
 
     # Best practice is to ask for all components at once, so they are from the same version
-    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network Svg)
+    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network)
+
+    # Svg is optional: nothing links Qt6::Svg or includes its headers, it is only wanted so the
+    # svg image format plugin is available for the icon themes. Some prebuilt Qt packages (the
+    # bundled Windows one included) ship without it, and requiring it fails configure outright.
+    list(APPEND YUZU_QT_OPTIONAL Svg)
     if (PLATFORM_LINUX OR PLATFORM_FREEBSD)
         list(APPEND YUZU_QT_COMPONENTS DBus)
         # yes Qt, we get it
