@@ -7,6 +7,8 @@
 
 #include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include <filesystem>
 #include <QMainWindow>
@@ -479,6 +481,10 @@ private slots:
     void ResetWindowSize800();
     void ResetWindowSize900();
     void ResetWindowSize1080();
+    void SetupResolutionScaleMenu();
+    void UpdateResolutionScaleMenu();
+    void OnResolutionScaleSelected(Settings::ResolutionSetup setup);
+    void RestartForResolutionScale(Settings::ResolutionSetup setup);
     void UpdateUITheme();
     void OnAlbum();
     void OnCabinet(Service::NFP::CabinetMode mode);
@@ -664,6 +670,9 @@ private:
     AppMode current_mode_{AppMode::Gamer};
 
     QAction* actions_recent_files[max_recent_files_item];
+
+    // Resolution scale entries in View -> Resolution Scale, keyed by the value they select
+    std::vector<std::pair<Settings::ResolutionSetup, QAction*>> resolution_scale_actions;
 
     // stores default icon theme search paths for the platform
     QStringList default_theme_paths;

@@ -85,6 +85,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <glad/glad.h>
 
 #define QT_NO_OPENGL
+#include <QActionGroup>
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
@@ -108,6 +109,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QScreen>
 #include <QSplashScreen>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSortFilterProxyModel>
 #include <QStandardPaths>
 #include <QStatusBar>
@@ -1815,6 +1817,8 @@ void GMainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Reset_Window_Size_800, &GMainWindow::ResetWindowSize800);
     connect_menu(ui->action_Reset_Window_Size_900, &GMainWindow::ResetWindowSize900);
     connect_menu(ui->action_Reset_Window_Size_1080, &GMainWindow::ResetWindowSize1080);
+    SetupResolutionScaleMenu();
+
     ui->menu_Reset_Window_Size->addActions({ui->action_Reset_Window_Size_720,
                                             ui->action_Reset_Window_Size_800,
                                             ui->action_Reset_Window_Size_900,
@@ -1904,6 +1908,9 @@ void GMainWindow::UpdateMenuState() {
     }
 
     ui->action_Capture_Screenshot->setEnabled(emulation_running && !is_paused);
+
+    // Per-game overrides and the settings dialog can both move this out from under the menu
+    UpdateResolutionScaleMenu();
 
     if (emulation_running && is_paused) {
         ui->action_Pause->setText(tr("&Continue"));
@@ -4241,6 +4248,148 @@ void GMainWindow::ResetWindowSize1080() {
     ResetWindowSize(Layout::ScreenDocked::Width, Layout::ScreenDocked::Height);
 }
 
+void GMainWindow::SetupResolutionScaleMenu() {
+    static const std::array<std::pair<Settings::ResolutionSetup, const char*>, 13> entries{{
+        {Settings::ResolutionSetup::Res1_4X, QT_TRANSLATE_NOOP("GMainWindow",
+                                                               "0.25X (180p/270p) [EXPERIMENTAL]")},
+        {Settings::ResolutionSetup::Res1_2X, QT_TRANSLATE_NOOP("GMainWindow",
+                                                               "0.5X (360p/540p) [EXPERIMENTAL]")},
+        {Settings::ResolutionSetup::Res3_4X, QT_TRANSLATE_NOOP("GMainWindow",
+                                                               "0.75X (540p/810p) [EXPERIMENTAL]")},
+        {Settings::ResolutionSetup::Res1X, QT_TRANSLATE_NOOP("GMainWindow", "1X (720p/1080p)")},
+        {Settings::ResolutionSetup::Res5_4X,
+         QT_TRANSLATE_NOOP("GMainWindow", "1.25X (900p/1350p) [EXPERIMENTAL]")},
+        {Settings::ResolutionSetup::Res3_2X,
+         QT_TRANSLATE_NOOP("GMainWindow", "1.5X (1080p/1620p) [EXPERIMENTAL]")},
+        {Settings::ResolutionSetup::Res2X, QT_TRANSLATE_NOOP("GMainWindow", "2X (1440p/2160p)")},
+        {Settings::ResolutionSetup::Res3X, QT_TRANSLATE_NOOP("GMainWindow", "3X (2160p/3240p)")},
+        {Settings::ResolutionSetup::Res4X, QT_TRANSLATE_NOOP("GMainWindow", "4X (2880p/4320p)")},
+        {Settings::ResolutionSetup::Res5X, QT_TRANSLATE_NOOP("GMainWindow", "5X (3600p/5400p)")},
+        {Settings::ResolutionSetup::Res6X, QT_TRANSLATE_NOOP("GMainWindow", "6X (4320p/6480p)")},
+        {Settings::ResolutionSetup::Res7X, QT_TRANSLATE_NOOP("GMainWindow", "7X (5040p/7560p)")},
+        {Settings::ResolutionSetup::Res8X, QT_TRANSLATE_NOOP("GMainWindow", "8X (5760p/8640p)")},
+    }};
+
+    auto* const group = new QActionGroup(this);
+    group->setExclusive(true);
+
+    resolution_scale_actions.clear();
+    resolution_scale_actions.reserve(entries.size());
+    for (const auto& [setup, label] : entries) {
+        QAction* const action = ui->menu_Resolution_Scale->addAction(tr(label));
+        action->setCheckable(true);
+        group->addAction(action);
+        connect(action, &QAction::triggered, this,
+                [this, setup] { OnResolutionScaleSelected(setup); });
+        resolution_scale_actions.emplace_back(setup, action);
+    }
+
+    UpdateResolutionScaleMenu();
+}
+
+void GMainWindow::UpdateResolutionScaleMenu() {
+    const auto current = Settings::values.resolution_setup.GetValue();
+    for (const auto& [setup, action] : resolution_scale_actions) {
+        QSignalBlocker blocker(action);
+        action->setChecked(setup == current);
+    }
+}
+
+void GMainWindow::OnResolutionScaleSelected(Settings::ResolutionSetup setup) {
+    if (Settings::values.resolution_setup.GetValue() == setup) {
+        UpdateResolutionScaleMenu();
+        return;
+    }
+
+    Settings::values.resolution_setup.SetValue(setup);
+    UpdateResolutionScaleMenu();
+
+    // A per-game override lives in that game's own config, which is written elsewhere
+    if (config && Settings::values.resolution_setup.UsingGlobal()) {
+        try {
+            config->SaveAllValues();
+        } catch (const std::exception& e) {
+            LOG_ERROR(Frontend, "Exception saving config: {}", e.what());
+        } catch (...) {
+            LOG_ERROR(Frontend, "Unknown exception saving config");
+        }
+    }
+
+    if (emulation_running) {
+        RestartForResolutionScale(setup);
+        return;
+    }
+
+    Settings::UpdateRescalingInfo();
+    if (system) {
+        system->ApplySettings();
+    }
+}
+
+void GMainWindow::RestartForResolutionScale(Settings::ResolutionSetup setup) {
+    // Restarting is the cheap way to pick up a new scale. Applying it in place would mean tearing
+    // down state that bakes the factor in at creation time:
+    //   - Vulkan::Image::ScaleUp refuses to reallocate an image that is already flagged rescaled,
+    //     and its cached blit framebuffers/views are never invalidated, so old surfaces would be
+    //     blitted with the new factor and come out mismatched
+    //   - the rescaling IR pass emits the scale numbers as literal immediates, and resolution is
+    //     not part of the pipeline key, so every compiled pipeline would need recompiling and the
+    //     disk cache would be poisoned unless the key learns about resolution
+    //   - the anti-alias passes, the cached samplers' anisotropy bump, and the GC memory budget
+    //     are all fixed at creation as well
+    // Doing it properly means one sync operation on the GPU thread that destroys every image,
+    // clears the pipeline cache and rebuilds those caches. See the TODO below.
+    // TODO: apply the new scale in place instead of restarting the game.
+
+    const bool was_per_game = !Settings::values.resolution_setup.UsingGlobal();
+
+    QMessageBox::StandardButton answer = QMessageBox::question(
+        this, tr("Apply Resolution Scale"),
+        tr("The resolution scale takes effect when the game starts.\n\nRestart the game now to "
+           "apply it? Unsaved progress will be lost."),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+
+    if (answer != QMessageBox::Yes) {
+        statusBar()->showMessage(
+            tr("Resolution scale saved. It takes effect the next time a game is started."), 8000);
+        return;
+    }
+
+    if (system->GetExitLocked() && !ConfirmForceLockedExit()) {
+        statusBar()->showMessage(
+            tr("Resolution scale saved. It takes effect the next time a game is started."), 8000);
+        return;
+    }
+
+    // Make a copy since ShutdownGame edits game_path
+    const auto current_game = QString(current_game_path);
+    ShutdownGame();
+
+    // Shutting down restores the global state, which drops any per-game value written above, so
+    // write the choice again now that the setting is global again
+    Settings::values.resolution_setup.SetValue(setup);
+    UpdateResolutionScaleMenu();
+    if (config) {
+        try {
+            config->SaveAllValues();
+        } catch (const std::exception& e) {
+            LOG_ERROR(Frontend, "Exception saving config: {}", e.what());
+        } catch (...) {
+            LOG_ERROR(Frontend, "Unknown exception saving config");
+        }
+    }
+
+    if (was_per_game) {
+        // The title's own config is reapplied during boot and wins over what we just stored
+        statusBar()->showMessage(
+            tr("This game has its own resolution setting, which overrides this one. Change it in "
+               "the per-game configuration."),
+            10000);
+    }
+
+    BootGame(current_game, ApplicationAppletParameters());
+}
+
 void GMainWindow::OnConfigure() {
     const QString old_theme = UISettings::values.theme;
     DarkModeState old_dark_mode_state = UISettings::values.dark_mode_state;
@@ -4323,6 +4472,7 @@ void GMainWindow::OnConfigure() {
         RestoreUIState();
     }
     InitializeHotkeys();
+    UpdateResolutionScaleMenu();
 
     if (UISettings::values.theme != old_theme ||
         UISettings::values.dark_mode_state != old_dark_mode_state) {
