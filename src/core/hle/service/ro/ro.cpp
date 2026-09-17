@@ -392,6 +392,9 @@ public:
         ProcessContext* context = this->GetContextById(context_id);
         ASSERT(context != nullptr);
 
+        LOG_INFO(Service_LDR, "MapManualLoadModuleMemory nro={:#x} size={:#x} bss={:#x}",
+                 nro_address, nro_size, bss_size);
+
         // Validate address/size.
         R_TRY(ValidateAddressAndNonZeroSize(nro_address, nro_size));
         R_TRY(ValidateAddressAndSize(bss_address, bss_size));

@@ -21,11 +21,22 @@ permissions:
 
 jobs:
   build-linux:
-    name: Linux
+    name: Linux (${{ matrix.variant }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: standard
+            no_jit: 'OFF'
+            archive: suyu-linux-x86_64.tar.gz
+          - variant: no-jit
+            no_jit: 'ON'
+            archive: suyu-linux-x86_64-no-jit.tar.gz
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
           fetch-depth: 0
       - name: Install dependencies
@@ -57,6 +68,8 @@ jobs:
           sudo mkdir -p /opt/cmake
           sudo tar xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
           echo /opt/cmake/bin >> "$GITHUB_PATH"
+      - name: Test static recompiler
+        run: python tests/recompiler_smoke/run.py
       - name: Configure
         # fmt_FORCE_BUNDLED: the system fmt 9 has no format_string::get(), and
         # suyu only forces the bundled copy inside a branch that does not apply
@@ -67,26 +80,61 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
+            -DSUYU_NO_JIT=${{ matrix.no_jit }} \
             -Dfmt_FORCE_BUNDLED=ON
       - name: Build
         run: cmake --build build --target suyu suyu-cmd
+      - name: Verify no-JIT build
+        if: matrix.variant == 'no-jit'
+        run: |
+          grep -qx 'SUYU_NO_JIT:BOOL=ON' build/CMakeCache.txt
+          ninja -C build -t inputs suyu suyu-cmd > build/no-jit-inputs.txt
+          if grep -Ei '(^|[/\\])dynarmic([/\\.]|$)|arm_dynarmic|libdynarmic[.]a' build/no-jit-inputs.txt; then
+            echo 'Dynarmic input found in the no-JIT build' >&2
+            exit 1
+          fi
+          for target in suyu suyu-cmd; do
+            nm -C "build/bin/$target" > "build/$target-symbols.txt"
+            # A stripped or unreadable binary is not evidence of zero symbols.
+            grep -Eq '[[:space:]][Tt][[:space:]]' "build/$target-symbols.txt"
+            if grep -E 'Dynarmic::|dynarmic::' "build/$target-symbols.txt"; then
+              echo "Dynarmic symbol found in $target" >&2
+              exit 1
+            fi
+          done
+          printf 'Source: %s\nSUYU_NO_JIT=ON\nNo Dynarmic target inputs or executable symbols.\n' "$GITHUB_SHA" > build/no-jit-audit.txt
       - name: Package
         run: |
           mkdir -p _pkg
           cp build/bin/suyu build/bin/suyu-cmd _pkg/
           cp LICENSE.txt _pkg/
-          tar -czf suyu-linux-x86_64.tar.gz -C _pkg .
+          if [ -f build/no-jit-audit.txt ]; then cp build/no-jit-audit.txt _pkg/; fi
+          tar -czf '${{ matrix.archive }}' -C _pkg .
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
-          path: suyu-linux-x86_64.tar.gz
+          name: linux-${{ matrix.variant }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
 
   build-windows:
-    name: Windows
+    name: Windows (${{ matrix.variant }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: standard
+            no_jit: 'OFF'
+            linker_flags: ''
+            archive: suyu-windows-x86_64.zip
+          - variant: no-jit
+            no_jit: 'ON'
+            linker_flags: '/MAP'
+            archive: suyu-windows-x86_64-no-jit.zip
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
           fetch-depth: 0
       - uses: ilammy/msvc-dev-cmd@v1
@@ -104,17 +152,60 @@ jobs:
           $sdk = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
           "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
           "$($sdk.FullName)\Bin" >> $env:GITHUB_PATH
+      - name: Test static recompiler
+        shell: pwsh
+        run: python tests/recompiler_smoke/run.py
       - name: Configure
         shell: bash
+        env:
+          MSYS_NO_PATHCONV: '1'
         run: |
           cmake --version
           cmake -B build -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
-            -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF
+            -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
+            -DSUYU_NO_JIT=${{ matrix.no_jit }} \
+            '-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.linker_flags }}'
       - name: Build
         shell: bash
         run: cmake --build build --target suyu suyu-cmd
+      - name: Verify no-JIT build
+        if: matrix.variant == 'no-jit'
+        shell: pwsh
+        run: |
+          if (-not (Select-String -Path build/CMakeCache.txt -Pattern '^SUYU_NO_JIT:BOOL=ON$' -Quiet)) {
+            throw 'No-JIT build setting is missing'
+          }
+          ninja -C build -t inputs suyu suyu-cmd | Set-Content build/no-jit-inputs.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Ninja inputs' }
+          if (Select-String -Path build/no-jit-inputs.txt -Pattern '(^|[/\\])dynarmic([/\\.]|$)|arm_dynarmic|libdynarmic[.]a' -Quiet) {
+            throw 'Dynarmic input found in the no-JIT build'
+          }
+          foreach ($target in @('suyu', 'suyu-cmd')) {
+            $maps = @(Get-ChildItem build -Recurse -File -Filter "$target.map")
+            if ($maps.Count -ne 1 -or $maps[0].Length -eq 0) {
+              throw "Expected one nonempty link map for $target"
+            }
+            if (-not (Select-String -LiteralPath $maps[0].FullName -Pattern 'Publics by Value' -Quiet)) {
+              throw "No public-symbol table found in $target link map"
+            }
+            # MSVC encodes UI text such as "Dynarmic" in ??_C@ literal symbols.
+            # Exclude only those literals; retain every code/data symbol row.
+            $symbols = @(Select-String -LiteralPath $maps[0].FullName -Pattern '^\s+[0-9a-f]+:[0-9a-f]+\s+(\S+)\s+[0-9a-f]{8,}\b' |
+              Where-Object { -not $_.Matches[0].Groups[1].Value.StartsWith('??_C@') })
+            if ($symbols.Count -eq 0) {
+              throw "No nonliteral symbols found in $target link map"
+            }
+            if ($symbols.Line -match '@Dynarmic@|\bdynarmic[.]lib\b') {
+              throw "Dynarmic symbol found in $target link map"
+            }
+          }
+          @(
+            "Source: $env:GITHUB_SHA"
+            'SUYU_NO_JIT=ON'
+            'No Dynarmic target inputs or executable link-map symbols.'
+          ) | Set-Content build/no-jit-audit.txt
       - name: Package
         shell: pwsh
         run: |
@@ -123,12 +214,15 @@ jobs:
           Get-ChildItem build\bin -Filter *.dll | Copy-Item -Destination _pkg\
           if (Test-Path build\bin\plugins) { Copy-Item build\bin\plugins _pkg\ -Recurse }
           windeployqt --release --no-translations _pkg\suyu.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Qt deployment failed' }
           Copy-Item LICENSE.txt _pkg\
-          Compress-Archive -Path _pkg\* -DestinationPath suyu-windows-x86_64.zip
+          if (Test-Path build/no-jit-audit.txt) { Copy-Item build/no-jit-audit.txt _pkg\ }
+          Compress-Archive -Path _pkg\* -DestinationPath '${{ matrix.archive }}'
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
-          path: suyu-windows-x86_64.zip
+          name: windows-${{ matrix.variant }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
 
   source:
     name: Source archive
@@ -136,6 +230,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
           fetch-depth: 0
       - name: Archive the complete source, submodules included
@@ -151,6 +246,7 @@ jobs:
         with:
           name: source
           path: '*.tar.gz'
+          if-no-files-found: error
 
   publish:
     name: Publish
@@ -161,6 +257,9 @@ jobs:
     needs: [build-linux, build-windows, source]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -168,6 +267,15 @@ jobs:
         run: |
           mkdir -p out
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} out/ \;
+          for asset in \
+            suyu-linux-x86_64.tar.gz \
+            suyu-linux-x86_64-no-jit.tar.gz \
+            suyu-windows-x86_64.zip \
+            suyu-windows-x86_64-no-jit.zip \
+            "suyu-${GITHUB_REF_NAME}-source.tar.gz"; do
+            test -s "out/$asset"
+          done
+          test -s "docs/releases/${GITHUB_REF_NAME}.md"
           ls -la out
       - name: Publish release
         env:
@@ -176,10 +284,7 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
+            --verify-tag \
             --title "suyu $TAG" \
-            --notes "Built from \`$TAG\` (\`${GITHUB_SHA}\`) by GitHub Actions.
-
-          \`suyu-$TAG-source.tar.gz\` is the complete source this was built from, submodules included. GitHub's own source links above exclude submodules.
-
-          No game data, keys or firmware are included here or fetched by anything in it. You supply your own." \
+            --notes-file "docs/releases/$TAG.md" \
             out/*

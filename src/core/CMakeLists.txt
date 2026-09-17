@@ -244,6 +244,8 @@ add_library(core STATIC
     hle/kernel/k_code_memory.h
     hle/kernel/k_condition_variable.cpp
     hle/kernel/k_condition_variable.h
+    hle/kernel/k_lock_trace.cpp
+    hle/kernel/k_lock_trace.h
     hle/kernel/k_debug.h
     hle/kernel/k_device_address_space.cpp
     hle/kernel/k_device_address_space.h
