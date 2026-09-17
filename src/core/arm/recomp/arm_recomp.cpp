@@ -1990,6 +1990,85 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                     }
                 }
             }
+            // Address-range hole. Every guest PC whose offset in `main` falls
+            // in [lo, hi) misses the lookup and runs under the JIT while the
+            // rest of the module stays static, which narrows a fault inside a
+            // module the way bisect-modules narrows it to a module. Read at
+            // runtime, so an arm needs neither a re-export nor a rebuild.
+            //
+            // Module-relative for the same reason as the cutoff above. Scoped
+            // to `main` because the same offset exists in every other image.
+            //
+            // Only meaningful when fallback is allowed: under
+            // SUYU_RECOMP_STRICT a miss is a PrefetchAbort, not a handover.
+            static const char* const main_hole = std::getenv("SUYU_RECOMP_MAIN_HOLE");
+            if (main_hole) {
+                static u64 hole_lo = 0;
+                static u64 hole_hi = 0;
+                static const bool hole_valid = [] {
+                    char* end = nullptr;
+                    hole_lo = std::strtoull(main_hole, &end, 0);
+                    if (!end || *end != '-') {
+                        LOG_ERROR(Core_ARM, "recomp: SUYU_RECOMP_MAIN_HOLE={} is not <lo>-<hi>",
+                                  main_hole);
+                        return false;
+                    }
+                    hole_hi = std::strtoull(end + 1, nullptr, 0);
+                    if (hole_hi <= hole_lo) {
+                        LOG_ERROR(Core_ARM, "recomp: SUYU_RECOMP_MAIN_HOLE={} is empty", main_hole);
+                        return false;
+                    }
+                    return true;
+                }();
+                // Which module the offsets are relative to, as a substring of
+                // its name. Modules are registered under the NSO's own name,
+                // not the exefs file name - Smash's `main` is
+                // `cross2_Release.nss` and its `sdk` is `nnSdk` - so matching
+                // "main" finds nothing. Unset applies the hole to every module,
+                // which is what the all-to-JIT control wants.
+                static const char* const hole_module = std::getenv("SUYU_RECOMP_HOLE_MODULE");
+                // Snapshotted, and retried while empty, because the first guest
+                // blocks can run before the loader registers module bases.
+                static std::vector<u64> hole_bases;
+                if (hole_valid && hole_bases.empty()) {
+                    std::scoped_lock lk{g_counters.hist_lock};
+                    for (const auto& [base, name] : g_counters.modules) {
+                        if (!hole_module || name.find(hole_module) != std::string::npos) {
+                            hole_bases.push_back(base);
+                        }
+                    }
+                    if (!hole_bases.empty()) {
+                        LOG_ERROR(Core_ARM, "recomp: main hole {:#x}-{:#x} armed on {} module(s)",
+                                  hole_lo, hole_hi, hole_bases.size());
+                    } else if (!g_counters.modules.empty()) {
+                        // Named a module that is not loaded. Silence here would
+                        // look exactly like a range that never executes.
+                        LOG_ERROR(Core_ARM, "recomp: SUYU_RECOMP_HOLE_MODULE={} matched no module",
+                                  hole_module);
+                    }
+                }
+                for (const u64 base : hole_bases) {
+                    if (impl->ctx.pc < base) {
+                        continue;
+                    }
+                    const u64 off = impl->ctx.pc - base;
+                    if (off >= hole_lo && off < hole_hi) {
+                        // Logged once so a run proves the hole was applied. A
+                        // silently ignored hole reports the same counters as no
+                        // hole at all, which makes every arm of a bisection look
+                        // uninformative for the wrong reason.
+                        static std::atomic<bool> hole_announced{false};
+                        if (!hole_announced.exchange(true, std::memory_order_relaxed)) {
+                            LOG_ERROR(Core_ARM,
+                                      "recomp: main hole {:#x}-{:#x} active (base {:#x}), first "
+                                      "handover at pc={:#x}",
+                                      hole_lo, hole_hi, base, impl->ctx.pc);
+                        }
+                        block = nullptr;
+                        break;
+                    }
+                }
+            }
             // Same hook keyed on wall time instead of block count. A stalled
             // title stops retiring blocks, so a block-count cutoff placed
             // inside the stall is never reached; seconds get there regardless.
