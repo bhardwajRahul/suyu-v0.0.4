@@ -626,15 +626,15 @@ else {
    uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);_p[_k]=_diff-_borrow;_borrow=_next;}
  }else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k){uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];
   uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}
- int _top=(int)(_count*64)-1;while(_top>=0&&!((_p[(unsigned)_top/64]>>(_top%64))&1))--_top;
+ int _top=recomp_fp_top_bit(_p,_count);
  if(_top<0)_v=((_zz&&(_az||_bz)&&_ps==_cs)?_ps:_mode==2)?_sign:0;
  else {int _e=_top+_base,_emin=1-(int)_bias;
   if(_e<_emin&&(c->fpcr&(1ULL<<24))){c->fpsr|=8;_v=_negative?_sign:0;}
   else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;
    unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;
    uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);
-   unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1),_sticky=0;
-   for(int _k=0;_k<_cut-1;++_k)_sticky|=(unsigned)((_p[(unsigned)_k/64]>>(_k%64))&1);
+   unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);
+   unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);
    unsigned _lost=_roundbit|_sticky;if(_lost){c->fpsr|=16;if(_e<_emin)c->fpsr|=8;
     if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}
    if(_e<_emin){_e=_emin;}if(_mant>=(_hidden<<1)){_mant>>=1;++_e;}
@@ -3302,14 +3302,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             "else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k)"
             "{uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];"
             "uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}"
-            "int _top=(int)(_count*64)-1;while(_top>=0&&!((_p[(unsigned)_top/64]>>(_top%64))&1))--_top;"
+            "int _top=recomp_fp_top_bit(_p,_count);"
             "if(_top<0)_v=_mode==2?_sign:0;else {int _e=_top+_base,_emin=1-(int)_bias;"
             "if(_e<_emin&&(c->fpcr&(1ULL<<24))) {c->fpsr|=8;_v=_negative?_sign:0;}"
             "else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;"
             "unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;"
             "uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);"
-            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1),_sticky=0;"
-            "for(int _k=0;_k<_cut-1;++_k)_sticky|=(unsigned)((_p[(unsigned)_k/64]>>(_k%64))&1);"
+            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);"
+            "unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);"
             "unsigned _lost=_roundbit|_sticky;if(_lost) {c->fpsr|=16;if(_e<_emin)c->fpsr|=8;"
             "if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}"
             "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
@@ -5840,8 +5840,104 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     return stats;
 }
 
+/* Exact-FP accumulator scans, shared by the runtime header below and by the
+   standalone test harnesses, which build a self-contained C file rather than
+   including recomp_runtime.h. One definition so the two cannot drift. */
+inline const char* FPScanHelpers() {
+    return R"FS(
+/* Standalone test harnesses paste this in without recomp_runtime.h. */
+#ifndef RECOMP_INLINE
+#if defined(_MSC_VER)
+#define RECOMP_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_INLINE inline __attribute__((always_inline))
+#else
+#define RECOMP_INLINE inline
+#endif
+#endif
+
+/* The multiply-add and step emitters keep a 9- (single) or 67-word (double)
+   integer accumulator so rounding, subnormals and FPSR are exact. Finding the
+   highest set bit and OR-ing the discarded bits one bit at a time made those
+   two loops the dominant cost of the generated code: sampled at 99 Hz they
+   were ~87-92% of the exclusive cycles of the three hottest attract functions.
+   These do the identical operation a word at a time. Results are unchanged. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+/* Index of the highest set bit of `w`. `w` must be nonzero. */
+RECOMP_INLINE unsigned recomp_bit_index64(uint64_t w) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long i;
+    _BitScanReverse64(&i, w);
+    return (unsigned)i;
+#elif defined(_MSC_VER)
+    /* 32-bit MSVC targets have no _BitScanReverse64. */
+    unsigned long i;
+    uint32_t hi = (uint32_t)(w >> 32);
+    if (hi) {
+        _BitScanReverse(&i, (unsigned long)hi);
+        return (unsigned)i + 32u;
+    }
+    _BitScanReverse(&i, (unsigned long)(uint32_t)w);
+    return (unsigned)i;
+#elif defined(__GNUC__) || defined(__clang__)
+    return 63u - (unsigned)__builtin_clzll(w);
+#else
+    /* Portable fallback: no intrinsic and no new CPU feature requirement. */
+    unsigned n = 0;
+    if (w >> 32) { w >>= 32; n += 32; }
+    if (w >> 16) { w >>= 16; n += 16; }
+    if (w >> 8)  { w >>= 8;  n += 8; }
+    if (w >> 4)  { w >>= 4;  n += 4; }
+    if (w >> 2)  { w >>= 2;  n += 2; }
+    if (w >> 1)  { n += 1; }
+    return n;
+#endif
+}
+
+/* Highest set bit of the little-endian word array `p`, or -1 if it is zero.
+   Equivalent to scanning bit (count*64-1) downwards for the first set bit. */
+RECOMP_INLINE int recomp_fp_top_bit(const uint64_t* p, unsigned count) {
+    unsigned k = count;
+    while (k--) {
+        if (p[k]) {
+            return (int)(k * 64u) + (int)recomp_bit_index64(p[k]);
+        }
+    }
+    return -1;
+}
+
+/* Sticky bit for a rounding position `cut`: the OR of bits [0, cut-1) of `p`,
+   i.e. everything strictly below the round bit, which is bit cut-1 and is
+   deliberately excluded. Equivalent to the per-bit OR loop it replaces. */
+RECOMP_INLINE unsigned recomp_fp_sticky(const uint64_t* p, unsigned count, int cut) {
+    int n = cut - 1;
+    uint64_t agg = 0;
+    unsigned whole, rest, i;
+    if (n <= 0) {
+        return 0u;
+    }
+    whole = (unsigned)n / 64u;
+    if (whole > count) {
+        whole = count;
+    }
+    for (i = 0; i < whole; ++i) {
+        agg |= p[i];
+    }
+    rest = (unsigned)n % 64u;
+    /* A zero remainder must not reach a shift by 64. */
+    if (rest && whole < count) {
+        agg |= p[whole] & ((1ULL << rest) - 1ULL);
+    }
+    return agg != 0;
+}
+)FS";
+}
+
 inline const char* RuntimeH() {
-    return R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
+    static const std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>   /* offsetof, for the layout assertions below */
@@ -5865,7 +5961,7 @@ inline const char* RuntimeH() {
 #else
 #define RECOMP_INLINE inline
 #endif
-
+)RT") + FPScanHelpers() + R"RT(
 /* Supplied by the host when the recompiled image is driven by an emulator
    rather than run standalone. `size` is 1, 2, 4 or 8 bytes. */
 typedef struct RecompHostMem {
@@ -6072,6 +6168,7 @@ int  recomp_save_exists(GuestContext* c, const char* name);
 int  recomp_load_segments(GuestContext* c, const char* data_dir);
 #endif
 )RT";
+    return text.c_str();
 }
 
 inline const char* EstimateRuntimeC() {
