@@ -139,15 +139,31 @@ static_assert(offsetof(GuestContextView, chain_budget) == 864);
 // to agree on the value.
 //
 // It bounds two things. How long a guest loop can run without the interrupt and
-// SVC checks below getting a look in; and, because the generated calls are not
-// guaranteed to be tail calls, how deep the host stack goes. Guest threads run
-// on 512 KB fibers (common/fiber.cpp) and a block frame carrying SIMD locals is
-// not small, so this has to stay well under what that stack can hold. 256
-// overflowed it and crashed on boot.
-// Overridable so the depth can be measured rather than guessed, but only
-// upwards from a value known to be safe, and only when the generated code was
-// built with -foptimize-sibling-calls - without real tail calls a large budget
-// is a stack overflow, which is exactly how 256 crashed on boot.
+// SVC checks below getting a look in; and, if the generated calls are not tail
+// calls, how deep the host stack goes. Guest threads run on 512 KB fibers
+// (common/fiber.cpp) and a block frame carrying SIMD locals is not small.
+//
+// This comment used to say 256 overflowed that stack and crashed on boot, and
+// that raising the budget was only safe when the generated code was built with
+// -foptimize-sibling-calls. That flag is still only on the GNU branch - the
+// MSVC branch emits "/O1" with no tail-call guarantee, and ChainTo calls into
+// another translation unit - so by that reasoning Windows should fall over well
+// below the ABI 4 default of 4096.
+//
+// It does not. Measured on Mario Kart 8 running fully static with zero JIT
+// transitions, replaying the same 8861-command fixture at each budget:
+//
+//     32 -> 0.666x realtime    256 -> 0.696x    1024 -> 0.695x
+//   4096 -> 0.678x             8192 -> 0.692x
+//
+// Every one completed, including 256 and the 8192 ceiling, each executing about
+// 8.5 billion blocks. So either MSVC /O1 does tail-call these, or the chains
+// never get deep enough to matter. The budget is worth about 4% either way,
+// with 32 the slowest, so there is little to gain from tuning it.
+//
+// Keep the bound: one title not overflowing is not proof that a deeper-
+// recursing one cannot. But do not treat a raised budget as known-dangerous on
+// MSVC, because that is not what the measurement says.
 // Refuse the JIT entirely. Without this, "the JIT was never reached" is an
 // observation about one run; with it, reaching the JIT is a loud, fatal failure
 // that names the address, which is the difference between evidence and proof.
