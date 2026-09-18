@@ -1965,6 +1965,95 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                    "again, or choose the Source export format if you only want the generated C."));
             return {};
         }
+        if (!cmake.isEmpty()) {
+            status_label->setText(tr("Compiling %1 (this takes a while)...").arg(mod.name));
+            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+            const QString build_dir = mod_dir + QDir::separator() + QStringLiteral("build");
+            QString configure_log;
+            QString build_log;
+
+            QProcess configure;
+            const int configure_rc = RunProcessDrained(
+                configure, cmake,
+                {QStringLiteral("-S"), mod_dir, QStringLiteral("-B"), build_dir,
+                 // The package ships one self-contained exe, so only the static
+                 // library is ever consumed. Without this the generated project
+                 // also builds a standalone exe and a loadable DLL from the same
+                 // sources - three full compiles of a translation unit that can
+                 // take 40 minutes each on a large title.
+                 QStringLiteral("-DRECOMP_STATIC_ONLY=ON")},
+                &configure_log);
+            if (configure_rc == 0) {
+                QProcess build;
+                const int build_rc =
+                    RunProcessDrained(build, cmake,
+                                      {QStringLiteral("--build"), build_dir,
+                                       QStringLiteral("--config"), QStringLiteral("Release"),
+                                       QStringLiteral("--parallel")},
+                                      &build_log);
+                if (build_rc != 0) {
+                    LOG_ERROR(Frontend, "Recompiled module {} failed to compile:\n{}",
+                              mod.name.toStdString(), build_log.right(4000).toStdString());
+                    if (fallback_enabled) {
+                        LOG_WARNING(Frontend, "Module {} compile failed, falling back to dynarmic",
+                                    mod.name.toStdString());
+                        fallback_modules.append(mod.name);
+                        continue;
+                    }
+                    QMessageBox::critical(
+                        this, tr("Build Failed"),
+                        tr("Compiling module '%1' failed.\n\nThe generated sources are still in:\n"
+                           "%2\n\nChoose Hybrid AOT + JIT to continue despite build "
+                           "failures. See the suyu log for compiler output.")
+                            .arg(mod.name, mod_dir));
+                    return {};
+                }
+            } else {
+                LOG_ERROR(Frontend, "cmake could not configure recompiled module {}:\n{}",
+                          mod.name.toStdString(), configure_log.right(4000).toStdString());
+                if (fallback_enabled) {
+                    LOG_WARNING(Frontend, "Module {} cmake configure failed, falling back to dynarmic",
+                                mod.name.toStdString());
+                    fallback_modules.append(mod.name);
+                    continue;
+                }
+                QMessageBox::critical(
+                    this, tr("Build Failed"),
+                    tr("CMake could not configure module '%1'.\n\nThe generated sources are in:\n"
+                       "%2\n\nChoose Hybrid AOT + JIT to continue despite failures.")
+                        .arg(mod.name, mod_dir));
+                return {};
+            }
+
+            const QStringList produced =
+                // With RECOMP_STATIC_ONLY the only artifact is the static library,
+                // so accept that as proof the module compiled.
+                QDir(build_dir).entryList({QStringLiteral("*.exe"), QStringLiteral("*.dll"),
+                                           QStringLiteral("*.so"), QStringLiteral("*.dylib"),
+                                           QStringLiteral("*.lib"), QStringLiteral("*.a"),
+                                           QStringLiteral("recompiled")},
+                                          QDir::Files, QDir::Name) +
+                QDir(build_dir + QDir::separator() + QStringLiteral("Release"))
+                    .entryList({QStringLiteral("*.exe"), QStringLiteral("*.dll"),
+                                QStringLiteral("*.lib"), QStringLiteral("*.a")},
+                               QDir::Files, QDir::Name);
+            if (produced.isEmpty()) {
+                LOG_ERROR(Frontend, "Build of module {} reported success but produced no binary",
+                          mod.name.toStdString());
+                if (fallback_enabled) {
+                    fallback_modules.append(mod.name);
+                    continue;
+                }
+                QMessageBox::critical(
+                    this, tr("Build Failed"),
+                    tr("CMake reported success for module '%1' but no binary was found in:\n%2")
+                        .arg(mod.name, build_dir));
+                return {};
+            }
+            LOG_INFO(Frontend, "Built recompiled module {}: {}", mod.name.toStdString(),
+                     produced.join(QStringLiteral(", ")).toStdString());
+        }
     }
 
     // Remembered so the completion dialog can say which modules degraded. Until
