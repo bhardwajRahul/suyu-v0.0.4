@@ -1612,7 +1612,6 @@ bool GameExportDialog::WantsCompiledOutput() const {
 
 QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                            const QString& cache_dir,
-                                           RecompileBackend backend,
                                            const QString& game_name) {
     QDir().mkpath(cache_dir);
 

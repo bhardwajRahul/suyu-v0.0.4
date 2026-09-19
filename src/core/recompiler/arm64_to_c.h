@@ -6470,7 +6470,7 @@ static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t b
   const RecompHostMem* hm = c->host_mem;
   uint64_t psz;
   if((va & (bytes - 1)) != 0){
-    if(!hm || !hm->page_entries) return 0;
+    if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
     psz = (uint64_t)1 << hm->page_bits;
     if(((va & 0xffffffffffffULL) & (psz - 1)) + bytes > psz) return 0;
   }

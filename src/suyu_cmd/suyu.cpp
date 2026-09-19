@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -29,6 +30,7 @@
 #include "common/string_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/core.h"
+#include "core/perf_stats.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
@@ -122,7 +124,17 @@ static void PrintHelp(const char* argv0) {
                  "-m, --multiplayer=nick:password@address:port"
                  " Nickname, password, address and port for multiplayer\n"
                  "-p, --program         Pass following string as arguments to executable\n"
+                 "-t, --tas             Replay the TAS script from the user tas directory,\n"
+                 "                      starting at the first displayed frame and exiting\n"
+                 "                      when the script runs out\n"
                  "-u, --user            Select a specific user profile from 0 to 7\n"
+                 "-V, --app-version=<n>[:<display>]\n"
+                 "                      Report <n> as the application version and <display>\n"
+                 "                      as its version string, for content that carries no\n"
+                 "                      control data of its own. Without this a deconstructed\n"
+                 "                      ROM directory always reports 1.0.0. Persisted as\n"
+                 "                      application_version_override and\n"
+                 "                      application_display_version_override in the config.\n"
                  "-v, --version         Output version information and exit\n"
                  "-l, "
                  "--applet-params="
@@ -649,6 +661,12 @@ int main(int argc, char** argv) {
 #ifdef SUYU_CMD_STATIC_RECOMP
     {
         namespace FS = Common::FS;
+        // Captured before the portable overrides below take effect: keys
+        // belong to the user's installed suyu rather than to the export,
+        // so this is where they still are once the rest has been
+        // repointed into the export's own user directory.
+        const std::filesystem::path installed_keys =
+            FS::GetSuyuPath(FS::SuyuPath::KeysDir);
 #ifdef _WIN32
         wchar_t exe_w[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
@@ -686,7 +704,13 @@ int main(int argc, char** argv) {
         FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
         FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
         FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
+#ifdef _WIN32
         FS::SetSuyuPath(FS::SuyuPath::KeysDir, FS::GetAppDataRoamingDirectory() / "suyu" / "keys");
+#else
+        // No roaming-appdata equivalent here, and the default already
+        // points at the installed location on these platforms.
+        FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_keys);
+#endif
     }
 #endif
 
@@ -725,6 +749,9 @@ int main(int argc, char** argv) {
 
     bool use_multiplayer = false;
     bool fullscreen = false;
+    bool tas_playback = false;
+    std::optional<u32> app_version_override;
+    std::string app_display_version_override;
     Service::AM::FrontendAppletParameters load_parameters{};
     std::string nickname{};
     std::string password{};
@@ -740,14 +767,16 @@ int main(int argc, char** argv) {
         {"applet-params", optional_argument, 0, 'l'},
         {"multiplayer", required_argument, 0, 'm'},
         {"program", optional_argument, 0, 'p'},
+        {"tas", no_argument, 0, 't'},
         {"user", required_argument, 0, 'u'},
         {"version", no_argument, 0, 'v'},
+        {"app-version", required_argument, 0, 'V'},
         {0, 0, 0, 0},
         // clang-format on
     };
 
     while (optind < argc) {
-        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l::", long_options, &option_index);
+        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l::tV:", long_options, &option_index);
         if (arg != -1) {
             switch (static_cast<char>(arg)) {
             case 'c':
@@ -819,6 +848,9 @@ int main(int argc, char** argv) {
                 }
                 break;
             }
+            case 't':
+                tas_playback = true;
+                break;
             case 'p':
                 program_args = argv[optind];
                 ++optind;
@@ -829,6 +861,25 @@ int main(int argc, char** argv) {
             case 'v':
                 PrintVersion();
                 return 0;
+            case 'V': {
+                // <numeric>[:<display>]. The numeric part is what the guest sees through
+                // the application version, the display part is the string a title prints
+                // for itself.
+                const std::string str_arg(optarg);
+                const auto colon = str_arg.find(':');
+                const std::string numeric = str_arg.substr(0, colon);
+                try {
+                    app_version_override = static_cast<u32>(std::stoul(numeric));
+                } catch (const std::exception&) {
+                    std::cout << "Invalid --app-version: " << str_arg
+                              << " (expected <number>[:<display>])\n";
+                    return 0;
+                }
+                if (colon != std::string::npos) {
+                    app_display_version_override = str_arg.substr(colon + 1);
+                }
+                break;
+            }
             }
         } else {
 #ifdef _WIN32
@@ -854,6 +905,13 @@ int main(int argc, char** argv) {
 
     if (selected_user.has_value()) {
         Settings::values.current_user = std::clamp(*selected_user, 0, 7);
+    }
+
+    if (tas_playback) {
+        // Must be set before the input subsystem is constructed: the TAS driver
+        // only reads the scripts out of the TAS directory when it sees this
+        // enabled, and it is applied here so the config file cannot clear it.
+        Settings::values.tas_enable.SetValue(true);
     }
 
 #ifdef _WIN32
@@ -1092,6 +1150,10 @@ int main(int argc, char** argv) {
         break;
     }
 
+    if (tas_playback) {
+        emu_window->EnableTasPlayback();
+    }
+
 #ifdef _WIN32
     Common::Windows::SetCurrentTimerResolutionToMaximum();
     system.CoreTiming().SetTimerResolutionNs(Common::Windows::GetCurrentTimerResolution());
@@ -1100,6 +1162,32 @@ int main(int argc, char** argv) {
     LOG_INFO(Frontend, "suyu-cmd: Window created, loading game...");
     system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    // The command line wins over the configuration file, so a one-off run can differ
+    // from the persisted setting without editing it.
+    if (!app_version_override) {
+        const u32 configured = Settings::values.application_version_override.GetValue();
+        const std::string& configured_display =
+            Settings::values.application_display_version_override.GetValue();
+        if (configured != 0 || !configured_display.empty()) {
+            app_version_override = configured;
+            if (app_display_version_override.empty()) {
+                app_display_version_override = configured_display;
+            }
+        }
+    }
+
+    if (app_version_override) {
+        // Deconstructed ROM directories carry no control data, so GetDisplayVersion has
+        // nothing to read and falls back to a hard-coded 1.0.0. Titles that report their
+        // own version, and anything that checks version compatibility, then see a value
+        // that does not match the code actually loaded.
+        LOG_INFO(Frontend, "suyu-cmd: reporting application version {} ({})",
+                 *app_version_override,
+                 app_display_version_override.empty() ? "no display version"
+                                                      : app_display_version_override);
+        system.SetApplicationVersionOverride(*app_version_override,
+                                             app_display_version_override);
+    }
     system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
     system.GetUserChannel().clear();
 
@@ -1222,9 +1310,48 @@ int main(int argc, char** argv) {
     if (system.DebuggerEnabled()) {
         system.InitializeDebugger();
     }
+
+    // Periodic performance samples for benchmarking.
+    //
+    // Timing a replay end to end says little when a run can stall partway
+    // and still finish: the stall is averaged in invisibly, and a run that
+    // never finishes yields no number at all. A series lets a measurement
+    // pick a window, and a stall shows up in it as a gap.
+    //
+    // On a thread of its own because the loop below blocks in WaitEvent:
+    // samples driven from there would stop arriving exactly when the
+    // emulator stops making progress, which is the case worth seeing. The
+    // window-title refresh gives up the counters while this is enabled, so
+    // there is still only one reader of them.
+    const bool perf_sampling = std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
+    std::atomic<bool> perf_sampling_run{perf_sampling};
+    std::thread perf_sampler;
+    if (perf_sampling) {
+        perf_sampler = std::thread([&system, &perf_sampling_run] {
+            while (perf_sampling_run.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::seconds{1});
+                if (!perf_sampling_run.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                const auto r = system.GetAndResetPerfStats();
+                LOG_INFO(Frontend,
+                         "PERF game_fps={:.3f} system_fps={:.3f} frametime_ms={:.3f} "
+                         "speed={:.4f}",
+                         r.average_game_fps, r.system_fps, r.frametime * 1000.0,
+                         r.emulation_speed);
+            }
+        });
+    }
+
     while (emu_window->IsOpen()) {
         emu_window->WaitEvent();
     }
+
+    perf_sampling_run.store(false, std::memory_order_relaxed);
+    if (perf_sampler.joinable()) {
+        perf_sampler.join();
+    }
+
     system.DetachDebugger();
     void(system.Pause());
     system.ShutdownMainProcess();

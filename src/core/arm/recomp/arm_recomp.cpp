@@ -24,6 +24,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_lock_trace.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hardware_properties.h"
 #include "core/arm/debug.h"
 #ifndef SUYU_NO_JIT
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -352,6 +353,7 @@ namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
 std::mutex g_process_init_lock;
+std::atomic<RecompPrepareFn> g_recomp_prepare{nullptr};
 
 /// Execution coverage for the AOT path (mk8-recomp #13).
 ///
@@ -409,6 +411,7 @@ struct RecompCounters {
 };
 
 RecompCounters g_counters;
+std::array<std::atomic<u64>, 4> g_current_pcs{};
 std::atomic<int> g_live_instances{0};
 std::atomic<Kernel::KProcess*> g_report_process{nullptr};
 
@@ -994,6 +997,24 @@ void ReportRecompCoverage() {
 
 } // namespace
 
+RecompExecutionStats GetRecompExecutionStats() {
+    return {
+        TotalStaticBlocks(),
+        g_counters.svc_calls.load(std::memory_order_relaxed),
+        g_counters.fallback_from_miss.load(std::memory_order_relaxed),
+        g_counters.fallback_from_unhandled.load(std::memory_order_relaxed),
+        g_counters.no_fallback_available.load(std::memory_order_relaxed),
+    };
+}
+
+std::array<u64, 4> GetRecompCurrentPcs() {
+    std::array<u64, 4> result{};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        result[index] = g_current_pcs[index].load(std::memory_order_relaxed);
+    }
+    return result;
+}
+
 void SetRecompLookup(RecompLookupFn lookup) {
     std::scoped_lock lock{g_process_init_lock};
     g_code_guard_ready.store(false, std::memory_order_release);
@@ -1031,6 +1052,14 @@ RecompLiveStats GetRecompLiveStats() {
 #endif
         StrictNoFallback(),
     };
+}
+
+void SetRecompPrepareCallback(RecompPrepareFn callback) {
+    g_recomp_prepare.store(callback, std::memory_order_release);
+}
+
+bool HasRecompPrepareCallback() {
+    return g_recomp_prepare.load(std::memory_order_acquire) != nullptr;
 }
 
 RecompLookupFn GetRecompLookup() {
@@ -1202,6 +1231,7 @@ struct ArmRecomp::Impl {
     }
 
     static u64 HostLoad(void* user, u64 va, u32 size) {
+        va &= 0xffffffffffffULL;
         auto* self = static_cast<Impl*>(user);
         auto& memory = self->system.ApplicationMemory();
         if (size != 0 && !memory.IsValidVirtualAddress(va)) {
@@ -1219,9 +1249,19 @@ struct ArmRecomp::Impl {
         case 4: return memory.Read32(va);
         default: return memory.Read64(va);
         }
+        if ((size != 1 && size != 2 && size != 4 && size != 8) ||
+            size > 0x1000000000000ULL - va) {
+            return 0;
+        }
+        u64 value = 0;
+        for (u32 offset = 0; offset < size; ++offset) {
+            value |= static_cast<u64>(memory.Read8(va + offset)) << (offset * 8);
+        }
+        return value;
     }
 
     static void HostStore(void* user, u64 va, u32 size, u64 value) {
+        va &= 0xffffffffffffULL;
         if (kTrapStoreLo != 0 && va >= kTrapStoreLo && va < kTrapStoreHi) {
             auto* self = static_cast<Impl*>(user);
             std::string trail;
@@ -1680,6 +1720,7 @@ struct ArmRecomp::Impl {
     Loader::AppLoader::Modules modules{};
     bool modules_read{false};
     bool rela_applied{false};
+    bool explicitly_prepared{false};
     static constexpr size_t kTrail = 32;
     u64 trail[kTrail]{};
     size_t trail_pos{0};
@@ -1715,6 +1756,9 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
 }
 
 ArmRecomp::~ArmRecomp() {
+    if (impl->core_index < g_current_pcs.size()) {
+        g_current_pcs[impl->core_index].store(0, std::memory_order_relaxed);
+    }
     // Report on the *first* instance torn down, not the last. Waiting for the
     // last one means the report is lost whenever anything still holds a
     // reference at shutdown - which happens, and silently costs the whole run's
@@ -1723,6 +1767,35 @@ ArmRecomp::~ArmRecomp() {
     g_live_instances.fetch_sub(1, std::memory_order_acq_rel);
     static std::once_flag reported;
     std::call_once(reported, [] { ReportRecompCoverage(); });
+}
+
+bool PrepareRecompProcess(Kernel::KProcess& process, const RecompModules& modules) {
+    const auto prepare = g_recomp_prepare.load(std::memory_order_acquire);
+    if (!prepare) return true;
+    // KProcess::InitializeInterfaces chooses ArmRecomp for every application
+    // core while this lookup is installed. RTTI is disabled in core builds.
+    if (!GetRecompLookup() || !process.IsApplication() || !process.Is64Bit() ||
+        modules.empty() || modules.begin()->second != "rtld" ||
+        modules.begin()->first != GetInteger(process.GetEntryPoint())) {
+        LOG_ERROR(Core_ARM, "Static preparation requires an AArch64 rtld entry point");
+        return false;
+    }
+    for (size_t i = 0; i < Hardware::NUM_CPU_CORES; ++i) {
+        const auto* cpu = static_cast<ArmRecomp*>(process.GetArmInterface(i));
+        if (!cpu || cpu->impl->explicitly_prepared) return false;
+    }
+    if (!prepare(modules)) return false;
+    for (size_t i = 0; i < Hardware::NUM_CPU_CORES; ++i) {
+        auto& state = *static_cast<ArmRecomp*>(process.GetArmInterface(i))->impl;
+        state.modules = modules;
+        state.modules_read = true;
+        // Run real rtld relocation. The desktop host pre-relocator substitutes
+        // unresolved imports and must never modify this strict session's memory.
+        state.rela_applied = true;
+        state.explicitly_prepared = true;
+    }
+    g_counters.RecordModules(modules);
+    return true;
 }
 
 bool ArmRecomp::EnterFallback() {
@@ -1814,9 +1887,9 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     // Logged once so it is obvious from a log whether the backend was ever
     // entered at all. A run with no errors is otherwise indistinguishable from
     // a run where the guest thread was never scheduled onto it.
-    static bool announced = false;
-    if (!announced) {
-        announced = true;
+    static std::atomic_bool announced{false};
+    bool first_run = !announced.exchange(true, std::memory_order_relaxed);
+    if (first_run) {
         LOG_INFO(Core_ARM, "ArmRecomp::RunThread entered, pc={:#x}", impl->ctx.pc);
     }
     // Kept so the coverage report can name what every guest thread is doing at
@@ -1833,8 +1906,23 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     }
 
     impl->RefreshPageTable();
+    if (first_run) {
+        LOG_INFO(Core_ARM, "ArmRecomp page table ready: entries={} stride={} page_bits={} max={:#x}",
+                 impl->bridge.page_entries != nullptr, impl->bridge.page_entry_stride,
+                 impl->bridge.page_bits, impl->bridge.address_space_max);
+    }
 
-    if (!impl->rela_applied) {
+    // Registering every loaded image's base with the host dispatcher is a
+    // side effect of this call, not something its return value is used for
+    // here - the dispatcher needs it done once before the first lookup, or
+    // every image's base stays 0 and every lookup misses.
+    if (HasRecompPrepareCallback() && !impl->explicitly_prepared) {
+        LOG_ERROR(Core_ARM, "Refusing unprepared static guest execution");
+        return HaltReason::BreakLoop;
+    }
+    // Keep the legacy desktop path isolated. Explicit sessions never enter
+    // this process-global lazy protocol or its heuristic relocation path.
+    if (!impl->explicitly_prepared && !impl->rela_applied) {
         // Every CPU Impl needs its own complete module map and relocation pass.
         // Collapsing this to once per KProcess left later Impls incompletely
         // initialized and changed MK8's execution despite zero lookup misses.
@@ -1882,6 +1970,9 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     impl->ctx.halted = 0;
 
     while (!impl->ctx.halted) {
+        if (impl->core_index < g_current_pcs.size()) {
+            g_current_pcs[impl->core_index].store(impl->ctx.pc, std::memory_order_relaxed);
+        }
         if (impl->interrupted.load(std::memory_order_relaxed)) {
             return HaltReason::BreakLoop;
         }
@@ -1929,7 +2020,17 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             continue;
         }
 
+        static std::atomic<u64> early_dispatches{0};
+        const u64 early_dispatch = early_dispatches.fetch_add(1, std::memory_order_relaxed);
+        if (early_dispatch < 64) {
+            LOG_INFO(Core_ARM, "Early static dispatch #{}: pc={:#x}", early_dispatch,
+                     impl->ctx.pc);
+        }
         RecompBlockFn block = impl->lookup(impl->ctx.pc);
+        if (first_run) {
+            LOG_INFO(Core_ARM, "First static lookup: pc={:#x}, covered={}", impl->ctx.pc,
+                     block != nullptr);
+        }
         // Test hook: forces every lookup past the Nth to miss, so the JIT
         // fallback below can be exercised on a title that would otherwise never
         // hit a gap. Unset in normal runs.
@@ -2214,7 +2315,19 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // report chains rather than blocks.
         const int chain_budget = RecompChainBudget();
         impl->ctx.chain_budget = chain_budget;
+        if (first_run) {
+            LOG_INFO(Core_ARM, "Calling first signed static block at pc={:#x}", impl->ctx.pc);
+        }
         block(&impl->ctx);
+        if (early_dispatch < 64) {
+            LOG_INFO(Core_ARM, "Early static return #{}: pc={:#x}, svc={}, halted={}",
+                     early_dispatch, impl->ctx.pc, impl->ctx.pending_svc, impl->ctx.halted);
+        }
+        if (first_run) {
+            LOG_INFO(Core_ARM, "First signed static block returned: pc={:#x}, svc={}, halted={}",
+                     impl->ctx.pc, impl->ctx.pending_svc, impl->ctx.halted);
+            first_run = false;
+        }
         {
             const int spent = chain_budget - impl->ctx.chain_budget;
             u64 after = seen;

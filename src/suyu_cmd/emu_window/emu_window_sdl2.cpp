@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <SDL3/SDL.h>
 // SDL3 removed these constants; define compat shims
 static constexpr Uint8 SDL_PRESSED = 1;
@@ -15,6 +16,7 @@ static constexpr Uint8 SDL_RELEASED = 0;
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/drivers/mouse.h"
+#include "input_common/drivers/tas_input.h"
 #include "input_common/drivers/touch_screen.h"
 #include "input_common/main.h"
 #include "common/param_package.h"
@@ -575,6 +577,49 @@ bool EmuWindow_SDL2::IsOpen() const {
     return is_open;
 }
 
+void EmuWindow_SDL2::EnableTasPlayback() {
+    tas_playback = true;
+}
+
+void EmuWindow_SDL2::OnFrameDisplayed() {
+    if (!tas_playback) {
+        return;
+    }
+    // Called on the render thread once per presented frame. The TAS driver
+    // consumes exactly one command per call, which is what keeps a recorded
+    // script deterministic against the frames the guest actually renders.
+    auto* const tas = input_subsystem->GetTas();
+    tas->UpdateThread();
+
+    const auto [state, progress, lengths] = tas->GetStatus();
+    if (!tas_started) {
+        // Start on the first displayed frame rather than at load: before the
+        // guest presents anything there is no frame for command zero to land
+        // on. Reset reloads the script so playback always begins at the top.
+        tas->Reset();
+        tas->StartStop();
+        tas_started = true;
+        LOG_INFO(Frontend, "TAS playback started, {} frames queued", lengths[0]);
+        return;
+    }
+    if (state != InputCommon::TasInput::TasState::Stopped) {
+        tas_progress = progress;
+        return;
+    }
+    // Playback ran off the end of the script and tas_loop is off. Quitting here
+    // is what makes --tas usable unattended; without it the replay finishes and
+    // the process sits idle until something kills it.
+    LOG_INFO(Frontend, "TAS playback finished, {} of {} frames, exiting", tas_progress,
+             lengths[0]);
+    tas_playback = false;
+    // WaitEvent is blocked in SDL_WaitEvent on the main thread. SDL_PushEvent is
+    // thread safe, and the main thread turns SDL_EVENT_QUIT into is_open = false,
+    // so the shutdown stays on the thread that owns the window.
+    SDL_Event quit_event{};
+    quit_event.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&quit_event);
+}
+
 bool EmuWindow_SDL2::IsShown() const {
     return is_shown;
 }
@@ -717,7 +762,16 @@ void EmuWindow_SDL2::WaitEvent() {
     }
 
     const u64 current_time = SDL_GetTicks();
-    if (current_time > last_time + 2000) {
+    // GetAndResetPerfStats clears the counters as it reads them, so only one
+    // caller in the process can have them. While the benchmark sampler is
+    // running it is that caller, and this refresh stands down rather than
+    // taking half the frames away from it and making both readings wrong.
+    // Nothing is lost by standing down: this runs from the SDL event
+    // handler, so during a headless replay - no input, nobody touching the
+    // window - it fires a couple of times in a whole run anyway.
+    static const bool perf_sampling_owns_stats =
+        std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
+    if (current_time > last_time + 2000 && !perf_sampling_owns_stats) {
         const auto results = system.GetAndResetPerfStats();
         std::string game_name;
         [[maybe_unused]] auto _ = system.GetGameName(game_name);
