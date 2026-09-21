@@ -67,8 +67,8 @@ Linux needs five things Windows does not, all handled by
 [`scripts/build-suyu.sh`][bld] in the consuming project:
 
 - CMake 3.31 (`CMakeModules/CPMUtil.cmake` requires it; Ubuntu 24.04 ships 3.28)
-- `-Dfmt_FORCE_BUNDLED=ON` — the system fmt 9 has no `format_string::get()`, and
-  suyu only forces the bundled one inside a branch that does not apply here
+- fmt 10 or newer — distro fmt 9 lacks `format_string::get()`; older copies
+  now select the pinned bundled release automatically
 - Qt6 Charts, which Ubuntu packages separately
 - system Boost
 - skipping the `externals/ownfoil` submodule, whose own nested submodule no
@@ -245,10 +245,10 @@ cmake -B build -GNinja \
 cmake --build build --target suyu suyu-cmd
 ```
 
-`-Dfmt_FORCE_BUNDLED=ON` is not optional on a distribution shipping fmt 9:
-`logging.h` calls `format_string::get()`, which only exists from fmt 10, and
-suyu forces the bundled copy only inside a branch that does not apply to an
-ordinary Linux build. Without it the build dies several hundred files in.
+The package metadata requires fmt 10 or newer because `logging.h` uses
+`format_string::get()`. A distribution shipping fmt 9 selects the pinned
+bundled release automatically. The explicit flag above also works and keeps
+the dependency choice fixed.
 
 Binaries land in `build/bin`.
 

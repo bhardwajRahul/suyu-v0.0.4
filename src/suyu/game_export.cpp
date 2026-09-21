@@ -1627,8 +1627,10 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     // per-block dumps.
     const bool dump_debug_artifacts = !qEnvironmentVariableIsEmpty("SUYU_AOT_DUMP_BLOCKS");
 
-    suyu::recomp::g_translate_all =
-        !qEnvironmentVariableIsEmpty("SUYU_AOT_TRANSLATE_ALL");
+    const bool translate_all = suyu::recomp::TranslateAllForExport(
+        backend == RecompileBackend::SuyuStatic,
+        !qEnvironmentVariableIsEmpty("SUYU_AOT_TRANSLATE_ALL"));
+    suyu::recomp::g_translate_all = translate_all;
     const QString debug_root = cache_dir + QDir::separator() + QStringLiteral("debug");
     const QString blockmap_dir = debug_root + QDir::separator() + QStringLiteral("blockmaps");
     const QString code_dir = debug_root + QDir::separator() + QStringLiteral("code");
@@ -1665,7 +1667,16 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !WantsCompiledOutput() ||
                 QFile::exists(cache_dir + QDir::separator() + QStringLiteral("launcher") +
                               QDir::separator() + QStringLiteral("static_launcher.exe"));
-            if (same_scan && same_backend && has_recompiled_project && has_required_launcher) {
+            const bool same_image_abi = contents.contains(
+                QStringLiteral("\"image_abi\": 5,"));
+            const bool same_correctness_revision = contents.contains(
+                QStringLiteral("\"correctness_revision\": \"20260920-fixedpoint-v1\","));
+            const bool same_translate_all = contents.contains(
+                QStringLiteral("\"translate_all\": ") +
+                (translate_all ? QStringLiteral("true,") : QStringLiteral("false,")));
+            if (same_scan && same_backend && same_image_abi && same_correctness_revision &&
+                same_translate_all &&
+                has_recompiled_project && has_required_launcher) {
                 LOG_INFO(Frontend, "Reusing completed AOT cache at {}", cache_dir.toStdString());
                 return cache_dir;
             }
@@ -2050,6 +2061,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                      "    SuyuRecompBlockFn run_slice;\n"
                      "    unsigned (*image_abi)(void);\n"
                      "} SuyuRecompStaticModule;\n\n"
+                     "const SuyuRecompStaticModule* suyu_recomp_static_modules_v4(unsigned* count);\n"
+                     "int suyu_recomp_static_guard_v2(unsigned version);\n\n"
                      "static const SuyuRecompStaticModule s_modules[] = {\n";
                 for (const auto& m : ordered) {
                     o << "    { \"" << m << "\", recomp_image_lookup_" << m
@@ -2456,6 +2469,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         QTextStream out(&manifest);
         out << "{\n";
         out << "  \"version\": 2,\n";
+        out << "  \"image_abi\": 5,\n";
+        out << "  \"correctness_revision\": \"20260920-fixedpoint-v1\",\n";
+        out << "  \"translate_all\": " << (translate_all ? "true" : "false") << ",\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
         out << "  \"effective_backend\": \"" << effective_backend_name << "\",\n";
         out << "  \"full_scan\": " << (full_scan ? "true" : "false") << ",\n";
@@ -3174,8 +3190,8 @@ void GameExportDialog::OnExport() {
     // Windows refuses paths past 260 characters unless long paths are enabled,
     // and the build scripts this export writes nest deeper than anything else
     // in the package:
-    //   <out>\<game> - Hybrid AOT + JIT\aot_cache\exefs\main\build\CMakeFiles\
-    //   CMakeScratch\TryCompile-xxxxxx\cmTC_xxxxx.dir\Debug\cmTC_xxxxx.tlog\
+    //   <out>\<game> - Hybrid AOT + JIT\aot_cache\exefs\main\build\CMakeFiles\<target>
+    //   CMakeScratch\TryCompile-xxxxxx\cmTC_xxxxx.dir\Debug\cmTC_xxxxx.tlog\<file>
     //   link-cvtres.write.1.tlog
     // which lands roughly 190 characters below the output directory. Over the
     // limit, MSBuild fails with "FTK1011: could not create the new file

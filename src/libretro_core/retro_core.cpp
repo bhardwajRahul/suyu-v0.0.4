@@ -193,7 +193,10 @@ RETRO_API void retro_init() {
                 continue;
             }
             LOG_INFO(Frontend, "libretro: found {} key directory at {}", emu, src_dir.string());
-            Common::FS::CreateDir(keys_dir);
+            if (!Common::FS::CreateDir(keys_dir)) {
+                LOG_WARNING(Frontend, "libretro: could not prepare local key directory");
+                continue;
+            }
             for (const auto& name : {"prod.keys", "title.keys", "console.keys"}) {
                 const auto src = src_dir / name;
                 const auto dst = keys_dir / name;
@@ -218,15 +221,18 @@ RETRO_API void retro_init() {
             const auto dst_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
             LOG_INFO(Frontend, "libretro: checking for keys in: {}", src_dir.string());
             if (std::filesystem::exists(src_dir)) {
-                Common::FS::CreateDir(dst_dir);
-                for (const auto& name : {"prod.keys", "title.keys", "console.keys"}) {
-                    auto src = src_dir / name;
-                    auto dst = dst_dir / name;
-                    if (std::filesystem::exists(src) && !std::filesystem::exists(dst)) {
-                        std::error_code ec;
-                        std::filesystem::copy_file(src, dst, ec);
-                        if (!ec) {
-                            LOG_INFO(Frontend, "libretro: copied {} from RetroArch system dir", name);
+                if (!Common::FS::CreateDir(dst_dir)) {
+                    LOG_WARNING(Frontend, "libretro: could not prepare local key directory");
+                } else {
+                    for (const auto& name : {"prod.keys", "title.keys", "console.keys"}) {
+                        auto src = src_dir / name;
+                        auto dst = dst_dir / name;
+                        if (std::filesystem::exists(src) && !std::filesystem::exists(dst)) {
+                            std::error_code ec;
+                            std::filesystem::copy_file(src, dst, ec);
+                            if (!ec) {
+                                LOG_INFO(Frontend, "libretro: copied {} from RetroArch system dir", name);
+                            }
                         }
                     }
                 }

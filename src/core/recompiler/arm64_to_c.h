@@ -302,6 +302,11 @@ inline std::string ChainTo(u64 t);
 // instruction, so the forms that lose to the JIT are turned on here.
 inline bool g_translate_all = false;
 
+// Strict static exports have no fallback to carry deliberately gated forms.
+inline bool TranslateAllForExport(bool strict_static, bool explicitly_requested) {
+    return strict_static || explicitly_requested;
+}
+
 inline const std::unordered_set<u64>* g_chain_blocks = nullptr;
 inline const char* g_chain_mod = nullptr;
 
@@ -430,52 +435,11 @@ inline std::string Xsp(u32 r) {
 // Emit one baseline S/D addition/subtraction from raw uint64_t _a/_b to _v.
 // Three guard bits plus sticky alignment preserve exact rounding, including
 // cancellation. No host FP arithmetic or host FP state is involved.
-/// Emit a native host-FP fast path in front of a soft-float value body.
-///
-/// The guest is AArch64 and, on iOS, so is the host. With FPCR in its default
-/// configuration the host FPU is bit-identical to the guest for these
-/// operations: same IEEE-754 rounding, same signed zeros, and - because both
-/// are ARM - the same NaN propagation order. The soft-float body spends
-/// hundreds of integer operations per lane on work one FMLA does natively,
-/// which the device profile showed to be the single largest cost in the frame.
-///
-/// The fast path is refused whenever the guest has selected a non-default
-/// rounding mode, flush-to-zero, default-NaN, alternative half precision, or
-/// enabled any exception trap - every FPCR bit that would make the host
-/// disagree. In those cases the soft-float body runs exactly as before.
-///
-/// It is restricted to AArch64 hosts on purpose. On x86-64 the NaN chosen by a
-/// multiply-add differs from ARM's order, so a native path there would change
-/// results relative to the desktop reference export. Keeping it ARM-only means
-/// the exported module stays bit-identical on the machine it was verified on.
-///
-/// Known limitation: FPSR exception flags are not raised on this path. They are
-/// sticky status bits, so a guest that reads FPSR after arithmetic that only
-/// took the fast path sees them clear. Define RECOMP_NO_NATIVE_FP to compile
-/// the generated module with the soft-float path only, which restores flag
-/// behaviour exactly.
-///
-/// `op` is one of "add", "sub", "div" or "fma"; "fma" reads the addend from _z.
-inline std::string EmitFPNativeValue(bool dbl, const char* op) {
-    const std::string ft = dbl ? "double" : "float";
-    const std::string it = dbl ? "uint64_t" : "uint32_t";
-    const std::string fma = dbl ? "__builtin_fma" : "__builtin_fmaf";
-    const std::string sz = dbl ? "8" : "4";
-    std::string expr;
-    if (!std::strcmp(op, "add")) expr = "_na+_nb";
-    else if (!std::strcmp(op, "sub")) expr = "_na-_nb";
-    else if (!std::strcmp(op, "div")) expr = "_na/_nb";
-    else expr = fma + "(_na,_nb,_nz)";
-    std::string s =
-        "\n#if defined(__aarch64__) && !defined(RECOMP_NO_NATIVE_FP)\n"
-        "if(!(c->fpcr&0x07C8FF07ULL)){" + ft + " _na,_nb,_nr;" + it + " _nt;"
-        "_nt=(" + it + ")_a;memcpy(&_na,&_nt," + sz + ");"
-        "_nt=(" + it + ")_b;memcpy(&_nb,&_nt," + sz + ");";
-    if (!std::strcmp(op, "fma"))
-        s += ft + " _nz;_nt=(" + it + ")_z;memcpy(&_nz,&_nt," + sz + ");";
-    s += "_nr=" + expr + ";memcpy(&_nt,&_nr," + sz + ");_v=(uint64_t)_nt;} else\n"
-         "#endif\n";
-    return s;
+// Use the integer value emitter on every host. The former native shortcut
+// did not publish guest FPSR flags and depended on the ambient host FPCR.
+// Reintroduce it only with value/status differential tests on AArch64.
+inline std::string EmitFPNativeValue(bool /*dbl*/, const char* /*op*/) {
+    return {};
 }
 
 inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
@@ -2851,75 +2815,40 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         return true;
     }
 
-    // FP <-> fixed-point conversions: the same shape as the integer forms
-    // below but with bit 21 clear and a scale field. fbits is 64 - scale, and
-    // the value is shifted by 2^fbits around the conversion. ldexp does that
-    // exactly; multiplying by a built-up power of two does not.
-    // Off deliberately, and measured: enabling this costs 25.0s against 20.7s on
-    // the reference replay. Translating one instruction pulls its whole block out
-    // of the JIT and into generated C, and these sit in float-heavy blocks the JIT
-    // compiles well - a NaN test, two bound compares and a cast cannot beat the
-    // single native instruction it replaces. Coverage only pays when the emitted C
-    // is faster than the JIT for that block. Re-measure before flipping this.
-    const bool kTranslateFixedPointConversions = g_translate_all;
-    if (kTranslateFixedPointConversions &&
-        (i & 0x5F200000) == 0x1E000000 && ((i >> 21) & 1) == 0) {
+    // Scalar FP <-> fixed-point conversions (S/D, W/X). A strict-static
+    // export cannot leave these to a JIT. Do not gate architectural coverage
+    // on the former hybrid replay-performance switch.
+    // Use integer significands, not host FP scaling/casts: preserve guest FZ,
+    // rounding and cumulative status without intermediate overflow/rounding.
+    if ((i & 0x7F200000U) == 0x1E000000U) {
         const u32 sf = i >> 31, ftype = (i >> 22) & 3;
         const u32 rmode = (i >> 19) & 3, opcode = (i >> 16) & 7;
         const u32 fbits = 64 - ((i >> 10) & 0x3F);
-        // fbits is fixed at translation time, so the scale is a literal rather
-        // than a call into libm. 2^n is exact in binary floating point for every
-        // n this encoding can name, so "%.1f" round-trips it without loss.
-        char scale_lit[64];
-        snprintf(scale_lit, sizeof scale_lit, "%.1f", std::pow(2.0, (double)fbits));
         const u32 rn = (i >> 5) & 31, rd = i & 31;
-        // A 32-bit destination only encodes scales that leave fbits in 1..32.
-        const bool shaped = (ftype == 0 || ftype == 1) && fbits >= 1 && (sf || fbits <= 32);
-        if (shaped) {
-            const bool dbl = (ftype == 1);
-            const char* ct = dbl ? "double" : "float";
-            const int fsz = dbl ? 8 : 4;
-                if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
-                const bool is_signed = (opcode == 0);
-                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
-                                    : (is_signed ? "int32_t" : "uint32_t");
-                const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
-                                          : (is_signed ? "-2147483648.0" : "0.0");
-                const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
-                                                       : "18446744073709551615.0")
-                                          : (is_signed ? "2147483647.0" : "4294967295.0");
-                const char* sat_lo = sf ? (is_signed ? "0x8000000000000000ULL" : "0ULL")
-                                        : (is_signed ? "0xFFFFFFFF80000000ULL" : "0ULL");
-                const char* sat_hi = sf ? (is_signed ? "0x7FFFFFFFFFFFFFFFULL"
-                                                     : "0xFFFFFFFFFFFFFFFFULL")
-                                        : (is_signed ? "0x7FFFFFFFULL" : "0xFFFFFFFFULL");
-                std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
-                                std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
-                s += std::string("_a = _a * (") + ct + ")" + scale_lit + "; ";
-                s += "uint64_t _r; if (_a != _a) _r = 0ULL; ";
-                s += std::string("else if (!(_a > (") + ct + ")" + lo_bound + ")) _r = " + sat_lo + "; ";
-                s += std::string("else if (!(_a < (") + ct + ")" + hi_bound + ")) _r = " + sat_hi + "; ";
-                s += "else _r = (uint64_t)(" + std::string(it) + ")_a; ";
-                if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
-                s += "c->x[" + std::to_string(rd) + "] = _r; }";
-                put(s);
-                return true;
-            }
-            if (rmode == 0 && (opcode == 2 || opcode == 3)) {
-                const std::string src = sf ? (opcode == 2 ? "(int64_t)" + Xz(rn)
-                                                          : "(uint64_t)" + Xz(rn))
-                                           : (opcode == 2 ? "(int32_t)" + Xz(rn)
-                                                          : "(uint32_t)" + Xz(rn));
-                std::string s = "{ double _t = (double)(" + src + "); ";
-                s += std::string(ct) + " _r = (" + ct + ")(_t / " + scale_lit + "); ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," +
-                     std::to_string(fsz) + "); }";
-                put(s);
-                return true;
-            }
+        const bool shaped = (ftype == 0 || ftype == 1) && (sf || fbits <= 32);
+        const bool to_fixed = rmode == 3 && (opcode == 0 || opcode == 1);
+        const bool to_float = rmode == 0 && (opcode == 2 || opcode == 3);
+        if (!shaped || (!to_fixed && !to_float)) {
+            put_unhandled();
+            return true;
         }
+        const std::string fw = ftype == 1 ? "64" : "32";
+        const std::string iw = sf ? "64" : "32";
+        const std::string is_signed = (opcode & 1) ? "0" : "1";
+        const std::string args = "," + fw + "," + iw + "," + std::to_string(fbits) +
+                                 "," + is_signed + ",c->fpcr,&c->fpsr)";
+        if (to_fixed) {
+            const std::string call = "recomp_fp_to_fixed(c->vreg[" +
+                                     std::to_string(rn) + "][0]" + args;
+            // Rd=31 is WZR/XZR, NOT SP. Conversion exceptions still happen.
+            put(rd == 31 ? "(void)" + call + ";"
+                         : "c->x[" + std::to_string(rd) + "]=" + call + ";");
+        } else {
+            put("{ uint64_t _r=recomp_fixed_to_fp(" + Xz(rn) + args +
+                "; c->vreg[" + std::to_string(rd) + "][0]=_r; c->vreg[" +
+                std::to_string(rd) + "][1]=0; }");
+        }
+        return true;
     }
 
     // FP <-> integer conversions and FMOV between register files. These share
@@ -5258,28 +5187,12 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         for (u32 k = 0; k < b.count; ++k) {
             char word[32]; snprintf(word, sizeof word, "0x%08xU,", p[first + k]); rcu += word;
         }
-        // Verify on the first entry, and after that only when the host says
-        // guest code may have changed. Checking the bytes on every entry made
-        // the guard the largest single cost in the frame: it ran before any
-        // guest work, and cost either a callback per instruction or a memcmp of
-        // the whole block. Comparing one counter replaces both.
-        //
-        // This keeps the guarantee the guard actually claims - synchronized
-        // instruction fetch - because on AArch64 the guest cannot synchronize
-        // new code without IC IVAU, and the host bumps the generation there, on
-        // any cache-range invalidation, on a full icache flush, and on every
-        // page-table refresh. What it does not do, and never did, is catch
-        // another thread rewriting a block while that block executes.
-        rcu += "};\n"
-               "    static uint64_t _guard_seen=0;\n"
-               "    { /* +1 so a fresh block never matches generation zero. */\n"
-               "      const uint64_t _gen=(c->host_mem&&c->host_mem->guard_generation)\n"
-               "          ? *c->host_mem->guard_generation+1 : 1;\n"
-               "      if(_guard_seen!=_gen){\n"
-               "        recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
-               "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n"
-               "        _guard_seen=_gen;\n"
-               "      } }\n";
+        // Verify each entry, including side entries and direct chains. Do not
+        // cache this in a function-static variable: multiple guest cores can
+        // enter the same generated block. Per-entry verification also handles
+        // process reuse and remapped addresses without an unsafe shared epoch.
+        rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
+               "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
         // Lookup indexes every emitted instruction, not only block starts. An
         // indirect transfer can therefore enter the middle of this function.
         // Direct chains publish their exact target PC before calling, so any
@@ -5769,8 +5682,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "#endif\n\n"
           "/* Version of the generated-image contract used by automatic bundle\n"
           "   selection. ABI 4 adds bounded, nonrecursive module-local slices to\n"
-          "   guarded instruction side entries. */\n"
-          "RECOMP_API unsigned recomp_image_abi(void){ return 4; }\n"
+          "   guarded instruction side entries. ABI 5 restores per-entry checks\n"
+          "   and exact guest floating-point status. */\n"
+          "RECOMP_API unsigned recomp_image_abi(void){ return RECOMP_IMAGE_ABI; }\n"
           "RECOMP_API unsigned recomp_image_guard_v2(unsigned host_version){\n"
           "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n"
           "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
@@ -6007,6 +5921,114 @@ RECOMP_INLINE unsigned recomp_fp_sticky(const uint64_t* p, unsigned count, int c
 )FS";
 }
 
+// Scalar fixed-point helpers, returned as C for the generated runtime.
+// This implements the S/D, W/X non-trapping FPCR/FPSR contract used by the
+// existing runtime; FP16 and alternative-FP extensions are not added here.
+inline const char* FPFixedHelpers() {
+    return R"FX(
+/* Convert a binary32/64 significand directly to signed/unsigned fixed-point.
+   Round toward zero first, then saturate. IOC takes precedence over IXC. */
+static RECOMP_INLINE uint64_t recomp_fp_to_fixed(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned fbits, unsigned is_signed,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const uint64_t exponent_mask = fp_bits == 64 ? 2047u : 255u;
+    const unsigned negative = (unsigned)((bits >> (fp_bits - 1)) & 1);
+    const unsigned exponent = (unsigned)((bits >> fraction_bits) & exponent_mask);
+    uint64_t mantissa = bits & fraction_mask;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t sign_bit = UINT64_C(1) << (int_bits - 1);
+    const uint64_t limit = is_signed ? sign_bit - (negative ? 0u : 1u) : integer_mask;
+    const uint64_t saturated = negative ? (is_signed ? sign_bit : 0) : limit;
+    uint64_t magnitude = 0;
+    unsigned inexact = 0, invalid = 0;
+    int shift;
+    if (exponent == exponent_mask) {
+        *fpsr |= UINT64_C(1); /* NaNs and infinities: invalid operation. */
+        return mantissa ? 0 : saturated;
+    }
+    if (exponent == 0) {
+        if (!mantissa) return 0; /* Both signed zeros. */
+        if (fpcr & (UINT64_C(1) << 24)) {
+            *fpsr |= UINT64_C(128); /* FZ: input-denormal, not inexact. */
+            return 0;
+        }
+    } else {
+        mantissa |= UINT64_C(1) << fraction_bits;
+    }
+    shift = (int)(exponent ? exponent : 1u) - (int)bias -
+            (int)fraction_bits + (int)fbits;
+    if (shift >= 0) {
+        if (shift >= 64 || mantissa > (limit >> (unsigned)shift)) invalid = 1;
+        else magnitude = mantissa << (unsigned)shift;
+    } else {
+        const unsigned discarded = (unsigned)(-shift);
+        if (discarded >= 64) {
+            inexact = mantissa != 0;
+        } else {
+            magnitude = mantissa >> discarded;
+            inexact = (mantissa & ((UINT64_C(1) << discarded) - 1)) != 0;
+        }
+        if (magnitude > limit) invalid = 1;
+    }
+    if (negative && !is_signed && magnitude != 0) invalid = 1;
+    if (invalid) {
+        *fpsr |= UINT64_C(1);
+        return saturated;
+    }
+    if (inexact) *fpsr |= UINT64_C(16);
+    return (negative ? UINT64_C(0) - magnitude : magnitude) & integer_mask;
+}
+
+/* Convert the integer magnitude once, using the guest FPCR rounding mode.
+   All legal S/D fixed-point inputs produce zero or a finite normal result:
+   exponent range is at least -64 and at most 63. No host FP cast is used. */
+static RECOMP_INLINE uint64_t recomp_fixed_to_fp(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned fbits, unsigned is_signed,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const unsigned negative = is_signed && ((bits >> (int_bits - 1)) & 1);
+    uint64_t magnitude, mantissa;
+    unsigned top;
+    int exponent;
+    bits &= integer_mask;
+    magnitude = negative ? (UINT64_C(0) - bits) & integer_mask : bits;
+    if (!magnitude) return 0;
+    top = recomp_bit_index64(magnitude);
+    exponent = (int)top - (int)fbits;
+    if (top <= fraction_bits) {
+        mantissa = magnitude << (fraction_bits - top);
+    } else {
+        const unsigned discarded = top - fraction_bits; /* 1..40 for S/D. */
+        const uint64_t remainder = magnitude & ((UINT64_C(1) << discarded) - 1);
+        const uint64_t halfway = UINT64_C(1) << (discarded - 1);
+        const unsigned mode = (unsigned)((fpcr >> 22) & 3);
+        mantissa = magnitude >> discarded;
+        if (remainder) {
+            *fpsr |= UINT64_C(16);
+            if ((mode == 0 && (remainder > halfway ||
+                              (remainder == halfway && (mantissa & 1)))) ||
+                (mode == 1 && !negative) || (mode == 2 && negative)) {
+                ++mantissa;
+            }
+        }
+        if (mantissa >= (UINT64_C(1) << (fraction_bits + 1))) {
+            mantissa >>= 1;
+            ++exponent;
+        }
+    }
+    return ((uint64_t)negative << (fp_bits - 1)) |
+           ((uint64_t)(exponent + (int)bias) << fraction_bits) |
+           (mantissa & fraction_mask);
+}
+)FX";
+}
+
 inline const char* RuntimeH() {
     static const std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
@@ -6032,9 +6054,11 @@ inline const char* RuntimeH() {
 #else
 #define RECOMP_INLINE inline
 #endif
-)RT") + FPScanHelpers() + R"RT(
+)RT") + FPScanHelpers() + FPFixedHelpers() + R"RT(
 /* Supplied by the host when the recompiled image is driven by an emulator
    rather than run standalone. `size` is 1, 2, 4 or 8 bytes. */
+#define RECOMP_IMAGE_ABI 5
+
 typedef struct RecompHostMem {
     void* user;
     uint64_t (*load)(void* user, uint64_t va, uint32_t size);
@@ -6080,19 +6104,8 @@ typedef struct RecompHostMem {
     uint64_t page_bits;
     uint64_t pointer_mask;
     uint64_t address_space_max;
-    /* Generation counter for the code guard, owned by the host and shared by
-       every core. The host bumps it whenever guest code may have changed: an
-       IC IVAU, a cache-range invalidation from another engine, a full icache
-       flush, or a new page table. A block re-verifies its bytes only when this
-       has moved since that block last checked, instead of on every entry.
-
-       A pointer rather than a value because each core owns its own
-       RecompHostMem, and one core invalidating code has to be seen by blocks
-       running on all of them.
-
-       Null is allowed and means "no host generation", which makes every block
-       verify exactly once - the standalone runtime's situation, where nothing
-       can remap or rewrite guest code behind the generated image. */
+    /* Reserved layout slot. ABI 5 verifies code on every entry and
+       never dereferences this pointer. Hosts must set it to null. */
     const uint64_t* guard_generation;
 } RecompHostMem;
 
@@ -6391,6 +6404,7 @@ static void memstore(GuestContext* c, uint64_t a, uint32_t sz, uint64_t v){
 }
 
 static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va);
+static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t bytes);
 
 /* Every generated block checks its compilation input before any guest effect.
    Normal mapped code is compared directly through the host page table. The
@@ -6419,7 +6433,7 @@ void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint
     uint64_t page_size=UINT64_C(1)<<c->host_mem->page_bits;
     uint64_t bytes=(uint64_t)count*4;
     if(bytes<=page_size && (pc&(page_size-1))<=page_size-bytes){
-      const unsigned char* p=recomp_host_ptr(c,pc);
+      const unsigned char* p=recomp_host_ptr_n(c,pc,bytes);
       if(p && memcmp(p,expected,(size_t)bytes)==0)return;
     }
   }
@@ -6539,7 +6553,7 @@ uint64_t recomp_cntpct(GuestContext* c){
 static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
   const RecompHostMem* hm = c->host_mem;
   uintptr_t raw, p;
-  if(!hm || !hm->page_entries) return 0;
+  if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
   va &= 0xffffffffffffULL;                 /* AArch64 ignores the top 16 bits */
   if(va >= hm->address_space_max) return 0;
   raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
@@ -6558,17 +6572,19 @@ static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
    pattern that finds it. Hand the crossing case to the emulator, which splits
    it correctly.
 
-   An aligned access of a power-of-two size never crosses, because the page size
-   is a larger power of two, so the alignment test alone settles the common case
-   and the page arithmetic is only reached for genuinely unaligned accesses. */
+   Even aligned accesses must respect an address-space limit inside a page.
+   Subtraction-based checks avoid overflowing the end address. */
 static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t bytes){
   const RecompHostMem* hm = c->host_mem;
   uint64_t psz;
-  if((va & (bytes - 1)) != 0){
-    if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
-    psz = (uint64_t)1 << hm->page_bits;
-    if(((va & 0xffffffffffffULL) & (psz - 1)) + bytes > psz) return 0;
-  }
+  if(!hm || !hm->page_entries || hm->page_bits >= 64 || !bytes) return 0;
+  va &= 0xffffffffffffULL;
+  /* The fast-path limit can be below a page boundary (diagnostic slow paths).
+     Validate the entire span before reading any entry or backing bytes. */
+  if(va >= hm->address_space_max || bytes > hm->address_space_max - va ||
+     bytes > UINT64_C(0x1000000000000) - va) return 0;
+  psz = UINT64_C(1) << hm->page_bits;
+  if(bytes > psz - (va & (psz - 1))) return 0;
   return recomp_host_ptr(c, va);
 }
 
@@ -6598,9 +6614,12 @@ void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
    access is skipped. */
 static int recomp_pair_same_page(const RecompHostMem* hm, uint64_t a, uint64_t bytes){
   uint64_t psz;
-  if(!hm || !hm->page_entries) return 0;
-  psz = (uint64_t)1 << hm->page_bits;
-  return (a & (psz - 1)) + bytes <= psz;
+  if(!hm || !hm->page_entries || hm->page_bits >= 64 || !bytes) return 0;
+  a &= 0xffffffffffffULL;
+  if(a >= hm->address_space_max || bytes > hm->address_space_max - a ||
+     bytes > UINT64_C(0x1000000000000) - a) return 0;
+  psz = UINT64_C(1) << hm->page_bits;
+  return bytes <= psz - (a & (psz - 1));
 }
 void recomp_ldp64(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
   if(recomp_pair_same_page(c->host_mem,a,16)){

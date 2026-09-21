@@ -23,6 +23,8 @@ if (SUYU_CMD OR YUZU_CMD)
         emu_window/emu_window_sdl2_vk.cpp
         emu_window/emu_window_sdl2_vk.h
         precompiled_headers.h
+        native_status.cpp
+        native_status.h
         sdl_config.cpp
         sdl_config.h
         suyu.cpp
@@ -105,12 +107,18 @@ if (SUYU_CMD OR YUZU_CMD)
                 # binary that black-screens.
                 if (EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h")
                     file(READ "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h" _rt_h)
+                    if (NOT _rt_h MATCHES "#define RECOMP_IMAGE_ABI 5")
+                        message(FATAL_ERROR "Module '${_m}' predates correctness ABI 5; re-export ALL modules")
+                    endif()
                     if (NOT _rt_h MATCHES "tpidrro_el0")
                         message(FATAL_ERROR
                             "Recompiled module '${_m}' in ${SUYU_CMD_RECOMP_DIR} predates the "
                             "TPIDRRO_EL0/TPIDR_EL0 split and would mis-handle IPC. "
                             "Re-export the game to regenerate its AOT cache.")
                     endif()
+                endif()
+                if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h")
+                    message(FATAL_ERROR "Generated module '${_m}' has no runtime header")
                 endif()
                 add_subdirectory("${SUYU_CMD_RECOMP_DIR}/${_m}"
                                  "${CMAKE_CURRENT_BINARY_DIR}/recomp/${_m}")

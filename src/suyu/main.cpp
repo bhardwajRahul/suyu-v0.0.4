@@ -6920,7 +6920,7 @@ namespace {
     };
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
-constexpr unsigned CurrentRecompImageAbi = 4;
+constexpr unsigned CurrentRecompImageAbi = 5;
 
 // Off unless asked for: this sits on the dispatch path, which runs tens of
 // millions of times a second.
@@ -7249,8 +7249,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
         const unsigned abi = image_abi ? image_abi() : 0;
         auto* guard_v2 = reinterpret_cast<unsigned (*)(unsigned)>(
             lib->resolve("recomp_image_guard_v2"));
-        if (require_current_abi &&
-            (abi != CurrentRecompImageAbi || !guard_v2)) {
+        if (abi != CurrentRecompImageAbi || !guard_v2) {
             LOG_WARNING(Frontend,
                         "Refusing automatic AOT bundle {}: {} does not provide image ABI {}",
                         dir.toStdString(), lib->fileName().toStdString(), CurrentRecompImageAbi);

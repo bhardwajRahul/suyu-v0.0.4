@@ -257,8 +257,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 }
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    StallProbe::Accum probe{StallProbe::draw_ns};
-    StallProbe::draw_count.fetch_add(1, std::memory_order_relaxed);
+    StallProbe::Accum probe{StallProbe::draw_ns, &StallProbe::draw_count};
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};

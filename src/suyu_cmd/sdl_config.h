@@ -47,3 +47,6 @@ public:
     static const std::array<int, 2> default_stick_mod;
     static const std::array<int, 2> default_ringcon_analogs;
 };
+
+// Persist the native controls panel's current bindings in the active SDL profile.
+void SaveNativeControls();

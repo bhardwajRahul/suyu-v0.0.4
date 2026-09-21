@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and execute synthetic ABI4 tests; requires only Python, CMake, C/C++."""
+"""Compile and execute synthetic ABI5 tests; requires only Python, CMake, C/C++."""
 import argparse
 from pathlib import Path
 import subprocess
@@ -50,7 +50,7 @@ def main():
         for mode in ("mutated", "mutated-entry", "unmapped-zero"):
             call([runner, mode], expected=86, timeout=15)
         call([executable(root / "run", "smoke_static")], timeout=15)
-        print("All synthetic ABI4 smoke checks passed.")
+        print("All synthetic ABI5 smoke checks passed.")
 
 
 if __name__ == "__main__":

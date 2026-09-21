@@ -19,6 +19,7 @@
 #include "common/string_util.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_diagnostic_sampler.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_thread.h"
@@ -103,24 +104,9 @@ struct RecompHostMem {
     u64 page_bits;
     u64 pointer_mask;
     u64 address_space_max;
-    // Points at g_guard_generation. Generated blocks re-verify their bytes only
-    // when this moves, rather than on every entry. Shared by all cores, so it is
-    // a pointer: one core invalidating code has to be visible to blocks running
-    // on the others.
+    // Reserved for layout compatibility; ABI 5 never reads this slot.
     const u64* guard_generation;
 };
-
-// Bumped whenever guest code may have changed - IC IVAU, a cache-range
-// invalidation, a full icache flush, or a new page table. Generated code reads
-// it through the pointer above, so it must be a plain 64-bit object in memory.
-static std::atomic<u64> g_guard_generation{0};
-static_assert(std::atomic<u64>::is_always_lock_free);
-static_assert(sizeof(std::atomic<u64>) == sizeof(u64));
-
-/// Force every compiled block to re-verify its bytes before it next runs.
-static void BumpGuardGeneration() {
-    g_guard_generation.fetch_add(1, std::memory_order_release);
-}
 
 // This struct is duplicated by hand in the emitter (arm64_to_c.h, RuntimeH's
 // RecompHostMem) because the generated project is plain C and shares no headers
@@ -303,14 +289,6 @@ const std::string kTrackSlotPrefix = [] {
     const char* e = std::getenv("SUYU_RECOMP_TRACK_SLOT_PREFIX");
     return std::string{(e && *e) ? e : ""};
 }();
-struct TrackedSlot {
-    u64 got_va = 0;
-    u64 stub_va = 0;
-    std::string name;
-};
-std::mutex g_tracked_lock;
-std::vector<TrackedSlot> g_tracked_slots;
-
 // The original DT_RELASZ/DT_PLTRELSZ values, as (address, size) pairs, for the
 // restore-on-main policy. Process-global rather than per-Impl: every CPU Impl
 // runs its own relocation pass, but only the first one sees the real sizes -
@@ -431,7 +409,8 @@ struct RecompCounters {
 RecompCounters g_counters;
 std::array<std::atomic<u64>, 4> g_current_pcs{};
 std::atomic<int> g_live_instances{0};
-std::atomic<Kernel::KProcess*> g_report_process{nullptr};
+std::mutex g_snapshot_lock;
+std::map<std::pair<u64, std::size_t>, std::string> g_diagnostic_snapshots;
 
 /// The block tally is incremented once per executed block by every guest
 /// thread. As one shared atomic that is a contended cache line on the hottest
@@ -586,139 +565,13 @@ std::string FormatRecompCoverage() {
         }
         o += fmt::format("    {} distinct PCs\n", g_counters.miss_pc.size());
     }
-    if (auto* process = g_report_process.load(std::memory_order_relaxed)) {
-        const auto state_name = [](Kernel::ThreadState s) {
-            switch (s & Kernel::ThreadState::Mask) {
-            case Kernel::ThreadState::Initialized: return "Initialized";
-            case Kernel::ThreadState::Waiting: return "Waiting";
-            case Kernel::ThreadState::Runnable: return "Runnable";
-            case Kernel::ThreadState::Terminated: return "Terminated";
-            default: return "?";
-            }
-        };
-        const auto wait_name = [](Kernel::ThreadWaitReasonForDebugging r) {
-            switch (r) {
-            case Kernel::ThreadWaitReasonForDebugging::None: return "-";
-            case Kernel::ThreadWaitReasonForDebugging::Sleep: return "Sleep";
-            case Kernel::ThreadWaitReasonForDebugging::IPC: return "IPC";
-            case Kernel::ThreadWaitReasonForDebugging::Synchronization: return "Sync";
-            case Kernel::ThreadWaitReasonForDebugging::ConditionVar: return "CondVar";
-            case Kernel::ThreadWaitReasonForDebugging::Arbitration: return "Arbitration";
-            case Kernel::ThreadWaitReasonForDebugging::Suspended: return "Suspended";
-            default: return "?";
-            }
-        };
-        const auto resolve = [](u64 pc) -> std::string {
-            u64 best = 0;
-            const std::string* name = nullptr;
-            for (const auto& [base, module_name] : g_counters.modules) {
-                if (pc >= base && base >= best) {
-                    best = base;
-                    name = &module_name;
-                }
-            }
-            return name ? fmt::format("  {}+{:#x}", *name, pc - best) : std::string{};
-        };
-        std::string live;
-        for (auto& t : process->GetThreadList()) {
-            // For a thread parked in address arbitration or a condvar, the
-            // address it is keyed on and what that address holds right now is
-            // the whole diagnosis: a waiter still queued on a word that no
-            // longer says "locked" is a lost wakeup, not contention.
-            //
-            // Which field holds the live address depends on the wait:
-            //
-            //   svcArbitrateLock and svcWaitProcessWideKey set m_address_key,
-            //   reported by GetAddressKey(), along with m_address_key_value.
-            //
-            //   svcWaitForAddress sets only m_condvar_key, via
-            //   SetAddressArbiter, and touches neither of those.
-            //
-            // m_address_key is never cleared when a wait ends, so printing it
-            // for an address-arbiter waiter shows residue from some earlier
-            // mutex wait: an address that thread is not parked on and a value
-            // that means nothing. Earlier dumps did exactly that, so the
-            // addresses they reported for the Arbitration threads were not the
-            // addresses those threads were waiting on.
-            std::string key;
-            const auto reason = t.GetWaitReasonForDebugging();
-            const bool waiting =
-                (t.GetState() & Kernel::ThreadState::Mask) == Kernel::ThreadState::Waiting;
-            u64 keyed_on = 0;
-            if (waiting && reason == Kernel::ThreadWaitReasonForDebugging::Arbitration) {
-                keyed_on = t.GetAddressArbiterKey();
-                if (keyed_on != 0) {
-                    key = fmt::format("  arb_key={:#x} mem_now={:#010x}", keyed_on,
-                                      process->GetMemory().Read32(keyed_on));
-                }
-            } else if (waiting && reason == Kernel::ThreadWaitReasonForDebugging::ConditionVar) {
-                keyed_on = GetInteger(t.GetAddressKey());
-                if (keyed_on != 0) {
-                    key = fmt::format("  key={:#x} key_val={:#010x} mem_now={:#010x}", keyed_on,
-                                      t.GetAddressKeyValue(),
-                                      process->GetMemory().Read32(keyed_on));
-                }
-            }
-            // Every blocked thread sits in one of a handful of supervisor-call
-            // stubs, so the stub PC says only which call it is. The link
-            // register names the nn::os routine that made the call, which is
-            // the part that differs between threads.
-            live += fmt::format(
-                "    id={:<4} prio={:<3} {:<11} wait={:<11} pc={:#018x}{} lr={:#018x}{}{}\n",
-                t.GetId(), t.GetPriority(), state_name(t.GetState()), wait_name(reason),
-                t.GetContext().pc, resolve(t.GetContext().pc), t.GetContext().r[30],
-                resolve(t.GetContext().r[30]), key);
-            if (keyed_on != 0 && Kernel::LockTrace::Enabled()) {
-                live += fmt::format("      --- lock history for {:#x} ---\n", keyed_on);
-                live += Kernel::LockTrace::DumpForAddress(keyed_on);
-            }
-            // A thread that is Runnable at the stall is not deadlocked, it is
-            // spinning. The loop it is in tests fields of the object in its
-            // callee-saved base register, so the registers and the bytes they
-            // point at are what says which field never advances. x19-x23 cover
-            // the base pointers these loops actually use.
-            if (!waiting && (t.GetState() & Kernel::ThreadState::Mask) ==
-                                Kernel::ThreadState::Runnable) {
-                const auto& ctx = t.GetContext();
-                for (int r = 19; r <= 23; ++r) {
-                    const u64 base = ctx.r[r];
-                    live += fmt::format("      x{}={:#018x}", r, base);
-                    // Only chase a register the guest has actually mapped. A
-                    // range test is not enough: a plain integer can land inside
-                    // the address space and the read then reports itself as an
-                    // unmapped guest access, which is indistinguishable in the
-                    // log from a real one.
-                    if (process->GetMemory().IsValidVirtualAddress(base) &&
-                        process->GetMemory().IsValidVirtualAddress(base + 0x10c)) {
-                        live += "  [+0xd0..0x110]=";
-                        for (u64 off = 0xd0; off < 0x110; off += 4) {
-                            live += fmt::format("{:08x} ", process->GetMemory().Read32(base + off));
-                        }
-                    }
-                    live += "\n";
-                }
-            }
-        }
-        // The end-of-run report runs from ~ArmRecomp, by which point the
-        // process has already unlinked its threads and the live list is empty.
-        // The periodic writes during the run are the ones that see it, so the
-        // last non-empty rendering is kept and reported instead of nothing.
-        static std::mutex snapshot_lock;
-        static std::string snapshot;
-        static u64 snapshot_blocks = 0;
-        {
-            std::scoped_lock snapshot_guard{snapshot_lock};
-            if (!live.empty()) {
-                snapshot = live;
-                snapshot_blocks = TotalStaticBlocks();
-            }
-            if (!snapshot.empty()) {
-                o += fmt::format("  --- guest threads (as of {} blocks) ---\n", snapshot_blocks);
-                o += snapshot;
-                if (Kernel::LockTrace::Enabled()) {
-                    o += "  --- lock supervisor calls ---\n";
-                    o += Kernel::LockTrace::DumpSummary(80);
-                }
+    {
+        std::scoped_lock lock{g_snapshot_lock};
+        if (!g_diagnostic_snapshots.empty()) {
+            o += "  --- last execution-boundary samples (not a live thread enumeration) ---\n";
+            for (const auto& [key, snapshot] : g_diagnostic_snapshots) {
+                (void)key;
+                o += snapshot + "\n";
             }
         }
     }
@@ -738,258 +591,8 @@ void WriteRecompCoverageFile(const std::string& text) {
     }
 }
 
-// The stall reduces to one single-valued question: does anything ever write
-// the load-state byte the two runnable threads poll? No store-side hook can
-// answer it - emitted code stores through the inline page-table fast path, so
-// HostStore never sees the write. Reading the byte from a host thread can.
-//
-// The object address is picked by the guest allocator and differs per run, so
-// it is derived rather than configured: find a Runnable guest thread whose
-// link register is the polling call site (module offset given by the env var)
-// and take its x19. That is exactly how the address was identified by hand.
-//
-// What this can and cannot show: every transition it prints is real, and the
-// block count next to it says where in the run it happened. A value that never
-// moves is weaker evidence - a write reverted between two samples would be
-// missed - but at 20 kHz against a byte that is supposed to latch and stay,
-// that gap is small.
-// Poll the recorded unresolved slots and log, once a second, how many have
-// been written over by something other than us. Answers "did nn::ro ever bind
-// main's deferred imports" directly, which no counter can.
-void StartSlotWatcher() {
-    if (kTrackSlotPrefix.empty()) {
-        return;
-    }
-    static std::once_flag once;
-    std::call_once(once, [] {
-        std::thread([] {
-            size_t last_bound = SIZE_MAX;
-            for (;;) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                std::scoped_lock lk{g_tracked_lock};
-                if (g_tracked_slots.empty()) {
-                    continue;
-                }
-                auto* proc = g_report_process.load(std::memory_order_relaxed);
-                if (!proc) {
-                    continue;
-                }
-                auto& memory = proc->GetMemory();
-                size_t bound = 0;
-                std::string first_bound;
-                for (const auto& t : g_tracked_slots) {
-                    if (!memory.IsValidVirtualAddress(t.got_va)) {
-                        continue;
-                    }
-                    const u64 now = memory.Read64(t.got_va);
-                    if (now != t.stub_va) {
-                        ++bound;
-                        if (first_bound.empty()) {
-                            first_bound = fmt::format("{} -> {:#x}", t.name, now);
-                        }
-                    }
-                }
-                if (bound != last_bound) {
-                    last_bound = bound;
-                    LOG_INFO(Core_ARM,
-                             "recomp: tracked slots bound {}/{} at t={:.1f}s{}{}", bound,
-                             g_tracked_slots.size(),
-                             std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                           kRecompStart)
-                                 .count(),
-                             first_bound.empty() ? "" : " first=", first_bound);
-                }
-            }
-        }).detach();
-    });
-}
-
-void StartStateWatcher(Kernel::KProcess* process) {
-    const char* lr_env = std::getenv("SUYU_RECOMP_WATCH_LR_OFFSET");
-    if (!lr_env || !*lr_env) {
-        return;
-    }
-    const u64 lr_offset = std::strtoull(lr_env, nullptr, 0);
-    const char* addr_env = std::getenv("SUYU_RECOMP_WATCH_ADDR");
-    const u64 fixed_addr = (addr_env && *addr_env) ? std::strtoull(addr_env, nullptr, 0) : 0;
-    const char* path_env = std::getenv("SUYU_RECOMP_WATCH_PATH");
-    const std::string path =
-        (path_env && *path_env)
-            ? std::string{path_env}
-            : (Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_watch.txt").string();
-
-    std::thread([process, lr_offset, fixed_addr, path] {
-        std::ofstream out(path, std::ios::trunc);
-        const auto stamp = [] {
-            return std::chrono::duration<double>(std::chrono::steady_clock::now() - kRecompStart)
-                .count();
-        };
-        auto& memory = process->GetMemory();
-        u64 base = 0;
-        int last_thread_count = -1;
-        const auto resolve = [](u64 pc) -> std::string {
-            u64 best = 0;
-            const std::string* name = nullptr;
-            std::scoped_lock lk{g_counters.hist_lock};
-            for (const auto& [b, n] : g_counters.modules) {
-                if (pc >= b && b >= best) {
-                    best = b;
-                    name = &n;
-                }
-            }
-            return name ? fmt::format(" {}+{:#x}", *name, pc - best) : std::string{};
-        };
-        const auto dump_threads = [&](std::ofstream& o) {
-            for (auto& t : process->GetThreadList()) {
-                o << fmt::format("        id={:<4} state={} pc={:#x}{} lr={:#x}{}\n", t.GetId(),
-                                 static_cast<int>(t.GetState() & Kernel::ThreadState::Mask),
-                                 t.GetContext().pc, resolve(t.GetContext().pc),
-                                 t.GetContext().r[30], resolve(t.GetContext().r[30]));
-            }
-        };
-
-        // Phase 1: wait for the polling thread to exist, and meanwhile record
-        // every change in the guest thread population. Baseline reaches 43
-        // threads across this point and static never exceeds 10, so when the
-        // count stops growing is itself a measurement.
-        while (base == 0) {
-            if (fixed_addr != 0 && memory.IsValidVirtualAddress(fixed_addr) &&
-                memory.IsValidVirtualAddress(fixed_addr + 0x10c)) {
-                base = fixed_addr;
-                break;
-            }
-            int count = 0;
-            u64 found = 0;
-            for (auto& t : process->GetThreadList()) {
-                ++count;
-                if ((t.GetState() & Kernel::ThreadState::Mask) != Kernel::ThreadState::Runnable) {
-                    continue;
-                }
-                const u64 lr = t.GetContext().r[30];
-                for (const u64 mod : [&] {
-                         std::vector<u64> v;
-                         std::scoped_lock lk{g_counters.hist_lock};
-                         for (const auto& [b, n] : g_counters.modules) v.push_back(b);
-                         return v;
-                     }()) {
-                    if (lr - mod == lr_offset) {
-                        found = t.GetContext().r[19];
-                    }
-                }
-            }
-            if (count != last_thread_count) {
-                last_thread_count = count;
-                out << fmt::format("[{:8.3f}s blocks={:<12}] threads={}\n", stamp(),
-                                   TotalStaticBlocks(), count);
-                for (auto& t : process->GetThreadList()) {
-                    out << fmt::format("    id={:<4} state={} pc={:#x} lr={:#x}\n", t.GetId(),
-                                       static_cast<int>(t.GetState() & Kernel::ThreadState::Mask),
-                                       t.GetContext().pc, t.GetContext().r[30]);
-                }
-                out.flush();
-            }
-            if (found != 0 && memory.IsValidVirtualAddress(found) &&
-                memory.IsValidVirtualAddress(found + 0x10c)) {
-                base = found;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-
-        out << fmt::format("[{:8.3f}s blocks={:<12}] latched object {:#x} from x19 of the thread "
-                           "polling at module+{:#x}\n",
-                           stamp(), TotalStaticBlocks(), base, lr_offset);
-        out.flush();
-
-        // Phase 2: poll the object. The whole 0xd0..0x110 window rather than
-        // the one byte, because "the state byte never moved but the field next
-        // to it did" and "nothing in the object ever moved" are different
-        // findings and cost the same to collect.
-        u32 prev[16];
-        for (int i = 0; i < 16; ++i) {
-            prev[i] = memory.Read32(base + 0xd0 + 4 * i);
-        }
-        out << fmt::format("[{:8.3f}s blocks={:<12}] initial", stamp(), TotalStaticBlocks());
-        for (int i = 0; i < 16; ++i) out << fmt::format(" {:08x}", prev[i]);
-        out << "\n";
-        out.flush();
-
-        u64 polls = 0;
-        auto last_heartbeat = std::chrono::steady_clock::now();
-        while (true) {
-            ++polls;
-            u32 now[16];
-            for (int i = 0; i < 16; ++i) {
-                now[i] = memory.Read32(base + 0xd0 + 4 * i);
-            }
-            {
-                // Same arithmetic as recomp_host_ptr in the generated header.
-                const auto view = memory.GetPageTableView();
-                for (int i = 0; i < 16; ++i) {
-                    const u64 va = (base + 0xd0 + 4 * i) & 0xffffffffffffULL;
-                    u32 fast = 0;
-                    bool have = false;
-                    if (view.entries && va < view.address_space_max) {
-                        uintptr_t raw;
-                        std::memcpy(&raw,
-                                    reinterpret_cast<const unsigned char*>(view.entries) +
-                                        (va >> view.page_bits) * view.entry_stride,
-                                    sizeof(raw));
-                        const uintptr_t p = raw & static_cast<uintptr_t>(view.pointer_mask);
-                        if (p) {
-                            std::memcpy(&fast, reinterpret_cast<const void*>(p + va), 4);
-                            have = true;
-                        }
-                    }
-                    if (have && fast != now[i]) {
-                        out << fmt::format("[{:8.3f}s blocks={:<12}] VIEW MISMATCH +{:#x} "
-                                           "slow={:08x} fast={:08x}\n",
-                                           stamp(), TotalStaticBlocks(), 0xd0 + 4 * i, now[i],
-                                           fast);
-                        out.flush();
-                    }
-                    if (!have) {
-                        static bool once = false;
-                        if (!once) {
-                            once = true;
-                            out << fmt::format("[{:8.3f}s] note: inline walk declines +{:#x} - the "
-                                               "guest takes the callback path for this object\n",
-                                               stamp(), 0xd0 + 4 * i);
-                            out.flush();
-                        }
-                    }
-                }
-            }
-            if (std::memcmp(now, prev, sizeof(prev)) != 0) {
-                out << fmt::format("[{:8.3f}s blocks={:<12}] CHANGE after {} polls", stamp(),
-                                   TotalStaticBlocks(), polls);
-                for (int i = 0; i < 16; ++i) {
-                    out << (now[i] == prev[i] ? fmt::format(" {:08x}", now[i])
-                                              : fmt::format(" [{:08x}]", now[i]));
-                }
-                out << "\n";
-                dump_threads(out);
-                out.flush();
-                std::memcpy(prev, now, sizeof(prev));
-            }
-            const auto t = std::chrono::steady_clock::now();
-            if (t - last_heartbeat >= std::chrono::seconds(5)) {
-                last_heartbeat = t;
-                int count = 0;
-                for (auto& th : process->GetThreadList()) {
-                    (void)th;
-                    ++count;
-                }
-                out << fmt::format("[{:8.3f}s blocks={:<12}] heartbeat polls={} threads={} "
-                                   "+0xe4={:08x}\n",
-                                   stamp(), TotalStaticBlocks(), polls, count, prev[5]);
-                out.flush();
-            }
-            std::this_thread::yield();
-        }
-    }).detach();
-}
-
+// Diagnostics are sampled synchronously by the owning CPU interface.
+// No detached worker may retain a KProcess or walk a live thread list.
 void ReportRecompCoverage() {
     const std::string report = FormatRecompCoverage();
     if (report.empty()) {
@@ -1101,7 +704,7 @@ struct ArmRecomp::Impl {
         // Filled in by RefreshPageTable once a process exists; until then the
         // fields stay null and every access takes the callback path.
         bridge.page_entries = nullptr;
-        bridge.guard_generation = reinterpret_cast<const u64*>(&g_guard_generation);
+        bridge.guard_generation = nullptr;
         ctx.host_mem = &bridge;
     }
 
@@ -1194,11 +797,7 @@ struct ArmRecomp::Impl {
     /// space, so it is refreshed rather than cached forever.
     void RefreshPageTable() {
         const auto view = system.ApplicationMemory().GetPageTableView();
-        // A different table can mean different bytes behind the same guest
-        // address, so nothing verified against the old one still counts.
-        if (bridge.page_entries != view.entries) {
-            BumpGuardGeneration();
-        }
+        // ABI 5 checks the instruction bytes against this mapping on every entry.
         bridge.page_entries = view.entries;
         bridge.page_entry_stride = view.entry_stride;
         bridge.page_bits = view.page_bits;
@@ -1256,36 +855,40 @@ struct ArmRecomp::Impl {
 
     static u64 HostLoad(void* user, u64 va, u32 size) {
         va &= 0xffffffffffffULL;
+        const u32 bytes = size == 0 ? 4 : size;
+        // Size zero is the negotiated guard-v2 instruction read. All other
+        // widths must be architectural scalar sizes, with no 48-bit wrap.
+        if ((size != 0 && size != 1 && size != 2 && size != 4 && size != 8) ||
+            bytes > 0x1000000000000ULL - va) {
+            return 0;
+        }
         auto* self = static_cast<Impl*>(user);
         auto& memory = self->system.ApplicationMemory();
-        if (size != 0 && !memory.IsValidVirtualAddress(va)) {
-            ReportUnmapped(self, va, size, "read");
-        }
-        switch (size) {
-        case 0: // Negotiated guard-v2 checked instruction read; zero is a valid word.
-            if (va > ~u64{0} - 3) return 0;
-            for (u64 offset = 0; offset < 4; ++offset) {
+        if (size == 0) {
+            for (u32 offset = 0; offset < bytes; ++offset) {
                 if (!memory.IsValidVirtualAddress(va + offset)) return 0;
             }
             return (u64{1} << 32) | memory.Read32(va);
+        }
+        if (!memory.IsValidVirtualAddress(va)) {
+            ReportUnmapped(self, va, size, "read");
+        }
+        // Memory's scalar accessors split unaligned accesses across guest
+        // pages. Preserve them rather than imposing byte loads on all reads.
+        switch (size) {
         case 1: return memory.Read8(va);
         case 2: return memory.Read16(va);
         case 4: return memory.Read32(va);
-        default: return memory.Read64(va);
+        default: return memory.Read64(va); // Validated size == 8.
         }
-        if ((size != 1 && size != 2 && size != 4 && size != 8) ||
-            size > 0x1000000000000ULL - va) {
-            return 0;
-        }
-        u64 value = 0;
-        for (u32 offset = 0; offset < size; ++offset) {
-            value |= static_cast<u64>(memory.Read8(va + offset)) << (offset * 8);
-        }
-        return value;
     }
 
     static void HostStore(void* user, u64 va, u32 size, u64 value) {
         va &= 0xffffffffffffULL;
+        if ((size != 1 && size != 2 && size != 4 && size != 8) ||
+            size > 0x1000000000000ULL - va) {
+            return;
+        }
         if (kTrapStoreLo != 0 && va >= kTrapStoreLo && va < kTrapStoreHi) {
             auto* self = static_cast<Impl*>(user);
             std::string trail;
@@ -1631,8 +1234,7 @@ struct ArmRecomp::Impl {
                     // anything (nn::ro binding an NRO, say) ever wrote over it.
                     if (!kTrackSlotPrefix.empty() &&
                         sym.name.rfind(kTrackSlotPrefix, 0) == 0) {
-                        std::scoped_lock lk{g_tracked_lock};
-                        g_tracked_slots.push_back({d.mod_base + r_offset, stub, sym.name});
+                        diagnostics.TrackSlot(d.mod_base + r_offset, stub, sym.name);
                     }
                 }
             }
@@ -1736,6 +1338,25 @@ struct ArmRecomp::Impl {
         LOG_INFO(Core_ARM, "recomp: restored {} rela size fields", g_rela_restore.size());
     }
 
+    void SampleDiagnostics(Kernel::KThread* thread) {
+        if (!diagnostics.Enabled()) return;
+        auto* process = thread->GetOwnerProcess();
+        if (!process) return;
+        auto& memory = process->GetMemory();
+        const u64 process_id = process->GetId();
+        diagnostics.Sample(RecompDiagnosticSampler::Clock::now(), thread->GetId(),
+            ctx.pc, ctx.x[30], ctx.x[19], modules,
+            [&](u64 address) { return memory.Read32(address); },
+            [&](u64 address) { return memory.Read64(address); },
+            [&](u64 address) { return memory.IsValidVirtualAddress(address); },
+            [&](const std::string& snapshot) {
+                std::scoped_lock lock{g_snapshot_lock};
+                g_diagnostic_snapshots[{process_id, core_index}] = snapshot;
+            },
+            [](const std::string& line) { LOG_INFO(Core_ARM, "{}", line); });
+    }
+
+    RecompDiagnosticSampler diagnostics;
     System& system;
     RecompLookupFn lookup{};
     GuestContextView ctx{};
@@ -1777,23 +1398,38 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;
     impl->uses_wall_clock = uses_wall_clock;
-    // One instance is built per core; the last one torn down prints the run's
-    // execution-coverage report.
-    g_live_instances.fetch_add(1, std::memory_order_relaxed);
+    RecompDiagnosticSampler::Config diagnostic_config;
+    diagnostic_config.snapshots = kSamplePc;
+    const char* lr_env = std::getenv("SUYU_RECOMP_WATCH_LR_OFFSET");
+    const char* addr_env = std::getenv("SUYU_RECOMP_WATCH_ADDR");
+    diagnostic_config.watch = (lr_env && *lr_env) || (addr_env && *addr_env);
+    diagnostic_config.lr_offset = (lr_env && *lr_env) ? std::strtoull(lr_env, nullptr, 0) : 0;
+    diagnostic_config.fixed_address = (addr_env && *addr_env) ? std::strtoull(addr_env, nullptr, 0) : 0;
+    if (diagnostic_config.watch) {
+        const char* path_env = std::getenv("SUYU_RECOMP_WATCH_PATH");
+        diagnostic_config.watch_path = (path_env && *path_env)
+            ? std::string{path_env}
+            : (Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_watch.txt").string();
+    }
+    impl->diagnostics.Configure(process ? process->GetId() : 0, core_index,
+                                std::move(diagnostic_config));
+    // Snapshot storage contains copied text only. A new session starts fresh.
+    if (g_live_instances.fetch_add(1, std::memory_order_relaxed) == 0) {
+        std::scoped_lock lock{g_snapshot_lock};
+        g_diagnostic_snapshots.clear();
+    }
 }
 
 ArmRecomp::~ArmRecomp() {
     if (impl->core_index < g_current_pcs.size()) {
         g_current_pcs[impl->core_index].store(0, std::memory_order_relaxed);
     }
-    // Report on the *first* instance torn down, not the last. Waiting for the
-    // last one means the report is lost whenever anything still holds a
-    // reference at shutdown - which happens, and silently costs the whole run's
-    // measurement. All per-core instances go down together, so the first is
-    // just as complete.
-    g_live_instances.fetch_sub(1, std::memory_order_acq_rel);
-    static std::once_flag reported;
-    std::call_once(reported, [] { ReportRecompCoverage(); });
+    // Reports only copied samples and counters; never dereferences a process
+    // after its page table has been finalized. Report once per session, not once
+    // per host-process lifetime.
+    if (g_live_instances.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        ReportRecompCoverage();
+    }
 }
 
 bool PrepareRecompProcess(Kernel::KProcess& process, const RecompModules& modules) {
@@ -1923,14 +1559,6 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     if (first_run) {
         LOG_INFO(Core_ARM, "ArmRecomp::RunThread entered, pc={:#x}", impl->ctx.pc);
     }
-    // Kept so the coverage report can name what every guest thread is doing at
-    // the end of a run. "The guest is stalled" is an observation about one
-    // thread; which of the others exited, and which are parked in a wait that
-    // will never be signalled, is the part that says why.
-    if (g_report_process.load(std::memory_order_relaxed) == nullptr) {
-        g_report_process.store(thread->GetOwnerProcess(), std::memory_order_relaxed);
-        StartStateWatcher(thread->GetOwnerProcess());
-    }
     if (!impl->lookup) {
         LOG_ERROR(Core_ARM, "No recompiled code registered; cannot run thread");
         return HaltReason::BreakLoop;
@@ -1964,7 +1592,6 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             impl->ModuleBaseFor(thread, impl->ctx.pc);
             impl->ApplyAllRelocations(impl->modules);
             impl->rela_applied = true;
-            StartSlotWatcher();
         }
     }
 
@@ -2001,6 +1628,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     impl->ctx.halted = 0;
 
     while (!impl->ctx.halted) {
+        impl->SampleDiagnostics(thread);
         if (impl->core_index < g_current_pcs.size()) {
             g_current_pcs[impl->core_index].store(impl->ctx.pc, std::memory_order_relaxed);
         }
@@ -2382,11 +2010,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             }
             const u64 address = impl->ctx.pending_svc;
             impl->ctx.pending_svc = kNoPendingSvc;
-            // The guest just synchronized new instructions, so nothing a block
-            // verified before this point can still be assumed. Bumped here as
-            // well as in InvalidateCacheRange so the guarantee does not depend
-            // on which engine GetArmInterface hands back.
-            BumpGuardGeneration();
+            // Forward the guest instruction-cache operation to each CPU interface.
             for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
                 if (auto* cpu = thread->GetOwnerProcess()->GetArmInterface(core)) cpu->InvalidateCacheRange(address, 64);
             }
@@ -2416,17 +2040,18 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             // ranks the missing opcodes by execution rather than by how often
             // they appear in the image.
             g_counters.fallback_from_unhandled.fetch_add(1, std::memory_order_relaxed);
-            g_counters.RecordUnhandled(
-                static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)));
+            const u32 unsupported_opcode =
+                static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4));
+            g_counters.RecordUnhandled(unsupported_opcode);
             static std::atomic<int> unhandled_count{0};
             if (unhandled_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(Core_ARM, "recomp: unimplemented opcode at {:#x}; running on JIT",
-                            impl->ctx.pc);
+                LOG_WARNING(Core_ARM, "recomp: unimplemented opcode {:#010x} at {:#x}; checking fallback policy",
+                            unsupported_opcode, impl->ctx.pc);
             }
             if (!EnterFallback()) {
                 g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
-                LOG_CRITICAL(Core_ARM, "recomp: unimplemented opcode at {:#x} and no JIT fallback",
-                             impl->ctx.pc);
+                LOG_CRITICAL(Core_ARM, "recomp: unimplemented opcode {:#010x} at {:#x} and no JIT fallback",
+                             unsupported_opcode, impl->ctx.pc);
                 return HaltReason::PrefetchAbort;
             }
             return RunFallback(thread);
@@ -2447,6 +2072,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
 }
 
 HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
+    impl->SampleDiagnostics(thread);
     // A context switch voids any outstanding reservation. A thread preempted
     // between its LDXR and STXR would otherwise have the STXR succeed against a
     // word another thread changed on this core meanwhile, silently losing an
@@ -2481,7 +2107,6 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
         }
         const u64 address = impl->ctx.pending_svc;
         impl->ctx.pending_svc = kNoPendingSvc;
-        BumpGuardGeneration();
         for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
             if (auto* cpu = thread->GetOwnerProcess()->GetArmInterface(core)) cpu->InvalidateCacheRange(address, 64);
         }
@@ -2507,23 +2132,14 @@ void ArmRecomp::ClearInstructionCache() {
 #ifndef SUYU_NO_JIT
     if (impl->fallback) impl->fallback->ClearInstructionCache();
 #endif
-    // A whole-icache flush is the broadest statement that guest code may have
-    // changed, so it retires every block's cached verification. Blocks used to
-    // re-read their bytes on every entry, which made this a no-op for them.
-    BumpGuardGeneration();
+    // Generated ABI 5 blocks verify bytes on every entry.
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
 #ifndef SUYU_NO_JIT
     if (impl->fallback) impl->fallback->InvalidateCacheRange(addr, size);
 #endif
-    // Whoever called this is telling us the bytes behind some guest address may
-    // have changed. Blocks cache the generation they last verified at, so moving
-    // it is what makes them look again. Deliberately global rather than ranged:
-    // the counter is read once per block entry, and narrowing it to the affected
-    // range would cost a lookup on the hot path to save re-verifying blocks in a
-    // situation that is rare to begin with.
-    BumpGuardGeneration();
+    // Generated ABI 5 blocks verify bytes on every entry.
 }
 
 void ArmRecomp::GetContext(Kernel::Svc::ThreadContext& ctx) const {

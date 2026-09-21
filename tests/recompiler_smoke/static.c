@@ -29,7 +29,7 @@ int main(void) {
     uint64_t first_lo, first_hi, second_lo, second_hi;
     BlockFn *first_index, *second_index;
     GuestContext first, second;
-    CHECK(recomp_image_abi_smoke() == 4 && recomp_image_abi_second() == 4);
+    CHECK(recomp_image_abi_smoke() == 5 && recomp_image_abi_second() == 5);
     CHECK(g_recomp_guard_host_v2_smoke == 0 && g_recomp_guard_host_v2_second == 0);
     CHECK(recomp_image_guard_v2_smoke(2) == 2);
     CHECK(g_recomp_guard_host_v2_smoke == 2 && g_recomp_guard_host_v2_second == 0);

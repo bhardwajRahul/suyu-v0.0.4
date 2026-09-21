@@ -20,6 +20,7 @@
 
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
+#include "suyu_cmd/native_status.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/fs/path_util.h"
@@ -53,6 +54,7 @@
 #include "input_common/main.h"
 #include "network/network.h"
 #include "sdl_config.h"
+#include "suyu_cmd/explicit_update.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2_gl.h"
 #ifdef __APPLE__
@@ -120,6 +122,11 @@ static void PrintHelp(const char* argv0) {
                  "-c, --config          Load the specified configuration file\n"
                  "-f, --fullscreen      Start in fullscreen mode\n"
                  "-g, --game            File path of the game to load\n"
+                 "--app-name            Display name when the loader has no title metadata\n"
+                 "--content-base        Read-only base XCI/NSP for an explicit update pair\n"
+                 "--content-update      Read-only matching update NSP (both flags required)\n"
+                 "--content-probe       Verify that pair and exit without a window or game\n"
+                 "--content-dump        New directory for resolved data (requires --content-probe)\n"
                  "-h, --help            Display this help and exit\n"
                  "-m, --multiplayer=nick:password@address:port"
                  " Nickname, password, address and port for multiplayer\n"
@@ -248,6 +255,13 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
 /// True once native recompiled CPU modules are registered — the running
 /// process is a standalone game export, not the suyu dev frontend.
 bool g_native_export_mode = false;
+SdlConfig* g_sdl_config = nullptr;
+
+void SaveNativeControls() {
+    if (g_sdl_config != nullptr) {
+        g_sdl_config->SaveAllValues();
+    }
+}
 
 /// Application entry point
 /// mk8-recomp: report each title's CPU architecture without booting it.
@@ -744,6 +758,10 @@ int main(int argc, char** argv) {
 #endif
     std::string filepath;
     std::optional<std::string> config_path;
+    std::optional<std::string> explicit_content_base;
+    std::optional<std::string> explicit_content_update;
+    bool explicit_content_probe = false;
+    std::string explicit_content_dump;
     std::string program_args;
     std::optional<int> selected_user;
 
@@ -752,6 +770,7 @@ int main(int argc, char** argv) {
     bool tas_playback = false;
     std::optional<u32> app_version_override;
     std::string app_display_version_override;
+    std::optional<std::string> app_name_override;
     Service::AM::FrontendAppletParameters load_parameters{};
     std::string nickname{};
     std::string password{};
@@ -771,14 +790,43 @@ int main(int argc, char** argv) {
         {"user", required_argument, 0, 'u'},
         {"version", no_argument, 0, 'v'},
         {"app-version", required_argument, 0, 'V'},
+        {"app-name", required_argument, 0, 'N'},
+        {"content-base", required_argument, 0, 'B'},
+        {"content-update", required_argument, 0, 'U'},
+        {"content-probe", no_argument, 0, 'P'},
+        {"content-dump", required_argument, 0, 'D'},
         {0, 0, 0, 0},
         // clang-format on
     };
 
     while (optind < argc) {
-        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l::tV:", long_options, &option_index);
+        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l::tV:N:B:U:PD:", long_options, &option_index);
         if (arg != -1) {
             switch (static_cast<char>(arg)) {
+            case 'B':
+                if (explicit_content_base) {
+                    LOG_ERROR(Frontend, "Duplicate --content-base argument");
+                    return 2;
+                }
+                explicit_content_base = optarg;
+                break;
+            case 'U':
+                if (explicit_content_update) {
+                    LOG_ERROR(Frontend, "Duplicate --content-update argument");
+                    return 2;
+                }
+                explicit_content_update = optarg;
+                break;
+            case 'D':
+                if (!explicit_content_dump.empty() || !optarg || !*optarg) {
+                    LOG_ERROR(Frontend, "Invalid or repeated --content-dump argument");
+                    return 2;
+                }
+                explicit_content_dump = optarg;
+                break;
+            case 'P':
+                explicit_content_probe = true;
+                break;
             case 'c':
                 config_path = optarg;
                 break;
@@ -880,6 +928,13 @@ int main(int argc, char** argv) {
                 }
                 break;
             }
+            case 'N':
+                if (app_name_override || !optarg || !*optarg) {
+                    LOG_ERROR(Frontend, "Invalid or repeated --app-name argument");
+                    return 2;
+                }
+                app_name_override = optarg;
+                break;
             }
         } else {
 #ifdef _WIN32
@@ -891,7 +946,27 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (explicit_content_base.has_value() != explicit_content_update.has_value() ||
+        (explicit_content_probe && !explicit_content_base) ||
+        (!explicit_content_dump.empty() && !explicit_content_probe)) {
+        LOG_ERROR(Frontend, "Supply both --content-base and --content-update");
+        return 2;
+    }
+    if (explicit_content_base && !filepath.empty()) {
+        LOG_ERROR(Frontend, "--content-base owns the launch path; do not also supply -g or a positional game");
+        return 2;
+    }
+    if (explicit_content_base) {
+        filepath = *explicit_content_base;
+    }
+#ifdef SUYU_CMD_STATIC_RECOMP
+    if (explicit_content_base || explicit_content_probe) {
+        LOG_ERROR(Frontend, "Explicit content comparison is only supported by the ordinary CLI");
+        return 2;
+    }
+#endif
     SdlConfig config{config_path};
+    g_sdl_config = &config;
 
     // apply the log_filter setting
     // the logger was initialized before and doesn't pick up the filter on its own
@@ -988,6 +1063,10 @@ int main(int argc, char** argv) {
         unsigned count = 0;
         const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v4(&count);
         for (unsigned i = 0; i < count; ++i) {
+            if (!mods[i].image_abi || mods[i].image_abi() != 5) {
+                LOG_CRITICAL(Frontend, "Static image predates correctness ABI 5; re-export all modules");
+                return EXIT_FAILURE;
+            }
             s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].run_slice,
                                         mods[i].image_abi ? mods[i].image_abi() : 0, nullptr});
             LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
@@ -1038,7 +1117,11 @@ int main(int argc, char** argv) {
                 auto image_abi = reinterpret_cast<unsigned (*)()>(
                     GetProcAddress(h, "recomp_image_abi"));
                 const unsigned abi = image_abi ? image_abi() : 0;
-                if (abi < 4) run_slice = nullptr;
+                if (abi != 5) {
+                    LOG_CRITICAL(Frontend, "Recompiled image ABI {} is not 5; re-export all modules", abi);
+                    FreeLibrary(h);
+                    return EXIT_FAILURE;
+                }
                 auto guard = reinterpret_cast<unsigned (*)(unsigned)>(GetProcAddress(h, "recomp_image_guard_v2"));
                 s_recomp_modules.push_back({lkp, sbf, run_slice, abi, guard});
                 LOG_INFO(Frontend, "Native recompiled module [{}] loaded from {} — ArmRecomp active",
@@ -1123,9 +1206,26 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO(Frontend, "suyu-cmd: Initializing system...");
+    // The VFS and explicit provider outlive System, which retains their file references.
+    const auto explicit_vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    SuyuCli::ExplicitUpdateProvider explicit_provider;
     Core::System system{};
     system.Initialize();
     LOG_INFO(Frontend, "suyu-cmd: System initialized.");
+    if (explicit_content_base) {
+        system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+        system.SetFilesystem(explicit_vfs);
+        system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
+        if (!SuyuCli::ConfigureExplicitUpdate(system, explicit_provider,
+                                              *explicit_content_base, *explicit_content_update,
+                                              explicit_content_dump)) {
+            return 2;
+        }
+        if (explicit_content_probe) {
+            LOG_INFO(Frontend, "CLI explicit content probe complete (no guest executed)");
+            return 0;
+        }
+    }
 
     InputCommon::InputSubsystem input_subsystem{};
 
@@ -1160,8 +1260,10 @@ int main(int argc, char** argv) {
 #endif
 
     LOG_INFO(Frontend, "suyu-cmd: Window created, loading game...");
-    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
-    system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    if (!explicit_content_base) {
+        system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+        system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    }
     // The command line wins over the configuration file, so a one-off run can differ
     // from the persisted setting without editing it.
     if (!app_version_override) {
@@ -1177,6 +1279,7 @@ int main(int argc, char** argv) {
     }
 
     if (app_version_override) {
+        SuyuCmd::SetNativeLaunchVersion(app_display_version_override);
         // Deconstructed ROM directories carry no control data, so GetDisplayVersion has
         // nothing to read and falls back to a hard-coded 1.0.0. Titles that report their
         // own version, and anything that checks version compatibility, then see a value
@@ -1223,6 +1326,16 @@ int main(int argc, char** argv) {
         load_parameters.applet_id = Service::AM::AppletId::Application;
     }
     LOG_INFO(Frontend, "suyu-cmd: Calling system.Load for '{}'...", filepath);
+    // A deconstructed ROM may have no control metadata for GetGameName.
+    // Preserve a reusable name from the chosen launch path for the status UI.
+    std::filesystem::path launch_path{filepath};
+    const auto launch_stem = launch_path.stem().string();
+    const std::string fallback_name =
+        (launch_stem == "main" && launch_path.parent_path().filename() == "exefs")
+            ? launch_path.parent_path().parent_path().filename().string()
+            : launch_stem;
+    SuyuCmd::SetNativeLaunchName(app_name_override.value_or(fallback_name),
+                                 app_name_override.has_value());
     const Core::SystemResultStatus load_result{system.Load(*emu_window, filepath, load_parameters)};
     LOG_INFO(Frontend, "suyu-cmd: system.Load returned: {}", static_cast<int>(load_result));
 
@@ -1321,8 +1434,8 @@ int main(int argc, char** argv) {
     // On a thread of its own because the loop below blocks in WaitEvent:
     // samples driven from there would stop arriving exactly when the
     // emulator stops making progress, which is the case worth seeing. The
-    // window-title refresh gives up the counters while this is enabled, so
-    // there is still only one reader of them.
+    // status sampler hands these counters no sample at all while this owns
+    // them, so there is still only one reader of them.
     const bool perf_sampling = std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
     std::atomic<bool> perf_sampling_run{perf_sampling};
     std::thread perf_sampler;
@@ -1334,6 +1447,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 const auto r = system.GetAndResetPerfStats();
+                SuyuCmd::StoreNativePerfStats(r);
                 LOG_INFO(Frontend,
                          "PERF game_fps={:.3f} system_fps={:.3f} frametime_ms={:.3f} "
                          "speed={:.4f}",
@@ -1341,6 +1455,9 @@ int main(int argc, char** argv) {
                          r.emulation_speed);
             }
         });
+    } else {
+        LOG_INFO(Frontend,
+                 "PERF sampling off: the window status refresh owns the perf counters");
     }
 
     while (emu_window->IsOpen()) {

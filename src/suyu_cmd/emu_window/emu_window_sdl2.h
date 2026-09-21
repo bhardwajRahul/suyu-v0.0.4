@@ -38,6 +38,8 @@ public:
     /// Wait for the next event on the main thread.
     void WaitEvent();
 
+    void RefreshWindowStatus();
+
     /// Replay the TAS script from the user TAS directory instead of waiting for
     /// a hotkey, and quit once it runs out. Call before the system is run.
     void EnableTasPlayback();

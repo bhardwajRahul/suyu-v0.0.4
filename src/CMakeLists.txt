@@ -151,9 +151,12 @@ else()
     if (NOT MSVC)
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>
-            # Disable RTTI (C++ only)
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>)
+        # Apple libc++ needs RTTI for a derived standard exception to match
+        # a base-class catch (for example invalid_argument -> logic_error).
+        if (NOT APPLE)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+        endif()
     endif()
 
     add_compile_options(

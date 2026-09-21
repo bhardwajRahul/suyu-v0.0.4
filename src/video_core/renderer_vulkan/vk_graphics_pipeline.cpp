@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_stall_probe.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_notify.h"
@@ -548,6 +549,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // Wait here rather than from a recorded command. The recorded wait ran
         // on the scheduler thread after this draw had already been queued, so
         // it could never decline to draw when the build failed.
+        StallProbe::Accum build_probe{StallProbe::build_wait_ns,
+                                           &StallProbe::build_wait_count};
         std::unique_lock lock{build_mutex};
         build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
     }

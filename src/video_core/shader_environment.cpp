@@ -66,6 +66,15 @@ static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& en
 }
 
 static Shader::TexturePixelFormat ConvertTexturePixelFormat(const Tegra::Texture::TICEntry& entry) {
+    // Texture cache rejects this exact zero-address TIC as unbound. Shader
+    // specialization may still query it while translating an IR instruction.
+    // Return the same noninteger fallback used by the unsupported-format path;
+    // malformed nonzero descriptors still reach that diagnostic.
+    if (entry.Address() == 0 &&
+        std::ranges::all_of(entry.raw, [](u64 word) { return word == 0; })) {
+        return static_cast<Shader::TexturePixelFormat>(
+            VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM);
+    }
     return static_cast<Shader::TexturePixelFormat>(
         PixelFormatFromTextureInfo(entry.format, entry.r_type, entry.g_type, entry.b_type,
                                    entry.a_type, entry.srgb_conversion));

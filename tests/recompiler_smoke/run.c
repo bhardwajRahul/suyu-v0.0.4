@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
     bridge.pointer_mask = ~(uint64_t)0;
     bridge.address_space_max = 0x3000;
     pages[1] = pages[2] = (uintptr_t)memory - 0x1000;
-    CHECK(recomp_image_abi() == 4);
+    CHECK(recomp_image_abi() == 5);
     CHECK(recomp_image_guard_v2(2) == 2);
     /* Exercise the interval lookup before the flat index is constructed. */
     CHECK(recomp_image_lookup(0x1018) == recomp_image_lookup(0x1014));

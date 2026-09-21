@@ -22,7 +22,14 @@ static constexpr Uint8 SDL_RELEASED = 0;
 #include "common/param_package.h"
 #include "common/settings_input.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2.h"
+#include "suyu_cmd/native_status.h"
+#include "suyu_cmd/sdl_config.h"
 #include "suyu_cmd/suyu_icon.h"
+
+namespace {
+constexpr u64 kStatusRefreshMs = 750;
+constexpr Sint32 kEventWaitSliceMs = 250;
+} // namespace
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -132,6 +139,10 @@ void DevBindSelected(DevPanelState& st, bool clear) {
             player.buttons[sel].clear();
         }
         DevRefreshBinds(st);
+        SaveNativeControls();
+        if (st.system != nullptr) {
+            st.system->HIDCore().ReloadInputDevices();
+        }
         return;
     }
 
@@ -142,6 +153,7 @@ void DevBindSelected(DevPanelState& st, bool clear) {
     Common::ParamPackage captured;
     const DWORD deadline = GetTickCount() + 5000;
     while (GetTickCount() < deadline) {
+        SDL_PumpEvents();
         captured = st.input->GetNextInput();
         if (captured.Has("engine")) {
             break;
@@ -169,6 +181,7 @@ void DevBindSelected(DevPanelState& st, bool clear) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    SaveNativeControls();
     DevRefreshBinds(st);
 }
 
@@ -177,25 +190,66 @@ void DevBindSelected(DevPanelState& st, bool clear) {
 // UI - what a shipped game build needs is for a plugged-in pad to just work,
 // and a way back to keyboard when it does not.
 void DevRefreshDevices(DevPanelState& st) {
+    SDL_PumpEvents();
+    const int previous = static_cast<int>(SendMessageW(st.devices, CB_GETCURSEL, 0, 0));
+    const auto selected = previous >= 0 && static_cast<std::size_t>(previous) < st.device_list.size()
+                              ? st.device_list[previous].Serialize()
+                              : std::string{};
     SendMessageW(st.devices, CB_RESETCONTENT, 0, 0);
     st.device_list.clear();
     if (st.input == nullptr) {
         return;
     }
     for (const auto& device : st.input->GetInputDevices()) {
-        const std::string name = device.Get("display", device.Get("class", "Unknown"));
-        if (name == "Any" || name == "Keyboard/Mouse") {
+        const std::string engine = device.Get("engine", "");
+        if (engine != "sdl" && engine != "joycon" && engine != "gcpad") {
             continue;
         }
+        const std::string name = device.Get("display", device.Get("class", "Unknown"));
         st.device_list.push_back(device);
         const std::wstring wide(name.begin(), name.end());
         SendMessageW(st.devices, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str()));
     }
     if (st.device_list.empty()) {
+        bool saved_pad = false;
+        for (const auto& binding : Settings::values.players.GetValue()[0].buttons) {
+            Common::ParamPackage existing{binding};
+            if (existing.Get("engine", "") == "sdl") {
+                saved_pad = true;
+                break;
+            }
+        }
         SendMessageW(st.devices, CB_ADDSTRING, 0,
-                     reinterpret_cast<LPARAM>(L"(no controller detected - plug one in and rescan)"));
+                     reinterpret_cast<LPARAM>(saved_pad
+                         ? L"(saved controller disconnected - reconnect and rescan)"
+                         : L"(no controller detected - plug one in and rescan)"));
     }
-    SendMessageW(st.devices, CB_SETCURSEL, 0, 0);
+    int preferred = 0;
+    if (!selected.empty()) {
+        for (std::size_t i = 0; i < st.device_list.size(); ++i) {
+            if (st.device_list[i].Serialize() == selected) {
+                preferred = static_cast<int>(i);
+                break;
+            }
+        }
+    } else {
+        const auto& buttons = Settings::values.players.GetValue()[0].buttons;
+        for (const auto& binding : buttons) {
+            Common::ParamPackage existing{binding};
+            if (!existing.Has("guid") || !existing.Has("port")) {
+                continue;
+            }
+            for (std::size_t i = 0; i < st.device_list.size(); ++i) {
+                if (st.device_list[i].Get("guid", "") == existing.Get("guid", "") &&
+                    st.device_list[i].Get("port", -1) == existing.Get("port", -2)) {
+                    preferred = static_cast<int>(i);
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    SendMessageW(st.devices, CB_SETCURSEL, preferred, 0);
 }
 
 void DevApplyPadMapping(DevPanelState& st) {
@@ -221,6 +275,7 @@ void DevApplyPadMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    SaveNativeControls();
     MessageBoxW(nullptr, L"Controller mapped to Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
@@ -251,29 +306,62 @@ void DevApplyKeyboardMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    SaveNativeControls();
     MessageBoxW(nullptr, L"Keyboard controls restored for Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
 
 std::wstring DevStatusText(Core::System& system) {
-    std::string game_name;
-    [[maybe_unused]] auto _ = system.GetGameName(game_name);
-    const auto perf = system.GetAndResetPerfStats();
-    wchar_t buf[2048];
+    // Read the shared snapshot rather than sampling. GetAndResetPerfStats
+    // clears the counters as it reads them, so a second caller here would take
+    // half the frames away from whoever owns the sample.
+    SuyuCmd::NativeStatusSnapshot snap{};
+    const bool have_snapshot = SuyuCmd::TryGetNativeStatusSnapshot(snap);
+    if (!have_snapshot) {
+        snap.title_id = system.GetApplicationProcessProgramID();
+    }
+
+    const auto backend = SuyuCmd::ClassifyGameBackend(snap);
+    const std::string backend_line =
+        std::string(SuyuCmd::NativeBackendName(backend)) + SuyuCmd::GameBackendQualifier(snap);
+
+    wchar_t fps_line[160];
+    if (!have_snapshot || !snap.perf_available) {
+        swprintf(fps_line, std::size(fps_line), L"FPS:          (no sample yet)");
+    } else {
+        swprintf(fps_line, std::size(fps_line), L"FPS:          %.1f   Speed: %.0f%%   CPU work: %.2f ms",
+                 snap.average_game_fps, snap.emulation_speed * 100.0, snap.frametime_ms);
+    }
+
+    wchar_t applet_line[192];
+    if (snap.applet_running) {
+        const std::wstring applet_name(snap.applet_name.begin(), snap.applet_name.end());
+        swprintf(applet_line, std::size(applet_line), L"\r\nApplet:       %s - %hs", applet_name.c_str(),
+                 SuyuCmd::NativeBackendName(snap.applet_backend));
+    } else {
+        swprintf(applet_line, std::size(applet_line), L"");
+    }
+
+    wchar_t buf[2560];
     const auto exe_dir = DevExeDir();
     swprintf(buf, std::size(buf),
              L"Title:        %hs\r\n"
              L"Title ID:     %016llX\r\n"
-             L"FPS:          %.1f   Speed: %.0f%%   Frame: %.2f ms\r\n"
+             L"Version:      %hs\r\n"
+             L"%s\r\n"
              L"CPU backend:  %hs\r\n"
+             L"JIT trans.:   %llu (requested strict=%hs)\r\n"
+             L"%s\r\n"
+             L"F12:          Controls panel\r\n"
              L"\r\n"
              L"User data:    %s\r\n"
              L"Mods:         %s\r\n"
              L"Keys:         %s\r\n",
-             game_name.empty() ? "(not loaded)" : game_name.c_str(),
-             static_cast<unsigned long long>(system.GetApplicationProcessProgramID()),
-             perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
-             g_native_export_mode ? "ArmRecomp (static recompiled modules)" : "dynarmic JIT",
+             snap.game_name.empty() ? "(not loaded)" : snap.game_name.c_str(),
+             static_cast<unsigned long long>(snap.title_id),
+             snap.display_version.empty() ? "(unknown)" : snap.display_version.c_str(), fps_line,
+             backend_line.c_str(), static_cast<unsigned long long>(snap.jit_transitions),
+             snap.strict_requested ? "yes" : "no", applet_line,
              (exe_dir / L"user").wstring().c_str(), (exe_dir / L"mods").wstring().c_str(),
              DevKeysDir().c_str());
     return buf;
@@ -309,6 +397,9 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER:
         if (st != nullptr && st->system != nullptr) {
+            const bool benchmark_owns_stats = std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
+            SuyuCmd::StoreNativeStatusSnapshot(
+                SuyuCmd::SampleNativeStatus(*st->system, !benchmark_owns_stats));
             SetWindowTextW(st->status, DevStatusText(*st->system).c_str());
         }
         return 0;
@@ -381,6 +472,7 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
+    const auto previous_dpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     static bool registered = false;
     static const wchar_t* kClass = L"SuyuGameDebugPanel";
     if (!registered) {
@@ -397,8 +489,11 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
         registered = true;
     }
 
-    std::string game_name;
-    [[maybe_unused]] auto _ = system.GetGameName(game_name);
+    SuyuCmd::NativeStatusSnapshot panel_snapshot{};
+    if (!SuyuCmd::TryGetNativeStatusSnapshot(panel_snapshot)) {
+        panel_snapshot = SuyuCmd::SampleNativeStatus(system, false);
+    }
+    const std::string& game_name = panel_snapshot.game_name;
     const std::wstring title =
         (game_name.empty() ? std::wstring(L"Game") : std::wstring(game_name.begin(), game_name.end())) +
         L" - Debug Panel (F12)";
@@ -408,6 +503,9 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
                                       CW_USEDEFAULT, 720, 780, nullptr, nullptr,
                                       GetModuleHandleW(nullptr), nullptr);
     if (hwnd == nullptr) {
+        if (previous_dpi != nullptr) {
+            SetThreadDpiAwarenessContext(previous_dpi);
+        }
         return;
     }
 
@@ -481,6 +579,9 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }
+    }
+    if (previous_dpi != nullptr) {
+        SetThreadDpiAwarenessContext(previous_dpi);
     }
 }
 
@@ -688,18 +789,23 @@ void EmuWindow_SDL2::WaitEvent() {
     // Called on main thread
     SDL_Event event;
 
-    if (!SDL_WaitEvent(&event)) {
-        const char* error = SDL_GetError();
-        if (!error || strcmp(error, "") == 0) {
-            // https://github.com/libsdl-org/SDL/issues/5780
-            // Sometimes SDL will return without actually having hit an error condition;
-            // just ignore it in this case.
-            return;
+    // Wait with a deadline rather than forever: with no input there is no event
+    // to wake on, so a plain SDL_WaitEvent would never refresh the status.
+    // A timeout is the idle tick, not a failure.
+    SDL_ClearError();
+    if (!SDL_WaitEventTimeout(&event, kEventWaitSliceMs)) {
+        if (const char* error = SDL_GetError(); error != nullptr && error[0] != '\0') {
+            LOG_ERROR(Frontend, "SDL_WaitEventTimeout failed: {}", error);
+            SDL_ClearError();
         }
-
-        LOG_CRITICAL(Frontend, "SDL_WaitEvent failed: {}", error);
-        exit(1);
+        const u64 idle_time = SDL_GetTicks();
+        if (idle_time > last_time + kStatusRefreshMs) {
+            last_time = idle_time;
+            RefreshWindowStatus();
+        }
+        return;
     }
+
 
     switch (event.type) {
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -762,33 +868,21 @@ void EmuWindow_SDL2::WaitEvent() {
     }
 
     const u64 current_time = SDL_GetTicks();
-    // GetAndResetPerfStats clears the counters as it reads them, so only one
-    // caller in the process can have them. While the benchmark sampler is
-    // running it is that caller, and this refresh stands down rather than
-    // taking half the frames away from it and making both readings wrong.
-    // Nothing is lost by standing down: this runs from the SDL event
-    // handler, so during a headless replay - no input, nobody touching the
-    // window - it fires a couple of times in a whole run anyway.
-    static const bool perf_sampling_owns_stats =
-        std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
-    if (current_time > last_time + 2000 && !perf_sampling_owns_stats) {
-        const auto results = system.GetAndResetPerfStats();
-        std::string game_name;
-        [[maybe_unused]] auto _ = system.GetGameName(game_name);
-        if (g_native_export_mode) {
-            // Standalone game export: plain game title, no emulator branding.
-            if (!game_name.empty()) {
-                SDL_SetWindowTitle(render_window, game_name.c_str());
-            }
-        } else {
-            const auto title =
-                fmt::format("{} | {} | FPS: {:.0f} ({:.0f}%)", game_name.empty() ? "suyu" : game_name,
-                            Common::g_build_fullname, results.average_game_fps,
-                            results.emulation_speed * 100.0);
-            SDL_SetWindowTitle(render_window, title.c_str());
-        }
+    if (current_time > last_time + kStatusRefreshMs) {
         last_time = current_time;
+        RefreshWindowStatus();
     }
+}
+
+void EmuWindow_SDL2::RefreshWindowStatus() {
+    const bool benchmark_owns_stats = std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
+    const auto snap = SuyuCmd::SampleNativeStatus(system, !benchmark_owns_stats);
+    SuyuCmd::StoreNativeStatusSnapshot(snap);
+
+    SuyuCmd::NativeStatusSnapshot display{};
+    SuyuCmd::TryGetNativeStatusSnapshot(display);
+    const std::string title = SuyuCmd::FormatNativeTitle(display);
+    SDL_SetWindowTitle(render_window, title.c_str());
 }
 
 // Credits to Samantas5855 and others for this function.

@@ -9,7 +9,10 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/find")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules")
 
-set(CPM_SOURCE_CACHE ${CMAKE_SOURCE_DIR}/.cache/cpm)
+# Keep an explicit -DCPM_SOURCE_CACHE authoritative, including for read-only
+# source checkouts. A normal variable here would hide the caller's cache entry.
+set(CPM_SOURCE_CACHE "${CMAKE_SOURCE_DIR}/.cache/cpm" CACHE PATH
+    "Directory to download CPM dependencies")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES 0)
 
@@ -22,6 +25,10 @@ include(UseCcache)
 include(CMakeDependentOption)
 include(CTest)
 include(CPMUtil)
+option(SUYU_USE_LOCAL_EXTERNALS "Use locally populated dependency trees (custom revisions)" OFF)
+if(SUYU_USE_LOCAL_EXTERNALS)
+    include(LocalDependencies)
+endif()
 
 if (NOT DEFINED ARCHITECTURE)
     message(FATAL_ERROR "Architecture didn't make it out of scope, did you delete DetectArchitecture.cmake?")
@@ -452,6 +459,10 @@ endif()
 
 # fmt
 AddJsonPackage(fmt)
+# Third-party headers must not inherit first-party warnings-as-errors.
+if(fmt_ADDED AND TARGET fmt)
+    set_property(TARGET fmt PROPERTY SYSTEM TRUE)
+endif()
 
 # lz4
 AddJsonPackage(lz4)
@@ -577,7 +588,9 @@ if (NOT YUZU_STATIC_ROOM)
     find_package(SimpleIni)
     find_package(sirit)
     find_package(gamemode)
-    find_package(frozen)
+    if(ENABLE_QT)
+        find_package(frozen)
+    endif()
 
     if (ARCHITECTURE_riscv64)
         find_package(biscuit)
