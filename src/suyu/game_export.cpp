@@ -329,9 +329,9 @@ void GameExportDialog::SetupUi() {
     out_row->addWidget(browse_btn);
     layout->addLayout(out_row);
 
-    const QString default_output = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    const QString default_output = DefaultExportRoot();
     if (!default_output.isEmpty()) {
-        output_path_edit->setText(default_output);
+        output_path_edit->setText(QDir::toNativeSeparators(default_output));
     }
 
     // Target platform
@@ -3551,6 +3551,31 @@ namespace {
 constexpr char kOutputRootsKey[] = "recompile/output_roots";
 } // namespace
 
+// suyu run from a source checkout (build/bin under the repo) exports into <repo>/exports, which
+// .gitignore keeps out of commits: exports hold generated game code and game data. Anywhere
+// else - an installed or unpacked release, or a macOS app bundle - keeps the Downloads default.
+static QString RepoExportRoot() {
+    QDir dir(QCoreApplication::applicationDirPath());
+    for (int level = 0; level < 6; ++level) {
+        if (QFileInfo::exists(dir.filePath(QStringLiteral(".git"))) &&
+            QFileInfo::exists(dir.filePath(QStringLiteral("src/suyu/game_export.cpp")))) {
+            return dir.filePath(QStringLiteral("exports"));
+        }
+        if (!dir.cdUp()) {
+            break;
+        }
+    }
+    return {};
+}
+
+QString GameExportDialog::DefaultExportRoot() {
+    const QString repo_exports = RepoExportRoot();
+    if (!repo_exports.isEmpty()) {
+        return repo_exports;
+    }
+    return QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+}
+
 QStringList GameExportDialog::RecompileOutputRoots() {
     QSettings settings(QStringLiteral("suyu"), QStringLiteral("suyu"));
     QStringList roots = settings.value(QString::fromLatin1(kOutputRootsKey)).toStringList();
@@ -3563,6 +3588,9 @@ QStringList GameExportDialog::RecompileOutputRoots() {
         roots.append(downloads);
     }
     roots.append(QDir::currentPath() + QDir::separator() + QStringLiteral("aot_test_output"));
+    if (const QString repo_exports = RepoExportRoot(); !repo_exports.isEmpty()) {
+        roots.append(repo_exports);
+    }
 
     // In a development tree suyu runs out of build/bin, so the export root the
     // test harness writes to sits a couple of levels above the executable.

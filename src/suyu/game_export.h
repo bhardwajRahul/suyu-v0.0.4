@@ -94,6 +94,8 @@ public:
 
     /// Directories that have been used as export output, most recent first.
     static QStringList RecompileOutputRoots();
+    /// Default output directory: <repo>/exports in a source checkout, else Downloads.
+    static QString DefaultExportRoot();
     /// Remember @p dir as an export output root for future lookups.
     static void RememberOutputRoot(const QString& dir);
 
