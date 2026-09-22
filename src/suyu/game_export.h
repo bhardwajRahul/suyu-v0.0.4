@@ -66,7 +66,9 @@ public:
     ///        can only ever exercise the default backend, which is why the
     ///        hybrid path went untested.
     void TriggerExportForTesting(const QString& rom_path, const QString& output_dir,
-                                 int format_index = -1, int backend_index = -1);
+                                 int format_index = -1, int backend_index = -1,
+                                 int full_scan = -1, quint32 app_version = 0,
+                                 const QString& display_version = {});
     bool IsExportInProgressForTesting() const;
     bool HasExportResultForTesting() const;
     bool ExportSucceededForTesting() const;
@@ -139,6 +141,8 @@ private:
     bool test_export_has_result{false};
     bool test_export_succeeded{false};
     QString test_export_output;
+    quint32 test_app_version{};
+    QString test_display_version;
     /// Modules the last export routed to the Dynarmic JIT after a recompile or
     /// compile failure. Reported to the user when the export finishes, so a
     /// partially-degraded package cannot look like a clean one.

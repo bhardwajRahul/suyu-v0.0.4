@@ -4,7 +4,7 @@
 No game files, keys, firmware, renderer mocks, or network access are used.
 """
 from pathlib import Path
-import ast, os, re, shlex, shutil, subprocess, tempfile, unittest
+import ast, os, re, shlex, shutil, subprocess, sys, tempfile, unittest
 ROOT=Path(__file__).resolve().parents[2]
 CXX=shlex.split(os.environ.get('CXX','c++'))
 
@@ -21,6 +21,12 @@ class BuildRegressions(unittest.TestCase):
         self.assertEqual(source.count('20260920-fixedpoint-v1'),2)
         self.assertIn('same_scan && same_backend && same_image_abi && same_correctness_revision',source)
         self.assertIn('const bool same_correctness_revision = contents.contains(',source)
+        self.assertIn('same_translate_all && same_source && same_fallback_policy &&',source)
+        self.assertIn('"source_exefs_sha256"',source.replace('\\"', '"'))
+
+    @unittest.skipUnless(os.name == 'nt', 'requires retained Windows Qt/MSVC toolchain')
+    def test_synthetic_export_exefs_replacement(self):
+        run([sys.executable, ROOT/'tests/export_regression/run_fixture.py'])
 
     def test_generated_registry_declares_public_c_entry_points(self):
         # The registration TU is built with the host warning policy, unlike

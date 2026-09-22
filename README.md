@@ -92,7 +92,7 @@ resolved only where CPM had fetched boost.
 
 The `no-jit` downloads are compiled with `-DSUYU_NO_JIT=ON` and audited for Dynarmic build inputs and executable symbols. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
-**Regenerate existing static modules for ABI 4.** Instruction side entries cover aligned addresses inside discovered blocks, and a bounded nonrecursive module loop reduces host dispatch. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
+**Regenerate existing static modules for ABI 5.** ABI 5 validates the generated-image revision, instruction coverage, and memory guards more strictly; ABI 4 bundles are intentionally rejected. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
 
 Current local testing reaches controller prompts, menus, attract rendering and the race starting grid without fallback. The starting grid was verified during a bounded idle observation after the replay ended. Race transitions outlast the JIT fixture; matching timing and full-race validation remain open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
 

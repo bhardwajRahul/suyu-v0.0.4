@@ -2154,6 +2154,12 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
 
     system->SetFilesystem(vfs);
 
+    // Apply the configured version to metadata-free launches, and clear a
+    // previous launch's override when both fields have been reset in Settings.
+    system->SetApplicationVersionOverride(
+        Settings::values.application_version_override.GetValue(),
+        Settings::values.application_display_version_override.GetValue());
+
     if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
         system->GetUserChannel().clear();
     }
@@ -6058,10 +6064,19 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                             : backend_name == QStringLiteral("hybrid")   ? 1
                             : backend_name == QStringLiteral("dynarmic") ? 2
                                                                          : -1;
+                        const int full_scan = params.contains(QStringLiteral("full_scan"))
+                                                  ? (params[QStringLiteral("full_scan")].toBool() ? 1 : 0)
+                                                  : -1;
+                        const auto app_version =
+                            static_cast<quint32>(params[QStringLiteral("app_version")].toInteger());
+                        const QString display_version =
+                            params[QStringLiteral("display_version")].toString();
                         QTimer::singleShot(0, dialog, [dialog, rom_path, output_dir, format_index,
-                                                       backend_index] {
+                                                       backend_index, full_scan, app_version,
+                                                       display_version] {
                             dialog->TriggerExportForTesting(rom_path, output_dir, format_index,
-                                                            backend_index);
+                                                            backend_index, full_scan, app_version,
+                                                            display_version);
                         });
                     } else if (action == QStringLiteral("nintendo_test_one_click")) {
                         // Test-only: directly invoke the One-Click Sign In
@@ -7652,23 +7667,34 @@ void GMainWindow::OnSteamIntegration() {
     SteamIntegration steam(this);
     const bool installed = steam.IsSteamInstalled();
 
-    // Seamless/automated: add suyu itself (icon + overlay-enabled shortcut)
-    // the first time this is opened, so the whole library shows up in Steam
-    // without the user needing to add every game one-by-one. AddGameShortcut
-    // already no-ops if a "suyu" shortcut is already present.
-    bool self_added_this_run = false;
-    if (installed) {
-        self_added_this_run = steam.AddSuyuSelfShortcut();
+    const auto existing_shortcuts = steam.ListShortcuts();
+    const auto self_shortcut = std::find_if(existing_shortcuts.begin(), existing_shortcuts.end(),
+                                            [](const auto& shortcut) {
+                                                return shortcut.app_name == QLatin1String("suyu");
+                                            });
+    const bool self_exists = self_shortcut != existing_shortcuts.end();
+    const bool self_current = self_exists &&
+        QFileInfo(QString(self_shortcut->exe).remove(QLatin1Char('"'))) ==
+            QFileInfo(QCoreApplication::applicationFilePath());
+    bool self_changed_this_run = false;
+    if (installed && !self_current &&
+        QMessageBox::question(
+            this, tr("Steam Integration"),
+            self_exists ? tr("Update your suyu Steam shortcut to this executable?")
+                        : tr("Add suyu to your Steam library? This will create a shortcut "
+                             "with the Steam overlay enabled."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) ==
+            QMessageBox::Yes) {
+        self_changed_this_run = steam.AddSuyuSelfShortcut();
     }
 
     const auto shortcuts = steam.ListShortcuts();
 
     QString message = installed ? tr("Steam is installed.\n") : tr("Steam is not detected.\n");
-    if (self_added_this_run) {
-        message += tr("suyu itself has been added to your Steam library (overlay enabled) - "
-                       "restart Steam to see it.\n");
+    if (self_changed_this_run) {
+        message += tr("suyu's Steam shortcut was added or updated - restart Steam to see it.\n");
     }
-    message += tr("%1 game shortcut(s) currently managed.\n").arg(shortcuts.size());
+    message += tr("%1 shortcut(s) currently managed.\n").arg(shortcuts.size());
     message += tr("Steam is detected by standard install paths, Steam registry settings, or the STEAM_PATH environment variable.\n");
     message += tr("Artwork is fetched from the Steam Store public search endpoint with no API key required.\n");
     message += tr("Add to Steam will still work without custom artwork if a matched store image cannot be found.");

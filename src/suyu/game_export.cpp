@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "suyu/game_export.h"
-#include "suyu/steam_integration.h"
 
 #include <QApplication>
 #include <QBuffer>
 #include <QCheckBox>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QPixmap>
 #include <QDir>
 #include <QDirIterator>
@@ -17,6 +17,9 @@
 #include <QHBoxLayout>
 #include <QDialogButtonBox>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QCloseEvent>
@@ -26,6 +29,7 @@
 #include <QSettings>
 #include <QSizePolicy>
 #include <QStandardPaths>
+#include <QStandardItemModel>
 #include <QTextStream>
 #include <QThread>
 #include <QVBoxLayout>
@@ -42,6 +46,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/settings.h"
 #ifndef SUYU_NO_JIT
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -348,15 +353,17 @@ void GameExportDialog::SetupUi() {
 
     // AOT options
     aot_full_scan_checkbox = new QCheckBox(
-        tr("Full code scan (slower — pre-compiles more blocks for better cold-start)"), this);
+        tr("Full code scan (currently no additional generated code)"), this);
     aot_full_scan_checkbox->setChecked(false);
+    aot_full_scan_checkbox->setToolTip(
+        tr("This mode currently produces the same generated code and does not improve cold boot."));
     layout->addWidget(aot_full_scan_checkbox);
 
-    steam_shortcut_checkbox = new QCheckBox(tr("Add to Steam library when the export finishes"), this);
+    steam_shortcut_checkbox =
+        new QCheckBox(tr("Add to Steam library when the export finishes (unavailable)"), this);
     steam_shortcut_checkbox->setChecked(false);
     steam_shortcut_checkbox->setToolTip(
-        tr("Creates a non-Steam shortcut for the exported game and pulls its store artwork "
-           "into Steam, so it shows up in the library with a proper grid image."));
+        tr("Steam shortcuts for exported standalone launchers are not available yet."));
     layout->addWidget(steam_shortcut_checkbox);
 
     steam_replace_rom_checkbox =
@@ -367,8 +374,11 @@ void GameExportDialog::SetupUi() {
            "is removed first, so the recompiled build takes its place instead of appearing "
            "alongside it. Uncheck to keep both entries."));
     layout->addWidget(steam_replace_rom_checkbox);
-    connect(steam_shortcut_checkbox, &QCheckBox::toggled, steam_replace_rom_checkbox,
-            &QWidget::setEnabled);
+    connect(steam_shortcut_checkbox, &QCheckBox::toggled, this, [this](bool enabled) {
+        steam_replace_rom_checkbox->setEnabled(
+            enabled && platform_combo->currentData().toInt() ==
+                           static_cast<int>(TargetPlatform::Windows));
+    });
     steam_replace_rom_checkbox->setEnabled(false);
 
     fallback_to_interpreter_checkbox = new QCheckBox(
@@ -471,15 +481,54 @@ void GameExportDialog::SetupUi() {
     connect(rom_browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseRom);
     connect(browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseOutput);
     connect(export_button, &QPushButton::clicked, this, &GameExportDialog::OnExport);
-    const auto update_backend_options = [this, note_label](int) {
+    const auto update_options = [this, note_label](int) {
+        const bool is_windows = platform_combo->currentData().toInt() ==
+                                static_cast<int>(TargetPlatform::Windows);
+#ifndef SUYU_NO_JIT
+        // The exporter has no non-Windows JIT package path. Disable the
+        // selectable item as well as the later export guard.
+        const int jit_index = backend_combo->findData(static_cast<int>(RecompileBackend::Dynarmic));
+        if (jit_index >= 0) {
+            if (auto* model = qobject_cast<QStandardItemModel*>(backend_combo->model())) {
+                model->item(jit_index)->setEnabled(is_windows);
+            }
+            if (!is_windows && backend_combo->currentIndex() == jit_index) {
+                backend_combo->setCurrentIndex(0);
+            }
+        }
+#endif
         const auto backend =
             static_cast<RecompileBackend>(backend_combo->currentData().toInt());
         const bool uses_aot = backend != RecompileBackend::Dynarmic;
         const bool is_hybrid = backend == RecompileBackend::Hybrid;
-        aot_full_scan_checkbox->setEnabled(uses_aot);
+        aot_full_scan_checkbox->setEnabled(false);
         fallback_to_interpreter_checkbox->setEnabled(is_hybrid);
         fallback_to_interpreter_checkbox->setChecked(is_hybrid);
-        output_format_combo->setEnabled(uses_aot);
+        // Only the Windows package path currently bundles a runtime executable.
+        // Do not offer Build where it would produce source artifacts and then
+        // report success as though a standalone program had been made.
+        output_format_combo->setEnabled(uses_aot && is_windows);
+        if (!is_windows) {
+            output_format_combo->setCurrentIndex(0);
+            output_format_combo->setToolTip(
+                tr("Build is available for Windows exports only. Linux and macOS exports "
+                   "currently contain source artifacts and no bundled runtime."));
+        } else {
+            output_format_combo->setToolTip(
+                tr("Source writes the recompiled C plus a CMakeLists.txt and a build script, and stops "
+                   "there. Build additionally runs CMake to completion, producing the standalone "
+                   "'recompiled' executable and the shared library suyu loads to run the game on its own "
+                   "recompiler. Build can take hours on large titles; the window stays responsive while "
+                   "it works."));
+        }
+        // AddGameShortcut launches suyu with -g; it cannot faithfully publish
+        // the standalone launcher produced here. Keep this disabled until the
+        // Steam integration provides a launcher-specific, durable API.
+        steam_shortcut_checkbox->setChecked(false);
+        steam_shortcut_checkbox->setEnabled(false);
+        steam_shortcut_checkbox->setToolTip(
+            tr("Steam shortcuts for exported standalone launchers are not available yet."));
+        steam_replace_rom_checkbox->setEnabled(false);
         if (backend == RecompileBackend::SuyuStatic) {
             note_label->setText(
                 tr("Experimental: translates the game's ARM64 code ahead of time with no JIT "
@@ -497,8 +546,202 @@ void GameExportDialog::SetupUi() {
         }
     };
     connect(backend_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            update_backend_options);
-    update_backend_options(backend_combo->currentIndex());
+            update_options);
+    connect(platform_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            update_options);
+    update_options(backend_combo->currentIndex());
+}
+
+// Deconstructed titles keep the multi-gigabyte RomFS beside the NSOs. Stage
+// only executable files for analysis; RomFS is streamed once during packaging.
+static bool CopyDeconstructedExeFs(const QString& src, const QString& dst) {
+    const QDir source(src);
+    if (!source.exists()) {
+        return false;
+    }
+    const QString source_path = source.canonicalPath();
+    const QDir destination(dst);
+    const QString destination_path = destination.exists() ? destination.canonicalPath()
+                                                          : destination.absolutePath();
+#ifdef _WIN32
+    constexpr auto path_case = Qt::CaseInsensitive;
+#else
+    constexpr auto path_case = Qt::CaseSensitive;
+#endif
+    if (source_path.compare(destination_path, path_case) == 0 ||
+        source_path.startsWith(destination_path + QLatin1Char('/'), path_case) ||
+        (QDir(dst).exists() && !QDir(dst).removeRecursively()) || !QDir().mkpath(dst)) {
+        return false;
+    }
+    for (const QFileInfo& entry : source.entryInfoList(QDir::Files | QDir::NoDotAndDotDot)) {
+        if (entry.fileName().compare(QStringLiteral("romfs.bin"), Qt::CaseInsensitive) == 0) {
+            continue;
+        }
+        if (!CopyFileReplacingExisting(entry.absoluteFilePath(),
+                                       dst + QDir::separator() + entry.fileName())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Fingerprint the effective files the recompiler will consume, including the
+// file names. A ROM path or mtime alone does not identify an installed update.
+static QString HashExeFsFiles(const FileSys::VirtualDir& vdir, const QString& directory) {
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    constexpr u64 chunk_size = 4ULL * 1024 * 1024;
+    const auto add_file_identity = [&hash](const QByteArray& name, u64 size) {
+        hash.addData(QByteArray::number(name.size()));
+        hash.addData(QByteArrayView(":", 1));
+        hash.addData(name);
+        hash.addData(QByteArrayView(":", 1));
+        hash.addData(QByteArray::number(size));
+        hash.addData(QByteArrayView(":", 1));
+    };
+    if (vdir) {
+        auto files = vdir->GetFiles();
+        std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+            return a->GetName() < b->GetName();
+        });
+        if (files.empty()) {
+            return {};
+        }
+        for (const auto& file : files) {
+            const QByteArray name = QByteArray::fromStdString(file->GetName());
+            add_file_identity(name, file->GetSize());
+            for (u64 offset = 0; offset < file->GetSize(); offset += chunk_size) {
+                const u64 length = std::min(chunk_size, file->GetSize() - offset);
+                const auto bytes = file->ReadBytes(length, offset);
+                if (bytes.size() != length) {
+                    return {};
+                }
+                hash.addData(QByteArrayView(reinterpret_cast<const char*>(bytes.data()),
+                                            static_cast<qsizetype>(bytes.size())));
+            }
+        }
+    } else {
+        const QDir dir(directory);
+        if (!dir.exists()) {
+            return {};
+        }
+        const auto files = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+        bool found = false;
+        for (const auto& info : files) {
+            if (info.fileName().compare(QStringLiteral("romfs.bin"), Qt::CaseInsensitive) == 0) {
+                continue;
+            }
+            found = true;
+            const QByteArray name = info.fileName().toUtf8();
+            add_file_identity(name, info.size());
+            QFile file(info.absoluteFilePath());
+            if (!file.open(QIODevice::ReadOnly)) {
+                return {};
+            }
+            qint64 remaining = info.size();
+            while (remaining > 0) {
+                const QByteArray bytes = file.read(std::min<qint64>(remaining, chunk_size));
+                if (bytes.isEmpty()) {
+                    return {};
+                }
+                hash.addData(bytes);
+                remaining -= bytes.size();
+            }
+        }
+        if (!found) {
+            return {};
+        }
+    }
+    return QString::fromLatin1(hash.result().toHex());
+}
+
+static bool PrepareAotSourcePackage(const QString& pkg_dir, const QString& package_name,
+                                    const QString& cache_dir) {
+    // A prior Build can leave a launcher in the same package. Source is C only.
+    const auto remove_file = [](const QString& path) {
+        return !QFile::exists(path) || QFile::remove(path);
+    };
+    if (!remove_file(pkg_dir + QDir::separator() + package_name + QStringLiteral(".exe")) ||
+        !remove_file(pkg_dir + QStringLiteral("/launch.bat"))) {
+        return false;
+    }
+    for (const char* dll : {"avcodec-61.dll", "avformat-61.dll", "avutil-59.dll",
+                            "dxcompiler.dll", "dxil.dll", "libcrypto.dll", "libssl.dll",
+                            "libcrypto-3-x64.dll", "libssl-3-x64.dll", "swresample-5.dll",
+                            "swscale-8.dll"}) {
+        if (!remove_file(pkg_dir + QDir::separator() + QString::fromLatin1(dll))) {
+            return false;
+        }
+    }
+    const QString stale_launcher_dir = cache_dir + QStringLiteral("/launcher");
+    if (QDir(stale_launcher_dir).exists() && !QDir(stale_launcher_dir).removeRecursively()) {
+        return false;
+    }
+    QFile readme(pkg_dir + QDir::separator() + QStringLiteral("README_NATIVE_EXPORT.txt"));
+    if (!readme.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        return false;
+    }
+    QTextStream out(&readme);
+    out << "AOT source export; no compiled launcher is included.\n\n"
+           "Generated C, CMake project files, and build scripts are in aot_cache/.\n"
+           "The extracted ExeFS and RomFS are in exefs/.\n"
+           "Compile the generated project before attempting to run this export.\n";
+    return out.status() == QTextStream::Ok;
+}
+
+static bool ReadCachedFallbackPolicy(const QByteArray& manifest, bool requested,
+                                     QStringList& cached_modules) {
+    const auto document = QJsonDocument::fromJson(manifest);
+    if (!document.isObject()) {
+        return false;
+    }
+    const auto object = document.object();
+    if (!object.contains(QStringLiteral("fallback_enabled")) ||
+        !object.value(QStringLiteral("fallback_enabled")).isBool() ||
+        object.value(QStringLiteral("fallback_enabled")).toBool() != requested ||
+        !object.value(QStringLiteral("fallback_modules")).isArray()) {
+        return false;
+    }
+    QStringList modules;
+    for (const auto& value : object.value(QStringLiteral("fallback_modules")).toArray()) {
+        if (!value.isString()) {
+            return false;
+        }
+        modules.append(value.toString());
+    }
+    if (!requested && !modules.isEmpty()) {
+        return false;
+    }
+    cached_modules = std::move(modules);
+    return true;
+}
+
+static bool WritePortableVersionOverride(const QString& config_path, u32 app_version,
+                                         const QString& display_version) {
+    if (app_version == 0 && !QFile::exists(config_path)) {
+        return true;
+    }
+    if (app_version != 0 && !QDir().mkpath(QFileInfo(config_path).absolutePath())) {
+        return false;
+    }
+    QSettings portable(config_path, QSettings::IniFormat);
+    const QString number = QStringLiteral("System/application_version_override");
+    const QString display = QStringLiteral("System/application_display_version_override");
+    if (app_version != 0) {
+        portable.setValue(number, app_version);
+        portable.setValue(number + QStringLiteral("\\default"), false);
+        portable.setValue(number + QStringLiteral("\\use_global"), true);
+        portable.setValue(display, display_version);
+        portable.setValue(display + QStringLiteral("\\default"), false);
+        portable.setValue(display + QStringLiteral("\\use_global"), true);
+    } else {
+        for (const auto& key : {number, display}) {
+            portable.remove(key);
+            portable.remove(key + QStringLiteral("\\default"));
+            portable.remove(key + QStringLiteral("\\use_global"));
+        }
+    }
+    portable.sync();
+    return portable.status() == QSettings::NoError;
 }
 
 void GameExportDialog::SetLibraryEntries(QVector<LibraryEntry> entries) {
@@ -526,7 +769,9 @@ void GameExportDialog::SetRomPath(const QString& path, quint64 program_id) {
 }
 
 void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QString& output_dir,
-                                               int format_index, int backend_index) {
+                                               int format_index, int backend_index,
+                                               int full_scan, quint32 app_version,
+                                               const QString& display_version) {
     // Backend first: changing it re-runs the backend-options handler, which
     // rewrites the fallback checkbox and the Export Format combo's enabled
     // state. Applying format first would just be undone here.
@@ -538,6 +783,11 @@ void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QS
         output_format_combo->setCurrentIndex(format_index);
     }
     SetRomPath(rom_path);
+    test_app_version = app_version;
+    test_display_version = display_version;
+    if (full_scan >= 0 && aot_full_scan_checkbox) {
+        aot_full_scan_checkbox->setChecked(full_scan != 0);
+    }
     output_path_edit->setText(output_dir);
     test_driven_export = true;
     test_export_has_result = false;
@@ -545,6 +795,8 @@ void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QS
     test_export_output.clear();
     OnExport();
     test_driven_export = false;
+    test_app_version = 0;
+    test_display_version.clear();
 }
 
 bool GameExportDialog::IsExportInProgressForTesting() const {
@@ -1256,8 +1508,11 @@ static qint64 DumpVirtualDir(const FileSys::VirtualDir& vdir, const QString& des
         const auto data = f->ReadAllBytes();
         QFile out(dest_dir + QLatin1Char('/') + QString::fromStdString(f->GetName()));
         if (!out.open(QIODevice::WriteOnly)) return -1;
-        out.write(reinterpret_cast<const char*>(data.data()),
-                  static_cast<qint64>(data.size()));
+        if (out.write(reinterpret_cast<const char*>(data.data()),
+                      static_cast<qint64>(data.size())) != static_cast<qint64>(data.size()) ||
+            !out.flush() || out.error() != QFile::NoError) {
+            return -1;
+        }
         total += static_cast<qint64>(data.size());
     }
     for (const auto& sub : vdir->GetSubdirectories()) {
@@ -1269,8 +1524,18 @@ static qint64 DumpVirtualDir(const FileSys::VirtualDir& vdir, const QString& des
     return total;
 }
 
-// Extract the romfs VirtualFile from a ROM (NSP/XCI/NCA). Returns nullptr if not available.
-static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path) {
+// Extract the same effective RomFS that the loader uses for the Program NCA.
+// The ExeFS extractor above selects the effective update via PatchManager;
+// packaging a base RomFS beside that ExeFS makes an internally inconsistent
+// standalone bundle. Returns nullptr when that paired view cannot be built.
+static bool HasUnpairedStandaloneNcaUpdate(const FileSys::VirtualFile& base_romfs,
+                                           const FileSys::VirtualFile& resolved_romfs) {
+    return resolved_romfs && resolved_romfs != base_romfs;
+}
+
+static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path,
+                                                Core::System& system,
+                                                const FileSys::VirtualDir& effective_exefs) {
     // RealVfsFile holds a raw RealVfsFilesystem& (not a shared_ptr), so a
     // locally-scoped vfs would dangle once files it opened outlive this
     // function - keep one filesystem instance alive for the process.
@@ -1281,10 +1546,47 @@ static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path) {
     auto pos = name.rfind('.'); std::string ext;
     if (pos != std::string::npos) { ext = name.substr(pos); std::transform(ext.begin(),ext.end(),ext.begin(),::tolower); }
 
-    const auto romfs_from_nsp = [](const std::shared_ptr<FileSys::NSP>& nsp) -> FileSys::VirtualFile {
+    const auto validate_base_fallback = [&effective_exefs](
+                                            const FileSys::VirtualDir& base_exefs,
+                                            const FileSys::VirtualFile& base_romfs,
+                                            const FileSys::VirtualFile& resolved_romfs)
+        -> FileSys::VirtualFile {
+        if (!resolved_romfs) {
+            return nullptr;
+        }
+        if (resolved_romfs == base_romfs) {
+            const QString base_hash = HashExeFsFiles(base_exefs, {});
+            const QString effective_hash = HashExeFsFiles(effective_exefs, {});
+            if (base_hash.isEmpty() || effective_hash.isEmpty() || base_hash != effective_hash) {
+                LOG_ERROR(Frontend,
+                          "Effective ExeFS differs from base but RomFS fell back to base; "
+                          "refusing an inconsistent export");
+                return nullptr;
+            }
+        }
+        return resolved_romfs;
+    };
+
+    const auto romfs_from_nsp = [&system, &validate_base_fallback](
+                                    const std::shared_ptr<FileSys::NSP>& nsp)
+        -> FileSys::VirtualFile {
         if (nsp->GetStatus() != Loader::ResultStatus::Success) return nullptr;
-        const auto nca = nsp->GetNCA(nsp->GetProgramTitleID(), FileSys::ContentRecordType::Program);
-        return nca ? nca->GetRomFS() : nullptr;
+        const auto title_id = nsp->GetProgramTitleID();
+        const auto base_nca = nsp->GetNCA(title_id, FileSys::ContentRecordType::Program);
+        if (!base_nca || !base_nca->GetRomFS()) {
+            return nullptr;
+        }
+        const auto update_id = FileSys::GetUpdateTitleID(title_id);
+        const auto packed_update = nsp->GetNCAFile(update_id,
+                                                    FileSys::ContentRecordType::Program,
+                                                    FileSys::TitleType::Update);
+        const FileSys::PatchManager pm{title_id, system.GetFileSystemController(),
+                                       system.GetContentProvider()};
+        const auto base_romfs = base_nca->GetRomFS();
+        const auto resolved = pm.PatchRomFS(base_nca.get(), base_romfs,
+                                            FileSys::ContentRecordType::Program,
+                                            packed_update, false);
+        return validate_base_fallback(base_nca->GetExeFS(), base_romfs, resolved);
     };
 
     if (ext == ".nsp") {
@@ -1300,8 +1602,25 @@ static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path) {
     }
     if (ext == ".nca") {
         auto nca = std::make_shared<FileSys::NCA>(file);
-        if (nca->GetStatus() == Loader::ResultStatus::Success)
-            return nca->GetRomFS();
+        if (nca->GetStatus() == Loader::ResultStatus::Success && nca->GetRomFS()) {
+            const auto title_id = nca->GetTitleId();
+            const FileSys::PatchManager pm{title_id, system.GetFileSystemController(),
+                                           system.GetContentProvider()};
+            const auto base_romfs = nca->GetRomFS();
+            const auto resolved = pm.PatchRomFS(nca.get(), base_romfs,
+                                                FileSys::ContentRecordType::Program,
+                                                nullptr, false);
+            // Standalone NCA ExeFS extraction currently uses this NCA alone.
+            // PatchRomFS can select an installed update independently; without
+            // selecting that update's ExeFS as well, this pair is unproven.
+            if (HasUnpairedStandaloneNcaUpdate(base_romfs, resolved)) {
+                LOG_ERROR(Frontend,
+                          "Standalone NCA RomFS resolved to an update while ExeFS remains "
+                          "from the input NCA; refusing an inconsistent export");
+                return nullptr;
+            }
+            return validate_base_fallback(nca->GetExeFS(), base_romfs, resolved);
+        }
     }
     return nullptr;
 }
@@ -1572,51 +1891,31 @@ static int RunProcessDrained(QProcess& proc, const QString& program, const QStri
 // AOT Pre-compilation — Real Implementation
 // ---------------------------------------------------------------------------
 
-// Optionally publish the finished build to Steam. A recompiled export is an
-// ordinary executable, so the shortcut needs no launch options and no emulator
-// behind it - which also means any shortcut the user already has for this title
-// (the ROM, launched through suyu) now points at the worse of the two.
-// Replacing it is the default, with a checkbox for anyone who wants both.
-void GameExportDialog::MaybeAddToSteam(const QString& game_name, const QString& exe_path) {
-    if (steam_shortcut_checkbox == nullptr || !steam_shortcut_checkbox->isChecked()) {
-        return;
-    }
-    SteamIntegration steam;
-    if (!steam.IsSteamInstalled()) {
-        if (status_label != nullptr) {
-            status_label->setText(tr("Steam not found - skipped library shortcut."));
-        }
-        return;
-    }
-    if (steam_replace_rom_checkbox != nullptr && steam_replace_rom_checkbox->isChecked()) {
-        steam.RemoveGameShortcut(game_name);
-    }
-    const bool added = steam.AddGameShortcut(game_name, exe_path, exe_path);
-    if (added) {
-        // Grid art is what makes the entry read as a real game rather than a
-        // generic shortcut; fetched by title from Steam's public endpoints.
-        const QString userdata = steam.GetSteamUserdataPath();
-        if (!userdata.isEmpty()) {
-            steam.FetchArtwork(game_name, userdata);
-        }
-    }
-    if (status_label != nullptr) {
-        status_label->setText(added ? tr("Added \"%1\" to the Steam library.").arg(game_name)
-                                    : tr("Could not add \"%1\" to Steam.").arg(game_name));
-    }
-}
-
 bool GameExportDialog::WantsCompiledOutput() const {
-    return output_format_combo && output_format_combo->currentIndex() == 1;
+    return output_format_combo && platform_combo &&
+           platform_combo->currentData().toInt() == static_cast<int>(TargetPlatform::Windows) &&
+           output_format_combo->currentIndex() == 1;
 }
 
 QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                            const QString& cache_dir,
                                            RecompileBackend backend,
                                            const QString& game_name) {
-    QDir().mkpath(cache_dir);
-
     const QString manifest_path = cache_dir + QDir::separator() + QStringLiteral("aot_manifest.json");
+    const QString rom_path = rom_path_edit->text();
+    const bool packaged_rom = QFileInfo(rom_path).isFile();
+    const auto source_exefs = packaged_rom
+                                  ? ExtractExeFsFromRom(rom_path.toStdString(), system_)
+                                  : FileSys::VirtualDir{};
+    if (packaged_rom && !source_exefs) {
+        LOG_ERROR(Frontend, "Could not resolve the effective ExeFS for AOT export");
+        return {};
+    }
+    const QString source_hash = HashExeFsFiles(source_exefs, exefs_dir);
+    if (source_hash.isEmpty()) {
+        LOG_ERROR(Frontend, "Could not fingerprint the effective ExeFS for AOT export");
+        return {};
+    }
 
     // blockmaps/, ir/ and code/ are debugging material for a codegen stage that
     // no longer exists: nothing in suyu or in the generated project reads any of
@@ -1635,14 +1934,10 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     const QString blockmap_dir = debug_root + QDir::separator() + QStringLiteral("blockmaps");
     const QString code_dir = debug_root + QDir::separator() + QStringLiteral("code");
     const QString ir_dir = debug_root + QDir::separator() + QStringLiteral("ir");
-    if (dump_debug_artifacts) {
-        QDir().mkpath(blockmap_dir);
-        QDir().mkpath(code_dir);
-        QDir().mkpath(ir_dir);
-    }
-
     const bool full_scan = aot_full_scan_checkbox->isChecked();
     const bool is_hybrid = backend == RecompileBackend::Hybrid;
+    const bool fallback_enabled = is_hybrid && fallback_to_interpreter_checkbox &&
+                                  fallback_to_interpreter_checkbox->isChecked();
     const QString requested_backend_name =
         is_hybrid ? QStringLiteral("suyu-hybrid") : QStringLiteral("suyu-static");
     const QString effective_backend_name = requested_backend_name;
@@ -1654,7 +1949,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     if (QFile::exists(manifest_path)) {
         QFile manifest(manifest_path);
         if (manifest.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            const QString contents = QString::fromUtf8(manifest.readAll());
+            const QByteArray manifest_bytes = manifest.readAll();
+            const QString contents = QString::fromUtf8(manifest_bytes);
             const bool same_scan = contents.contains(
                 QStringLiteral("\"full_scan\": ") + (full_scan ? QStringLiteral("true")
                                                                   : QStringLiteral("false")));
@@ -1674,13 +1970,35 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const bool same_translate_all = contents.contains(
                 QStringLiteral("\"translate_all\": ") +
                 (translate_all ? QStringLiteral("true,") : QStringLiteral("false,")));
+            const bool same_source = contents.contains(
+                QStringLiteral("\"source_exefs_sha256\": \"") + source_hash +
+                QStringLiteral("\""));
+            QStringList cached_fallback_modules;
+            const bool same_fallback_policy = ReadCachedFallbackPolicy(
+                manifest_bytes, fallback_enabled, cached_fallback_modules);
             if (same_scan && same_backend && same_image_abi && same_correctness_revision &&
-                same_translate_all &&
+                same_translate_all && same_source && same_fallback_policy &&
                 has_recompiled_project && has_required_launcher) {
+                last_fallback_modules = std::move(cached_fallback_modules);
                 LOG_INFO(Frontend, "Reusing completed AOT cache at {}", cache_dir.toStdString());
                 return cache_dir;
             }
         }
+    }
+
+    // A changed input may have removed modules. Rebuild the owned cache from
+    // an empty tree so no generated C or launcher survives from that input.
+    if (QDir(cache_dir).exists() && !QDir(cache_dir).removeRecursively()) {
+        LOG_ERROR(Frontend, "Could not clear stale AOT cache at {}", cache_dir.toStdString());
+        return {};
+    }
+    if (!QDir().mkpath(cache_dir)) {
+        return {};
+    }
+    if (dump_debug_artifacts) {
+        QDir().mkpath(blockmap_dir);
+        QDir().mkpath(code_dir);
+        QDir().mkpath(ir_dir);
     }
 
     // Collect NSO files to analyze — either from VFS (ROM containers) or from extracted ExeFS
@@ -1688,10 +2006,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     bool used_vfs = false;
 
     // First, try to open the ROM via VFS to extract ExeFS directly
-    const QString rom_path = rom_path_edit->text();
     if (!rom_path.isEmpty() && QFile::exists(rom_path) && QFileInfo(rom_path).isFile()) {
         const auto t_extract_start = std::chrono::steady_clock::now();
-        auto exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString(), system_);
+        auto exefs_vdir = source_exefs;
         const auto t_extract_end = std::chrono::steady_clock::now();
         LOG_INFO(Frontend, "AOT diag: ExtractExeFsFromRom took {} ms",
                  std::chrono::duration_cast<std::chrono::milliseconds>(t_extract_end - t_extract_start).count());
@@ -1773,7 +2090,10 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
 
     // Fallback: read NSO files from the extracted exefs directory on disk
     if (!used_vfs && QDir(exefs_dir).exists()) {
-        CopyDirectoryRecursive(exefs_dir, cache_dir + QDir::separator() + QStringLiteral("exefs"));
+        if (!CopyDeconstructedExeFs(exefs_dir,
+                                    cache_dir + QDir::separator() + QStringLiteral("exefs"))) {
+            return QString();
+        }
 
         // RealVfsFile holds a raw RealVfsFilesystem& (not a shared_ptr), so a
     // locally-scoped vfs would dangle once files it opened outlive this
@@ -1847,9 +2167,6 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             }
         }
     }
-
-    const bool fallback_enabled = is_hybrid && fallback_to_interpreter_checkbox &&
-                                  fallback_to_interpreter_checkbox->isChecked();
 
     u64 recomp_total_blocks = 0;
     QStringList recomp_module_dirs;
@@ -2255,7 +2572,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         mod_build, cmake_exe,
                         {QStringLiteral("--build"), build_tree, QStringLiteral("--target"),
                          QStringLiteral("recomp_static_") + m, QStringLiteral("--config"),
-                         QStringLiteral("Release")},
+                         QStringLiteral("Release"), QStringLiteral("--parallel"),
+                         QStringLiteral("2")},
                         &mod_log);
                     if (mod_rc == 0) {
                         continue;
@@ -2325,7 +2643,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                              QStringLiteral("--target"),
                                              QStringLiteral("suyu-cmd-static"),
                                              QStringLiteral("--config"), QStringLiteral("Release"),
-                                             QStringLiteral("--parallel")},
+                                             QStringLiteral("--parallel"), QStringLiteral("2")},
                                             &link_log);
                 if (link_rc != 0) {
                     LOG_ERROR(Frontend, "suyu-cmd-static failed to link:\n{}",
@@ -2463,6 +2781,13 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         }
     }
 
+    // Write the final fallback outcome, including compile-time module failures.
+    last_fallback_modules = fallback_modules;
+    QJsonArray fallback_array;
+    for (const auto& module : fallback_modules) {
+        fallback_array.append(module);
+    }
+
     // Write the AOT manifest with real analysis results
     QFile manifest(manifest_path);
     if (manifest.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -2471,10 +2796,15 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         out << "  \"version\": 2,\n";
         out << "  \"image_abi\": 5,\n";
         out << "  \"correctness_revision\": \"20260920-fixedpoint-v1\",\n";
+        out << "  \"source_exefs_sha256\": \"" << source_hash << "\",\n";
         out << "  \"translate_all\": " << (translate_all ? "true" : "false") << ",\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
         out << "  \"effective_backend\": \"" << effective_backend_name << "\",\n";
         out << "  \"full_scan\": " << (full_scan ? "true" : "false") << ",\n";
+        out << "  \"fallback_enabled\": " << (fallback_enabled ? "true" : "false") << ",\n";
+        out << "  \"fallback_modules\": "
+            << QString::fromUtf8(QJsonDocument(fallback_array).toJson(QJsonDocument::Compact))
+            << ",\n";
         out << "  \"total_modules\": " << module_results.size() << ",\n";
         out << "  \"total_blocks_analyzed\": " << total_blocks << ",\n";
         out << "  \"total_instructions\": " << total_instructions << ",\n";
@@ -2573,8 +2903,8 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         out << (uses_aot ? "Recompiled from: " : "JIT baseline exported from: ")
             << QDir::toNativeSeparators(rom_path) << "\n";
         if (uses_aot) {
-            out << "The ROM is referenced, not bundled - the generated project runs from the guest\n"
-                << "segments in aot_cache/recompiled/<module>/data and does not read this file.\n";
+            out << "This path records provenance. The original container is not copied;\n"
+                << "effective ExeFS and RomFS content is extracted into this package.\n";
         } else {
             out << "The packaged executable runs the extracted game code through Dynarmic.\n";
         }
@@ -2588,57 +2918,65 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             return false;
         }
 
-        // A prior export into this same folder may have been "Build" format
-        // and left a compiled launcher exe + its DLLs sitting in pkg_dir. If
-        // this run is "Source" (or otherwise not producing a compiled
-        // launcher), that stale exe is never touched by anything below - it
-        // just sits there looking like part of the new export. Strip it so a
-        // format switch on the same output folder doesn't leave orphaned
-        // binaries next to freshly generated C source.
-        if (uses_aot && !WantsCompiledOutput()) {
-            QFile::remove(pkg_dir + QDir::separator() + package_name + QStringLiteral(".exe"));
-            for (const char* dll : {"avcodec-61.dll", "avformat-61.dll", "avutil-59.dll",
-                                     "dxcompiler.dll", "dxil.dll", "libcrypto.dll", "libssl.dll",
-                                     "swresample-5.dll", "swscale-8.dll"}) {
-                QFile::remove(pkg_dir + QDir::separator() + QString::fromLatin1(dll));
-            }
-        }
-
         // ── Extract exefs (NSO executables) → <pkg>/exefs/ ──────────────────────
         // This gives the package the same structure as Switch ROM viewers show.
         // suyu-cmd auto-detects exefs/main next to it and loads from there.
         const QString exefs_dst = pkg_dir + QStringLiteral("/exefs");
-        auto exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString(), system_);
-        if (exefs_vdir) {
-            DumpVirtualDir(exefs_vdir, exefs_dst);
+        const bool deconstructed = QDir(rom_path).exists();
+        const QString source_exefs = QDir(rom_path).exists(QStringLiteral("exefs"))
+                                         ? rom_path + QStringLiteral("/exefs") : rom_path;
+        if (!deconstructed && QDir(exefs_dst).exists() &&
+            !QDir(exefs_dst).removeRecursively()) {
+            LOG_ERROR(Frontend, "Could not clear old packaged ExeFS");
+            return false;
+        }
+        auto exefs_vdir = deconstructed ? FileSys::VirtualDir{}
+                                       : ExtractExeFsFromRom(rom_path.toStdString(), system_);
+        const bool exefs_ok = deconstructed
+                                  ? CopyDeconstructedExeFs(source_exefs, exefs_dst)
+                                  : exefs_vdir && DumpVirtualDir(exefs_vdir, exefs_dst) >= 0;
+        if (!exefs_ok || !QFile::exists(exefs_dst + QStringLiteral("/main"))) {
+            LOG_ERROR(Frontend, "Could not extract the effective ExeFS for export");
+            return false;
         }
 
         // ── Extract romfs → <pkg>/exefs/romfs.bin ────────────────────────────────
         // DeconstructedRomDirectory loader looks for a .romfs file alongside the NSOs.
         // Romfs can be several GB — only extract if VFS gives it without copying the file.
-        if (exefs_vdir) {
-            auto romfs_vf = ExtractRomFsFromRom(rom_path.toStdString());
-            if (romfs_vf) {
-                // Always extract the decrypted romfs into the package so the
-                // export is genuinely standalone: no original ROM file and no
-                // keys required at runtime (only at export time, on this
-                // machine, to read the source ROM once). Streamed in chunks -
-                // romfs can be many GB and ReadAllBytes() would double the
-                // package's peak memory use for no benefit.
-                QFile rf(exefs_dst + QStringLiteral("/romfs.bin"));
-                if (rf.open(QIODevice::WriteOnly)) {
-                    constexpr u64 kChunk = 64ULL * 1024 * 1024;
-                    const u64 total = romfs_vf->GetSize();
-                    for (u64 off = 0; off < total; off += kChunk) {
-                        const u64 len = std::min(kChunk, total - off);
-                        const auto bytes = romfs_vf->ReadBytes(len, off);
-                        rf.write(reinterpret_cast<const char*>(bytes.data()),
-                                 static_cast<qint64>(bytes.size()));
-                    }
-                    rf.close();
-                }
+        static const auto export_vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+        auto romfs_vf = deconstructed
+                            ? export_vfs->OpenFile(QString(source_exefs + QStringLiteral("/romfs.bin"))
+                                                       .toStdString(), FileSys::OpenMode::Read)
+                            : ExtractRomFsFromRom(rom_path.toStdString(), system_, exefs_vdir);
+        if (!romfs_vf) {
+            LOG_ERROR(Frontend, "Could not extract the effective RomFS for export");
+            return false;
+        }
+        // Always extract the decrypted RomFS into the package so the export is
+        // genuinely standalone. Streamed in chunks because RomFS can be many GB.
+        QFile rf(exefs_dst + QStringLiteral("/romfs.bin"));
+        if (!rf.open(QIODevice::WriteOnly)) {
+            LOG_ERROR(Frontend, "Could not open packaged RomFS for writing: {}",
+                      rf.errorString().toStdString());
+            return false;
+        }
+        constexpr u64 kChunk = 64ULL * 1024 * 1024;
+        const u64 total = romfs_vf->GetSize();
+        for (u64 off = 0; off < total; off += kChunk) {
+            const u64 len = std::min(kChunk, total - off);
+            const auto bytes = romfs_vf->ReadBytes(len, off);
+            if (bytes.size() != len ||
+                rf.write(reinterpret_cast<const char*>(bytes.data()),
+                         static_cast<qint64>(bytes.size())) != static_cast<qint64>(len)) {
+                LOG_ERROR(Frontend, "RomFS stream failed at offset {} of {} bytes", off, total);
+                return false;
             }
         }
+        if (!rf.flush() || rf.error() != QFile::NoError || rf.size() != static_cast<qint64>(total)) {
+            LOG_ERROR(Frontend, "RomFS write did not complete: {}", rf.errorString().toStdString());
+            return false;
+        }
+        rf.close();
 
         // Bundle suyu-cmd.exe (renamed to the game name) and its runtime DLLs so the
         // package runs standalone — suyu-cmd provides the HLE+GPU+audio stack.
@@ -2659,12 +2997,15 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // it" rather than a native game) only makes sense for Source-format
         // exports, where the user asked for the C project instead of a
         // compiled binary.
-        if (uses_aot && !has_static_launcher) {
+        if (uses_aot && (!has_static_launcher || !WantsCompiledOutput())) {
             write_source_reference(pkg_dir);
             if (!CopyDirectoryUnlessInPlace(
-                    cache_dir, pkg_dir + QDir::separator() + QStringLiteral("aot_cache"))) {
+                     cache_dir, pkg_dir + QDir::separator() + QStringLiteral("aot_cache"))) {
                 return false;
             }
+        }
+        if (uses_aot && !WantsCompiledOutput()) {
+            return PrepareAotSourcePackage(pkg_dir, package_name, cache_dir);
         }
         // has_static_launcher's aot_cache cleanup happens further down, after
         // static_launcher.exe has been copied out of it to its final path -
@@ -2694,16 +3035,24 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         const QString launcher_src = has_static_launcher
                                          ? static_launcher
                                          : bin_dir + QStringLiteral("/suyu-cmd.exe");
-        if (!uses_aot && !QFile::exists(launcher_src)) {
-            LOG_ERROR(Frontend, "Dynarmic baseline launcher was not found: {}",
+        if (!QFile::exists(launcher_src)) {
+            LOG_ERROR(Frontend, "Export launcher was not found: {}",
                       launcher_src.toStdString());
             return false;
         }
         const QString launcher_dst =
             pkg_dir + QDir::separator() + package_name + QStringLiteral(".exe");
-        if (QFile::exists(launcher_src)) {
-            QFile::remove(launcher_dst);
-            QFile::copy(launcher_src, launcher_dst);
+        {
+            if (QFile::exists(launcher_dst) && !QFile::remove(launcher_dst)) {
+                LOG_ERROR(Frontend, "Could not replace export launcher: {}",
+                          launcher_dst.toStdString());
+                return false;
+            }
+            if (!QFile::copy(launcher_src, launcher_dst)) {
+                LOG_ERROR(Frontend, "Could not copy export launcher from {} to {}",
+                          launcher_src.toStdString(), launcher_dst.toStdString());
+                return false;
+            }
 
             // Embed the game's icon into the launcher exe via Windows resource update API.
             if (!game_icon_.isNull()) {
@@ -2804,7 +3153,6 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
                     << "is the baseline for comparing suyu static (Experimental) and Hybrid AOT + JIT.\n"
                     << "No original ROM or decryption keys are needed at runtime.\n";
                 readme.close();
-                MaybeAddToSteam(package_name, launcher_dst);
                 return true;
             }
             out << (is_hybrid
@@ -2842,8 +3190,6 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             out << "Press F12 in-game for the debug panel (status, mods, folders).\n";
             readme.close();
         }
-
-        MaybeAddToSteam(package_name, launcher_dst);
 
         return true;
     }
@@ -3320,8 +3666,9 @@ void GameExportDialog::OnExport() {
     progress_bar->setValue(5);
 
     if (uses_aot) {
-        QDir().mkpath(exefs_work);
-
+        if (QDir(exefs_work).exists() && !QDir(exefs_work).removeRecursively()) {
+            throw std::runtime_error("Failed to clear old ExeFS staging directory");
+        }
         // Step 2: ExeFS extraction is handled inside RunAotPrecompile via VFS.
         // For extracted directories, we copy them to the work area here.
         status_label->setText(tr("Scanning for ExeFS content..."));
@@ -3331,10 +3678,10 @@ void GameExportDialog::OnExport() {
         if (rom_fi.isDir()) {
             const QString exefs_sub = rom_path + QDir::separator() + QStringLiteral("exefs");
             if (QDir(exefs_sub).exists()) {
-                if (!CopyDirectoryRecursive(exefs_sub, exefs_work)) {
+                if (!CopyDeconstructedExeFs(exefs_sub, exefs_work)) {
                     throw std::runtime_error("Failed to copy ExeFS staging directory");
                 }
-            } else if (!CopyDirectoryRecursive(rom_path, exefs_work)) {
+            } else if (!CopyDeconstructedExeFs(rom_path, exefs_work)) {
                 throw std::runtime_error("Failed to copy ROM directory into export staging area");
             }
         }
@@ -3403,6 +3750,25 @@ void GameExportDialog::OnExport() {
         }
     }
     progress_bar->setValue(90);
+
+    // Deconstructed ExeFS has no update CNMT, so preserve an explicitly
+    // selected application version in the portable CLI config. This keeps
+    // the game's reported version aligned with the code/data in the export.
+    if (platform == TargetPlatform::Windows) {
+        const u32 app_version = test_app_version != 0
+                                    ? test_app_version
+                                    : Settings::values.application_version_override.GetValue();
+        const QString display_version = !test_display_version.isEmpty()
+                                            ? test_display_version
+                                            : QString::fromStdString(Settings::values
+                                                                          .application_display_version_override
+                                                                          .GetValue());
+        const QString config_path = output_dir + QDir::separator() + export_name +
+                                    QStringLiteral("/user/config/sdl2-config.ini");
+        if (!WritePortableVersionOverride(config_path, app_version, display_version)) {
+            throw std::runtime_error("Could not write portable version config");
+        }
+    }
 
     // Step 6: Clean up working directory
     QDir(work_dir).removeRecursively();
@@ -3480,14 +3846,13 @@ void GameExportDialog::OnExport() {
         QMessageBox::information(
             this, tr("AOT Export Complete"),
             tr("Game exported as C source to:\n%1\n\n"
-               "The package contains:\n"
-               "- Recompiled C source (buildable standalone PC executable)\n"
-               "- Runtime with save/load support (save_data/ directory next to exe)\n"
-               "- Bundled data segments (text, rodata, data)\n"
-               "- Build scripts for Windows (.cmd) and Unix (.sh)\n\n"
-               "Run build_native_windows.cmd (or build_native_unix.sh) in aot_cache/recompiled/ to compile.\n"
-               "The resulting executable runs independently — no emulator required.\n\n"
-               "(Choose \"Build\" instead of \"Source\" as the Export Format to have suyu compile "
+                "The package contains:\n"
+                "- Recompiled C source and CMake project files\n"
+                "- Bundled data segments (text, rodata, data)\n"
+                "- Build scripts for Windows (.cmd) and Unix (.sh)\n\n"
+                "No compiled game launcher is included. Run build_native_windows.cmd "
+                "(or build_native_unix.sh) in aot_cache/recompiled/ to compile the generated project.\n\n"
+                "(Choose \"Build\" instead of \"Source\" as the Export Format to have suyu compile "
                "this for you automatically.)")
                 .arg(final_path));
     }

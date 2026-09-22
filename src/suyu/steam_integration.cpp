@@ -15,6 +15,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
 
@@ -359,23 +360,40 @@ bool SteamIntegration::AddGameShortcut(const QString& game_title, const QString&
     // suyu directory entirely. Repoint it instead, and only leave it alone when
     // it already refers to this executable.
     const QString quoted_exe = QStringLiteral("\"%1\"").arg(exe_path);
+    const QString start_dir = QStringLiteral("\"%1\"").arg(QFileInfo(exe_path).absolutePath());
+    const QString shortcut_path = QFileInfo(exe_path).absolutePath();
+    const QString launch_options =
+        rom_path.isEmpty() ? QString() : QStringLiteral("-g \"%1\"").arg(rom_path);
     for (auto& sc : shortcuts) {
         if (sc.app_name != game_title) {
             continue;
         }
         const QString existing = QString(sc.exe).remove(QLatin1Char('"'));
-        if (QFileInfo(existing) == QFileInfo(exe_path)) {
-            return true; // Already correct
+        const bool executable_changed = QFileInfo(existing) != QFileInfo(exe_path);
+        const bool metadata_changed = executable_changed || sc.start_dir != start_dir ||
+                                      sc.shortcut_path != shortcut_path ||
+                                      sc.launch_options != launch_options ||
+                                      (!icon_path.isEmpty() &&
+                                       sc.icon != QFileInfo(icon_path).absoluteFilePath());
+        if (!metadata_changed) {
+            return true;
         }
         sc.exe = quoted_exe;
-        sc.start_dir = QStringLiteral("\"%1\"").arg(QFileInfo(exe_path).absolutePath());
-        sc.shortcut_path = QFileInfo(exe_path).absolutePath();
-        QFile out(vdf_path);
+        if (executable_changed) {
+            sc.id = GenerateAppId(sc.exe, sc.app_name);
+        }
+        sc.start_dir = start_dir;
+        sc.shortcut_path = shortcut_path;
+        sc.launch_options = launch_options;
+        if (!icon_path.isEmpty()) {
+            sc.icon = QFileInfo(icon_path).absoluteFilePath();
+        }
+        QSaveFile out(vdf_path);
         if (!out.open(QIODevice::WriteOnly)) {
             return false;
         }
-        out.write(SerializeShortcutsVdf(shortcuts));
-        return true;
+        const QByteArray data = SerializeShortcutsVdf(shortcuts);
+        return out.write(data) == data.size() && out.commit();
     }
 
     SteamShortcut new_sc;
@@ -400,12 +418,14 @@ bool SteamIntegration::AddGameShortcut(const QString& game_title, const QString&
     QDir().mkpath(QFileInfo(vdf_path).absolutePath());
 
     // Write the updated shortcuts.vdf
-    QFile out_file(vdf_path);
-    if (!out_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    QSaveFile out_file(vdf_path);
+    if (!out_file.open(QIODevice::WriteOnly)) {
         return false;
     }
-    out_file.write(SerializeShortcutsVdf(shortcuts));
-    out_file.close();
+    const QByteArray data = SerializeShortcutsVdf(shortcuts);
+    if (out_file.write(data) != data.size() || !out_file.commit()) {
+        return false;
+    }
 
     emit ShortcutAdded(game_title);
     return true;
@@ -448,12 +468,14 @@ bool SteamIntegration::RemoveGameShortcut(const QString& game_title) {
     shortcuts.erase(it, shortcuts.end());
 
     // Write back
-    QFile out_file(vdf_path);
-    if (!out_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    QSaveFile out_file(vdf_path);
+    if (!out_file.open(QIODevice::WriteOnly)) {
         return false;
     }
-    out_file.write(SerializeShortcutsVdf(shortcuts));
-    out_file.close();
+    const QByteArray data = SerializeShortcutsVdf(shortcuts);
+    if (out_file.write(data) != data.size() || !out_file.commit()) {
+        return false;
+    }
 
     emit ShortcutRemoved(game_title);
     return true;
