@@ -39,6 +39,14 @@ public:
     /// Remove a previously added shortcut.
     bool RemoveGameShortcut(const QString& game_title);
 
+    /// Add, or repoint, a shortcut that runs a standalone launcher directly - an exported game -
+    /// rather than suyu with a ROM. An existing shortcut for the same launcher is updated in
+    /// place, so exporting again does not duplicate it. When @p replace_title is not empty,
+    /// shortcuts with that title that launch anything else (suyu with the ROM) are removed so
+    /// the launcher takes their place.
+    bool AddLauncherShortcut(const QString& app_name, const QString& launcher_path,
+                             const QString& replace_title = {});
+
     enum class ArtworkType {
         Grid,
         Hero,
