@@ -236,11 +236,32 @@ jobs:
       - name: Archive the complete source, submodules included
         # GitHub's own "Source code" links exclude submodules, so on their own
         # they are not the corresponding source for these binaries. This one is
-        # the tree the release was actually built from.
+        # the tree the release was actually built from. Use git archive for the
+        # root and every submodule so export-ignore attributes exclude retained
+        # developer binaries without dropping corresponding submodule source.
         run: |
           NAME="suyu-${GITHUB_REF_NAME:-manual}-source"
-          git ls-files --recurse-submodules -z \
-            | tar --null -T - -czf "${NAME}.tar.gz" --transform "s,^,${NAME}/,"
+          git archive --format=tar --prefix="${NAME}/" HEAD > "${NAME}.tar"
+          while IFS= read -r path; do
+            test -n "$path" || continue
+            subarchive="$(mktemp --suffix=.tar)"
+            git -C "$path" archive --format=tar --prefix="${NAME}/${path}/" HEAD \
+              > "$subarchive"
+            tar --concatenate --file="${NAME}.tar" "$subarchive"
+            rm -f "$subarchive"
+          done < <(git submodule foreach --quiet --recursive 'printf "%s\n" "$displaypath"')
+          # Several upstream submodules retain prebuilt test/helper binaries.
+          # Corresponding source archives should contain source, not opaque
+          # executable or object payloads from those upstream histories.
+          mapfile -t opaque_files < <(
+            tar -tf "${NAME}.tar" \
+              | grep -Ei '\.(exe|dll|obj|so|dylib|a|lib|bin)$' || true
+          )
+          if ((${#opaque_files[@]})); then
+            printf '%s\n' "${opaque_files[@]}" \
+              | tar --delete --file="${NAME}.tar" --files-from=-
+          fi
+          gzip -9 "${NAME}.tar"
           ls -la "${NAME}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
