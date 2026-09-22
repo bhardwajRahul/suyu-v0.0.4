@@ -675,6 +675,8 @@ int main(int argc, char** argv) {
     // never bundled with a distributed export.
     // Must run before Log::Initialize(), which opens a file under LogDir.
 #ifdef SUYU_CMD_STATIC_RECOMP
+    // The export carries no system firmware; it reads the installed one, like its keys.
+    std::filesystem::path installed_nand;
     {
         namespace FS = Common::FS;
         // Captured before the portable overrides below take effect: keys
@@ -683,6 +685,8 @@ int main(int argc, char** argv) {
         // repointed into the export's own user directory.
         const std::filesystem::path installed_keys =
             FS::GetSuyuPath(FS::SuyuPath::KeysDir);
+        [[maybe_unused]] const std::filesystem::path installed_nand_default =
+            FS::GetSuyuPath(FS::SuyuPath::NANDDir);
 #ifdef _WIN32
         wchar_t exe_w[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
@@ -722,10 +726,12 @@ int main(int argc, char** argv) {
         FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
 #ifdef _WIN32
         FS::SetSuyuPath(FS::SuyuPath::KeysDir, FS::GetAppDataRoamingDirectory() / "suyu" / "keys");
+        installed_nand = FS::GetAppDataRoamingDirectory() / "suyu" / "nand";
 #else
         // No roaming-appdata equivalent here, and the default already
         // points at the installed location on these platforms.
         FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_keys);
+        installed_nand = installed_nand_default;
 #endif
     }
 #endif
@@ -1223,6 +1229,9 @@ int main(int argc, char** argv) {
     SuyuCli::ExplicitUpdateProvider explicit_provider;
     Core::System system{};
     system.Initialize();
+#ifdef SUYU_CMD_STATIC_RECOMP
+    system.GetFileSystemController().SetSystemContentFallback(installed_nand);
+#endif
     LOG_INFO(Frontend, "suyu-cmd: System initialized.");
     if (explicit_content_base) {
         system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());

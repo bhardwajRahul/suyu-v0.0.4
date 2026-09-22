@@ -71,6 +71,7 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/recompiler/arm64_to_c.h"
+#include "frontend_common/firmware_manager.h"
 
 // ---------------------------------------------------------------------------
 // Filesystem helpers
@@ -3569,6 +3570,24 @@ void GameExportDialog::OnExport() {
         }
     }
 #endif
+
+    // An exported game never contains firmware; it reads the firmware installed in suyu when
+    // it runs. Without it, games still boot but anything built on firmware data - Mii
+    // selection in Mario Kart 8 Deluxe, for one - can stop a strict static game thread.
+    if (!test_driven_export && !FirmwareManager::CheckFirmwarePresence(system_)) {
+        const auto answer = QMessageBox::warning(
+            this, tr("System Firmware Not Installed"),
+            tr("suyu has no system firmware installed.\n\n"
+               "Exported games do not include firmware. They use the firmware installed in "
+               "suyu on this computer. Without it, parts of a game that rely on firmware "
+               "data, such as choosing a Mii, can fail.\n\n"
+               "Install firmware with Tools > Install Firmware, then export again.\n\n"
+               "Export anyway?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes) {
+            return;
+        }
+    }
 
     const auto platform =
         static_cast<TargetPlatform>(platform_combo->currentData().toInt());
