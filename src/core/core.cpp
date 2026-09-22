@@ -812,7 +812,11 @@ void System::SetContentProvider(std::unique_ptr<FileSys::ContentProviderUnion> p
 }
 
 void System::SetApplicationVersionOverride(u32 version, std::string display_version) {
-    impl->application_version_override = version;
+    if (version == 0 && display_version.empty()) {
+        impl->application_version_override.reset();
+    } else {
+        impl->application_version_override = version;
+    }
     impl->application_display_version_override = std::move(display_version);
 }
 

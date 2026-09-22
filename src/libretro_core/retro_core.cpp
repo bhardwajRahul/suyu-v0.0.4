@@ -33,11 +33,21 @@
 //     RETRO_SERIALIZATION_QUIRK_INCOMPLETE so the frontend reports them as
 //     unavailable rather than offering them and failing later.
 
+#include <algorithm>
+#include <array>
 #include <cstring>
+#include <cstdlib>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <filesystem>
 #include <vector>
+#ifdef SUYU_ANDROID_LIBRETRO
+#include <sys/system_properties.h>
+#endif
 #include "audio_core/sink/libretro_sink.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -45,27 +55,65 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/crypto/key_manager.h"
 #include "core/cpu_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/loader/loader.h"
+#include "core/perf_stats.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/virtual_gamepad.h"
+#include "input_common/drivers/tas_input.h"
 #include "input_common/main.h"
 #include "network/network.h"
 #include "libretro_core/libretro.h"
 #include "libretro_core/retro_emu_window.h"
+#include "suyu_cmd/explicit_update.h"
 #include "video_core/renderer_base.h"
 
 namespace {
 
+std::string GetRuntimeOption(const char* environment_key,
+                             [[maybe_unused]] const char* android_property) {
+    if (const char* value = std::getenv(environment_key)) {
+        return value;
+    }
+#ifdef SUYU_ANDROID_LIBRETRO
+    char value[PROP_VALUE_MAX]{};
+    const int length = __system_property_get(android_property, value);
+    if (length > 0 && length < PROP_VALUE_MAX) {
+        return std::string(value, static_cast<size_t>(length));
+    }
+#endif
+    return {};
+}
+
+bool HasUsableNcaHeaderKey() {
+    const auto key = Core::Crypto::KeyManager::Instance().GetKey(Core::Crypto::S256KeyType::Header);
+    constexpr size_t half_size = 16;
+    // OpenSSL XTS rejects a missing key and equal key halves. Check the
+    // already-loaded key material without attempting to decrypt content.
+    return std::any_of(key.begin(), key.end(), [](u8 byte) { return byte != 0; }) &&
+           !std::equal(key.begin(), key.begin() + half_size, key.begin() + half_size);
+}
+
+
 std::unique_ptr<Core::System> g_system;
+std::unique_ptr<SuyuCli::ExplicitUpdateProvider> g_explicit_provider;
 std::unique_ptr<LibretroCore::RetroEmuWindow> g_emu_window;
 std::shared_ptr<InputCommon::InputSubsystem> g_input_subsystem;
 std::string g_game_path;
 bool g_game_loaded = false;
+bool g_tas_playback = false;
+bool g_previous_tas_enable = false;
+bool g_previous_tas_loop = false;
+std::filesystem::path g_previous_tas_directory;
+bool g_sample_perf = false;
+std::chrono::steady_clock::time_point g_perf_start;
+std::chrono::steady_clock::time_point g_perf_last_sample;
 // False: suyu drives a host audio device directly (default, sounds correct).
 // True: samples are handed to the frontend via retro_audio_sample_batch.
 bool g_use_frontend_audio = false;
@@ -79,6 +127,61 @@ retro_input_state_t g_input_state_cb;
 
 constexpr unsigned kFrameWidth = 1280;
 constexpr unsigned kFrameHeight = 720;
+
+// System::Initialize() may decrypt firmware metadata. Make the frontend's
+// existing keys visible before that call, not after it has already tried to
+// create crypto contexts with a missing key.
+void PrepareLibretroKeys() {
+    const auto keys_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
+    const auto roaming = keys_dir.parent_path().parent_path();
+    for (const auto& emu : {"suyu", "yuzu", "sudachi", "citron", "Ryujinx"}) {
+        const auto src_dir = roaming / emu / "keys";
+        std::error_code ec;
+        if (!std::filesystem::exists(src_dir, ec)) {
+            continue;
+        }
+        LOG_INFO(Frontend, "libretro: found {} key directory at {}", emu, src_dir.string());
+        if (!Common::FS::CreateDirs(keys_dir)) {
+            LOG_WARNING(Frontend, "libretro: could not prepare local key directory");
+            continue;
+        }
+        for (const auto& name : {"prod.keys", "title.keys", "console.keys"}) {
+            const auto src = src_dir / name;
+            const auto dst = keys_dir / name;
+            if (std::filesystem::exists(src, ec) && !std::filesystem::exists(dst, ec)) {
+                std::filesystem::copy_file(src, dst, ec);
+                if (!ec) {
+                    LOG_INFO(Frontend, "libretro: adopted {} from {}", name, emu);
+                }
+            }
+        }
+    }
+
+    if (g_environ_cb) {
+        const char* system_dir = nullptr;
+        if (g_environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir) && system_dir) {
+            const auto src_dir = std::filesystem::path(system_dir) / "suyu" / "keys";
+            LOG_INFO(Frontend, "libretro: checking for keys in: {}", src_dir.string());
+            if (std::filesystem::exists(src_dir)) {
+                if (!Common::FS::CreateDirs(keys_dir)) {
+                    LOG_WARNING(Frontend, "libretro: could not prepare local key directory");
+                } else {
+                    for (const auto& name : {"prod.keys", "title.keys", "console.keys"}) {
+                        const auto src = src_dir / name;
+                        const auto dst = keys_dir / name;
+                        if (std::filesystem::exists(src) && !std::filesystem::exists(dst)) {
+                            std::error_code ec;
+                            std::filesystem::copy_file(src, dst, ec);
+                            if (!ec) {
+                                LOG_INFO(Frontend, "libretro: copied {} from RetroArch system dir", name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 } // namespace
 
@@ -94,23 +197,23 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
 
     static const struct retro_variable vars[] = {
-        {"suyu_renderer", "Renderer; Vulkan|OpenGL|Software"},
-        {"suyu_resolution", "Internal Resolution; 1x|2x|3x|4x"},
-        {"suyu_scaling_filter", "Window Adapting Filter; Bilinear|Bicubic|Lanczos|ScaleForce|FSR|NearestNeighbor"},
-        {"suyu_anti_aliasing", "Anti-Aliasing; None|FXAA|SMAA"},
-        {"suyu_cpu_accuracy", "CPU Accuracy; Auto|Accurate|Unsafe"},
-        {"suyu_use_docked", "Docked Mode; Yes|No"},
-        {"suyu_fastmem", "Fastmem; Enabled|Disabled"},
-        {"suyu_audio_output", "Audio Output; Host (direct)|Frontend (libretro)"},
+        // This headless readback window only implements Vulkan. Advertising
+        // other renderers would claim an option that cannot take effect.
+        {"suyu_resolution", "Internal Resolution (reload content); 1x|2x|3x|4x"},
+        {"suyu_scaling_filter", "Window Adapting Filter (reload content); Bilinear|Bicubic|Lanczos|ScaleForce|FSR|NearestNeighbor"},
+        {"suyu_anti_aliasing", "Anti-Aliasing (reload content); None|FXAA|SMAA"},
+        {"suyu_cpu_accuracy", "CPU Accuracy (reload content); Auto|Accurate|Unsafe"},
+        {"suyu_use_docked", "Docked Mode (reload content); Yes|No"},
+        {"suyu_fastmem", "Fastmem (reload content); Enabled|Disabled"},
+        {"suyu_audio_output", "Audio Output (reload content); Host (direct)|Frontend (libretro)"},
         // suyu's own online play. RetroArch's netplay can't drive this core
         // (see retro_serialize_size), but suyu's room system tunnels the
         // game's own LAN multiplayer between peers and doesn't need frame
         // sync, so it works here - it just needs somewhere to be configured,
         // which is what these are.
-        {"suyu_online_enable", "suyu Online Play; Disabled|Enabled"},
-        {"suyu_online_server", "suyu Room Server; 127.0.0.1"},
-        {"suyu_online_port", "suyu Room Port; 24872"},
-        {"suyu_online_nickname", "suyu Online Nickname; Player"},
+        {"suyu_online_enable", "suyu Online Play (reload content); Disabled|Enabled"},
+        // Legacy variables cannot accept free-form strings. Online endpoint
+        // and nickname are supplied through environment variables instead.
         {nullptr, nullptr},
     };
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
@@ -144,11 +247,30 @@ RETRO_API void retro_set_input_state(retro_input_state_t cb) {
 }
 
 RETRO_API void retro_init() {
+#ifdef SUYU_ANDROID_LIBRETRO
+    // RetroArch owns Android storage; establish a writable core directory before
+    // logging and firmware/key initialization. Content must use ordinary paths.
+    const char* system_directory = nullptr;
+    if (!g_environ_cb ||
+        !g_environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_directory) ||
+        !system_directory || !*system_directory) {
+        return;
+    }
+    const auto user_directory = std::filesystem::path{system_directory} / "suyu";
+    std::error_code directory_error;
+    std::filesystem::create_directories(user_directory, directory_error);
+    if (directory_error) {
+        return;
+    }
+    Common::FS::SetAppDirectory(user_directory.string());
+    Common::FS::CreateSuyuPaths();
+#endif
     Common::Log::Initialize();
     Common::Log::Start();
 
     LOG_INFO(Frontend, "libretro core: retro_init() starting");
 
+    PrepareLibretroKeys();
     g_system = std::make_unique<Core::System>();
     g_emu_window = std::make_unique<LibretroCore::RetroEmuWindow>();
     g_input_subsystem = std::make_shared<InputCommon::InputSubsystem>();
@@ -178,68 +300,6 @@ RETRO_API void retro_init() {
     g_system->GetFileSystemController().CreateFactories(*g_system->GetFilesystem());
     g_system->GetUserChannel().clear();
 
-    // Adopt keys from any other Switch emulator installed on this machine.
-    // A RetroArch user may well have never run suyu itself, but is likely to
-    // have one of these already set up; copying rather than reading in place
-    // keeps suyu's own key directory the single source of truth afterwards.
-    {
-        const auto keys_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
-        // .../<roaming>/suyu/keys -> .../<roaming>
-        const auto roaming = keys_dir.parent_path().parent_path();
-        for (const auto& emu : {"suyu", "yuzu", "sudachi", "citron", "Ryujinx"}) {
-            const auto src_dir = roaming / emu / "keys";
-            std::error_code ec;
-            if (!std::filesystem::exists(src_dir, ec)) {
-                continue;
-            }
-            LOG_INFO(Frontend, "libretro: found {} key directory at {}", emu, src_dir.string());
-            if (!Common::FS::CreateDir(keys_dir)) {
-                LOG_WARNING(Frontend, "libretro: could not prepare local key directory");
-                continue;
-            }
-            for (const auto& name : {"prod.keys", "title.keys", "console.keys"}) {
-                const auto src = src_dir / name;
-                const auto dst = keys_dir / name;
-                // Never overwrite: suyu's own keys, and anything adopted from
-                // an earlier emulator in this list, take precedence.
-                if (std::filesystem::exists(src, ec) && !std::filesystem::exists(dst, ec)) {
-                    std::filesystem::copy_file(src, dst, ec);
-                    if (!ec) {
-                        LOG_INFO(Frontend, "libretro: adopted {} from {}", name, emu);
-                    }
-                }
-            }
-        }
-    }
-
-    // Load keys from RetroArch system directory if available
-    // Users can place prod.keys and title.keys in <system_dir>/suyu/keys/
-    if (g_environ_cb) {
-        const char* system_dir = nullptr;
-        if (g_environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir) && system_dir) {
-            const auto src_dir = std::filesystem::path(system_dir) / "suyu" / "keys";
-            const auto dst_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
-            LOG_INFO(Frontend, "libretro: checking for keys in: {}", src_dir.string());
-            if (std::filesystem::exists(src_dir)) {
-                if (!Common::FS::CreateDir(dst_dir)) {
-                    LOG_WARNING(Frontend, "libretro: could not prepare local key directory");
-                } else {
-                    for (const auto& name : {"prod.keys", "title.keys", "console.keys"}) {
-                        auto src = src_dir / name;
-                        auto dst = dst_dir / name;
-                        if (std::filesystem::exists(src) && !std::filesystem::exists(dst)) {
-                            std::error_code ec;
-                            std::filesystem::copy_file(src, dst, ec);
-                            if (!ec) {
-                                LOG_INFO(Frontend, "libretro: copied {} from RetroArch system dir", name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     // Bring up suyu's own room-based multiplayer. RetroArch's netplay can't
     // drive this core (see retro_serialize_size() for why), but suyu's online
     // play is peer-to-peer at the emulated-console level and doesn't depend on
@@ -257,9 +317,11 @@ RETRO_API void retro_init() {
 }
 
 RETRO_API void retro_deinit() {
+    retro_unload_game();
     Network::Shutdown();
-    g_emu_window.reset();
     g_system.reset();
+    g_explicit_provider.reset();
+    g_emu_window.reset();
     if (g_input_subsystem) { g_input_subsystem->Shutdown(); g_input_subsystem.reset(); }
     Common::Log::Stop();
 }
@@ -325,11 +387,36 @@ bool g_prev_buttons[20] = {};
 } // namespace
 
 RETRO_API void retro_run() {
+    // This frontend is the sole periodic consumer of the destructive stats read.
+    // Sample guest rendering/timing, independently of retro_run's frontend FPS.
+    if (g_sample_perf && g_system && g_game_loaded) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_perf_last_sample >= std::chrono::seconds{1}) {
+            const auto stats = g_system->GetAndResetPerfStats();
+            const double interval = std::chrono::duration<double>(now - g_perf_last_sample).count();
+            const double elapsed = std::chrono::duration<double>(now - g_perf_start).count();
+            g_perf_last_sample = now;
+            const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count();
+            const auto metric = [](double value) {
+                return std::isfinite(value) && value >= 0.0 ? fmt::format("{:.3f}", value)
+                                                          : std::string{"unavailable"};
+            };
+            const bool has_system_frames = std::isfinite(stats.system_fps) && stats.system_fps > 0.0;
+            LOG_INFO(Frontend, "libretro PERF unix_ms={} elapsed_s={:.3f} interval_s={:.3f} "
+                               "average_game_fps={} system_fps={} emulation_speed={} "
+                               "frametime_ms={} has_system_frames={}",
+                     unix_ms, elapsed, interval, metric(stats.average_game_fps),
+                     metric(stats.system_fps), metric(stats.emulation_speed),
+                     has_system_frames ? metric(stats.frametime * 1000.0) : "unavailable",
+                     has_system_frames);
+        }
+    }
     if (g_input_poll_cb) {
         g_input_poll_cb();
     }
 
-    // Bridge libretro input → suyu HID via VirtualGamepad
+    // Bridge libretro input to suyu HID via VirtualGamepad.
     if (g_input_state_cb && g_input_subsystem && g_game_loaded) {
         auto* vgp = g_input_subsystem->GetVirtualGamepad();
         if (vgp) {
@@ -458,7 +545,97 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     }
 
     g_game_path = game->path;
+    // need_fullpath makes content availability the core's responsibility. Avoid
+    // initializing guest kernel state for a path the frontend cannot open.
+    std::error_code path_error;
+    if (!std::filesystem::is_regular_file(std::filesystem::u8path(g_game_path), path_error)) {
+        LOG_ERROR(Frontend, "libretro: content is not an accessible file");
+        g_game_path.clear();
+        return false;
+    }
+    // Loader::IdentifyFile probes encrypted NCAs even for a malformed NRO.
+    // With no keys, that probe reaches AES-XTS with an uninitialized cipher.
+    // Check only the unencrypted executable signatures here; normal loader
+    // validation still decides whether a recognized file can actually boot.
+    const auto filename_type =
+        Loader::GuessFromFilename(std::filesystem::u8path(g_game_path).filename().string());
+    if (filename_type == Loader::FileType::NSO) {
+        // A standalone NSO has no NPDM to initialize its process page table.
+        // The supported deconstructed layout is booted through exefs/main.
+        LOG_ERROR(Frontend, "libretro: standalone NSO requires a deconstructed ExeFS main");
+        g_game_path.clear();
+        return false;
+    }
+    if (filename_type == Loader::FileType::NRO || filename_type == Loader::FileType::KIP ||
+        filename_type == Loader::FileType::DeconstructedRomDirectory) {
+        std::array<char, 0x14> header{};
+        std::ifstream content{std::filesystem::u8path(g_game_path), std::ios::binary};
+        content.read(header.data(), header.size());
+        const auto magic_offset = filename_type == Loader::FileType::NRO ? 0x10 : 0;
+        const char* magic = filename_type == Loader::FileType::NRO ? "NRO0" :
+                            filename_type == Loader::FileType::KIP ? "KIP1" : "NSO0";
+        if (content.gcount() < magic_offset + 4 ||
+            std::memcmp(header.data() + magic_offset, magic, 4) != 0) {
+            LOG_ERROR(Frontend, "libretro: executable header is not recognized");
+            g_game_path.clear();
+            return false;
+        }
+    } else if ((filename_type == Loader::FileType::NSP || filename_type == Loader::FileType::XCI ||
+                filename_type == Loader::FileType::NCA || filename_type == Loader::FileType::NAX) &&
+               !HasUsableNcaHeaderKey()) {
+        LOG_ERROR(Frontend, "libretro: encrypted content requires a usable NCA header key");
+        g_game_path.clear();
+        return false;
+    }
     LOG_INFO(Frontend, "libretro core: loading game: {}", g_game_path);
+
+    // RetroArch passes one content path. When an update is requested, require
+    // that path to be the base XCI/NSP and verify the supplied update with the
+    // same read-only provider and module/RomFS checks as suyu-cmd. The provider
+    // is registered only for this content session; no NAND install occurs.
+    if (const auto update_path = GetRuntimeOption("SUYU_LIBRETRO_UPDATE_PATH",
+                                                 "debug.suyu.libretro.update");
+        !update_path.empty()) {
+        g_explicit_provider = std::make_unique<SuyuCli::ExplicitUpdateProvider>();
+        if (!SuyuCli::ConfigureExplicitUpdate(*g_system, *g_explicit_provider,
+                                              g_game_path, update_path)) {
+            retro_unload_game();
+            return false;
+        }
+        LOG_INFO(Frontend, "libretro: explicit base/update provider verified for this session");
+    }
+
+    // A verified deconstructed ExeFS/RomFS pair has no CNMT to report the
+    // update version. Allow an explicit version only for that layout; packed
+    // base+update sessions get their version from the verified provider.
+    g_system->SetApplicationVersionOverride(0, {});
+    if (const char* raw_version = std::getenv("SUYU_LIBRETRO_APP_VERSION");
+        raw_version && *raw_version) {
+        const char* display_version = std::getenv("SUYU_LIBRETRO_DISPLAY_VERSION");
+        const auto main_path = std::filesystem::u8path(g_game_path);
+        const auto exefs_dir = main_path.parent_path();
+        u32 version{};
+        const auto* end = raw_version + std::strlen(raw_version);
+        const auto [parsed_end, parse_error] = std::from_chars(raw_version, end, version);
+        std::array<char, 0x10> npdm_header{};
+        std::ifstream npdm{exefs_dir / "main.npdm", std::ios::binary};
+        npdm.read(npdm_header.data(), npdm_header.size());
+        const bool valid_arm64 = npdm.gcount() ==
+                                     static_cast<std::streamsize>(npdm_header.size()) &&
+                                 std::memcmp(npdm_header.data(), "META", 4) == 0 &&
+                                 (npdm_header[0x0C] & 1) != 0;
+        if (g_explicit_provider || main_path.filename() != "main" ||
+            !std::filesystem::is_regular_file(exefs_dir / "romfs.bin") || !valid_arm64 ||
+            !display_version || !*display_version || parse_error != std::errc{} ||
+            parsed_end != end || version == 0) {
+            LOG_ERROR(Frontend, "libretro: invalid deconstructed application version override");
+            retro_unload_game();
+            return false;
+        }
+        g_system->SetApplicationVersionOverride(version, display_version);
+        LOG_INFO(Frontend, "libretro: using explicit deconstructed application version {} ({})",
+                 version, display_version);
+    }
 
     // Apply core options before loading the game
     if (g_environ_cb) {
@@ -559,20 +736,23 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
             std::string nickname = "Player";
             u16 port = 24872;
 
-            var.key = "suyu_online_server";
-            var.value = nullptr;
-            if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-                server = var.value;
+            if (const char* configured = std::getenv("SUYU_LIBRETRO_ROOM_SERVER");
+                configured && *configured) {
+                server = configured;
             }
-            var.key = "suyu_online_nickname";
-            var.value = nullptr;
-            if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-                nickname = var.value;
+            if (const char* configured = std::getenv("SUYU_LIBRETRO_ROOM_NICKNAME");
+                configured && *configured) {
+                nickname = configured;
             }
-            var.key = "suyu_online_port";
-            var.value = nullptr;
-            if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-                port = static_cast<u16>(std::strtoul(var.value, nullptr, 10));
+            if (const char* configured = std::getenv("SUYU_LIBRETRO_ROOM_PORT");
+                configured && *configured) {
+                char* end = nullptr;
+                const unsigned long parsed = std::strtoul(configured, &end, 10);
+                if (*end == '\0' && parsed > 0 && parsed <= 65535) {
+                    port = static_cast<u16>(parsed);
+                } else {
+                    LOG_WARNING(Frontend, "libretro: invalid SUYU_LIBRETRO_ROOM_PORT; using 24872");
+                }
             }
 
             // Keep peers in one netplay session from colliding on nickname,
@@ -592,6 +772,25 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         }
     }
 
+    g_tas_playback = false;
+    if (const auto tas_dir = GetRuntimeOption("SUYU_LIBRETRO_TAS_DIR", "debug.suyu.libretro.tas");
+        !tas_dir.empty()) {
+        const auto directory = std::filesystem::u8path(tas_dir);
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(directory / "script0-1.txt", error)) {
+            LOG_ERROR(Frontend, "libretro: requested TAS script0-1.txt is unavailable");
+            retro_unload_game();
+            return false;
+        }
+        g_previous_tas_enable = Settings::values.tas_enable.GetValue();
+        g_previous_tas_loop = Settings::values.tas_loop.GetValue();
+        g_previous_tas_directory = Common::FS::GetSuyuPath(Common::FS::SuyuPath::TASDir);
+        Common::FS::SetSuyuPath(Common::FS::SuyuPath::TASDir, directory);
+        Settings::values.tas_enable.SetValue(true);
+        Settings::values.tas_loop.SetValue(false);
+        g_tas_playback = true;
+    }
+
     Service::AM::FrontendAppletParameters load_parameters{};
     load_parameters.applet_id = Service::AM::AppletId::Application;
 
@@ -600,18 +799,34 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     if (result != Core::SystemResultStatus::Success) {
         LOG_CRITICAL(Frontend, "libretro core: Load() failed with status {}",
                      static_cast<u32>(result));
+        // Libretro does not require an unload call after a failed load. Restore
+        // the per-game TAS overrides now so a later load starts cleanly.
+        retro_unload_game();
         return false;
     }
 
-    // The GUI's EmuThread does these steps between Load and Run — without them the GPU thread
+    // The GUI's EmuThread does these steps between Load and Run; otherwise the GPU thread
     // never starts and the CPU manager doesn't know the GPU is ready, causing the game to stall
     // before it ever reaches display setup.
+    if (g_tas_playback) {
+        auto* tas = g_input_subsystem->GetTas();
+        tas->BeginBootSession(InputCommon::TasInput::TasBootMode::Playback);
+        g_emu_window->SetTasPlayback(tas);
+        LOG_INFO(Frontend, "libretro: boot TAS playback armed, {} commands",
+                 std::get<2>(tas->GetStatus())[0]);
+    }
     auto& gpu = g_system->GPU();
     gpu.ObtainContext();
     gpu.ReleaseContext();
     gpu.Start();
     g_system->GetCpuManager().OnGpuReady();
 
+    const auto perf_setting = GetRuntimeOption("SUYU_LIBRETRO_PERF", "debug.suyu.libretro.perf");
+    g_sample_perf = perf_setting == "1";
+    if (g_sample_perf) {
+        (void)g_system->GetAndResetPerfStats();
+        g_perf_start = g_perf_last_sample = std::chrono::steady_clock::now();
+    }
     g_system->Run();
     g_game_loaded = true;
     LOG_INFO(Frontend, "libretro core: game loaded and running");
@@ -624,11 +839,28 @@ RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retr
 }
 
 RETRO_API void retro_unload_game() {
+    g_sample_perf = false;
     if (g_system && g_game_loaded) {
         g_system->ShutdownMainProcess();
     }
+    if (g_emu_window) {
+        g_emu_window->SetTasPlayback(nullptr);
+    }
+    if (g_tas_playback && g_input_subsystem) {
+        g_input_subsystem->GetTas()->BeginBootSession(InputCommon::TasInput::TasBootMode::None);
+        Settings::values.tas_enable.SetValue(g_previous_tas_enable);
+        Settings::values.tas_loop.SetValue(g_previous_tas_loop);
+        Common::FS::SetSuyuPath(Common::FS::SuyuPath::TASDir, g_previous_tas_directory);
+        g_previous_tas_directory.clear();
+    }
+    g_tas_playback = false;
     g_game_loaded = false;
     g_game_path.clear();
+    if (g_explicit_provider) {
+        g_system->RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                          nullptr);
+        g_explicit_provider.reset();
+    }
     // Leave any room we joined for this game; the next one loaded in this
     // session gets to make its own decision from its own core options.
     if (auto member = Network::GetRoomMember().lock()) {

@@ -286,7 +286,7 @@ if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
 endif()
 
-if (ANDROID)
+if (ANDROID AND NOT SUYU_ANDROID_LIBRETRO)
     add_subdirectory(android/app/src/main/jni)
     target_include_directories(yuzu-android PRIVATE android/app/src/main)
 endif()

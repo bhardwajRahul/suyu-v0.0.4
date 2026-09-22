@@ -5,6 +5,10 @@
 
 #include "core/frontend/emu_window.h"
 
+namespace InputCommon::TasInput {
+class Tas;
+}
+
 namespace LibretroCore {
 
 // Minimal EmuWindow for the libretro core frontend. Runs the video backend
@@ -27,6 +31,13 @@ public:
 
     std::unique_ptr<Core::Frontend::GraphicsContext> CreateSharedContext() const override;
     bool IsShown() const override;
+    void SetTasPlayback(InputCommon::TasInput::Tas* tas);
+    void OnFrameDisplayed() override;
+
+private:
+    InputCommon::TasInput::Tas* tas_playback{};
+    u64 tas_completion_generation{};
+    u64 tas_frame_callbacks{};
 };
 
 } // namespace LibretroCore
