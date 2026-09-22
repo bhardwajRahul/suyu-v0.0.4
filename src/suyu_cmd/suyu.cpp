@@ -15,8 +15,10 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <fmt/ostream.h>
+#include <stb_image_write.h>
 
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
@@ -983,6 +985,16 @@ int main(int argc, char** argv) {
     }
 
     if (tas_playback) {
+        const auto script_path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::TASDir) /
+                                 "script0-1.txt";
+        std::error_code tas_error;
+        const auto script_size = std::filesystem::file_size(script_path, tas_error);
+        LOG_INFO(Frontend, "TAS script path={} size={} valid={}", script_path.string(),
+                 tas_error ? 0 : script_size, !tas_error && script_size > 0);
+        if (tas_error || script_size == 0) {
+            LOG_ERROR(Frontend, "TAS playback requires a nonempty script0-1.txt");
+            return 2;
+        }
         // Must be set before the input subsystem is constructed: the TAS driver
         // only reads the scripts out of the TAS directory when it sees this
         // enabled, and it is applied here so the config file cannot clear it.
@@ -1460,8 +1472,51 @@ int main(int argc, char** argv) {
                  "PERF sampling off: the window status refresh owns the perf counters");
     }
 
+    const char* capture_dir_env = std::getenv("SUYU_CMD_CAPTURE_DIR");
+    const std::filesystem::path capture_dir = capture_dir_env ? capture_dir_env : "";
+    if (!capture_dir.empty()) {
+        std::filesystem::create_directories(capture_dir);
+    }
+    const auto capture_start = std::chrono::steady_clock::now();
+    const auto capture_seconds = [](const char* name, int fallback) {
+        const char* value = std::getenv(name);
+        return std::chrono::seconds{value ? std::max(1, std::atoi(value)) : fallback};
+    };
+    auto next_capture = capture_seconds("SUYU_CMD_CAPTURE_FIRST_SEC", 30);
+    const auto capture_interval = capture_seconds("SUYU_CMD_CAPTURE_INTERVAL_SEC", 60);
+    unsigned capture_index = 0;
     while (emu_window->IsOpen()) {
         emu_window->WaitEvent();
+        if (capture_dir.empty() || system.Renderer().IsScreenshotPending() ||
+            std::chrono::steady_clock::now() - capture_start < next_capture) {
+            continue;
+        }
+        constexpr int width = 1280;
+        constexpr int height = 720;
+        auto pixels = std::make_shared<std::vector<u8>>(width * height * 4);
+        const std::string output =
+            (capture_dir / ("frame-" + std::to_string(++capture_index) + ".png")).string();
+        system.Renderer().RequestScreenshot(
+            pixels->data(),
+            [pixels, output](bool invert_y) {
+                std::vector<u8> rgba(pixels->size());
+                for (int y = 0; y < height; ++y) {
+                    const int source_y = invert_y ? height - 1 - y : y;
+                    for (int x = 0; x < width; ++x) {
+                        const size_t src = (static_cast<size_t>(source_y) * width + x) * 4;
+                        const size_t dst = (static_cast<size_t>(y) * width + x) * 4;
+                        rgba[dst] = (*pixels)[src + 2];
+                        rgba[dst + 1] = (*pixels)[src + 1];
+                        rgba[dst + 2] = (*pixels)[src];
+                        rgba[dst + 3] = (*pixels)[src + 3];
+                    }
+                }
+                LOG_INFO(Frontend, "CAPTURE {} success={}", output,
+                         stbi_write_png(output.c_str(), width, height, 4, rgba.data(),
+                                        width * 4) != 0);
+            },
+            Layout::DefaultFrameLayout(width, height));
+        next_capture += capture_interval;
     }
 
     perf_sampling_run.store(false, std::memory_order_relaxed);
