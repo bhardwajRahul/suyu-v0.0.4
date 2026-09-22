@@ -201,7 +201,10 @@ private:
     QComboBox* output_format_combo{};
     /// True when output_format_combo selects the build-to-binary format.
     bool WantsCompiledOutput() const;
-    void MaybeAddToSteam(const QString& game_name, const QString& exe_path);
+    /// Add the finished package's launcher to Steam when asked to. Returns a note for the
+    /// completion message, empty when Steam was not requested.
+    QString MaybeAddToSteam(const QString& game_title, const QString& exe_path,
+                            const QString& backend_label, bool replace);
     QProgressBar* progress_bar{};
     QPushButton* export_button{};
     QLabel* status_label{};
@@ -210,6 +213,9 @@ private:
     quint64 rom_program_id{};
     /// ROM path rom_program_id belongs to; a hand-typed different path invalidates it.
     QString rom_program_id_path;
+    /// Title ID parsed from a ROM file, and the path it belongs to (SelectedProgramId's cache).
+    mutable quint64 cached_program_id{};
+    mutable QString cached_program_id_path;
     QVector<LibraryEntry> library_entries_;
     Core::System& system_;
     QPixmap game_icon_;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "suyu/game_export.h"
+#include "suyu/steam_integration.h"
 
 #include <QApplication>
 #include <QBuffer>
@@ -374,12 +375,13 @@ void GameExportDialog::SetupUi() {
     aot_full_scan_checkbox->setToolTip(
         tr("This mode currently produces the same generated code and does not improve cold boot."));
     layout->addWidget(aot_full_scan_checkbox);
+    // It produces the same generated code as a normal export, so offering it only suggests a
+    // speed-up that does not exist. Kept, hidden, for TriggerExportForTesting's full_scan.
+    aot_full_scan_checkbox->setVisible(false);
 
     steam_shortcut_checkbox =
-        new QCheckBox(tr("Add to Steam library when the export finishes (unavailable)"), this);
+        new QCheckBox(tr("Add to Steam library when the export finishes"), this);
     steam_shortcut_checkbox->setChecked(false);
-    steam_shortcut_checkbox->setToolTip(
-        tr("Steam shortcuts for exported standalone launchers are not available yet."));
     layout->addWidget(steam_shortcut_checkbox);
 
     steam_replace_rom_checkbox =
@@ -387,13 +389,12 @@ void GameExportDialog::SetupUi() {
     steam_replace_rom_checkbox->setChecked(true);
     steam_replace_rom_checkbox->setToolTip(
         tr("A shortcut added earlier for this title - pointing at the ROM through the emulator - "
-           "is removed first, so the recompiled build takes its place instead of appearing "
-           "alongside it. Uncheck to keep both entries."));
+           "is removed first, so the exported build takes its place under the game's name. "
+           "Uncheck to keep both entries; the exported one is then named after its CPU "
+           "backend."));
     layout->addWidget(steam_replace_rom_checkbox);
     connect(steam_shortcut_checkbox, &QCheckBox::toggled, this, [this](bool enabled) {
-        steam_replace_rom_checkbox->setEnabled(
-            enabled && platform_combo->currentData().toInt() ==
-                           static_cast<int>(TargetPlatform::Windows));
+        steam_replace_rom_checkbox->setEnabled(enabled && steam_shortcut_checkbox->isEnabled());
     });
     steam_replace_rom_checkbox->setEnabled(false);
 
@@ -409,12 +410,13 @@ void GameExportDialog::SetupUi() {
 
     // Source vs Build is a real, explicit choice rather than an easily-missed
     // checkbox, because the two produce completely different deliverables and
-    // "I picked build and got a folder of C" was the reported complaint. Source
-    // stays the default: a large title lifts to gigabytes of C - Smash
+    // "I picked build and got a folder of C" was the reported complaint. Build is
+    // the Windows default because a playable game is what an export is for; its
+    // label says it is slow, since a large title lifts to gigabytes of C - Smash
     // Ultimate's main module alone is ~3 GB across 139 translation units - and
-    // compiling that is hours of C-compiler work, so it must be asked for, not
-    // stumbled into. When Build IS chosen the export compiles all the way to a
-    // binary and fails loudly if it cannot, instead of silently degrading.
+    // compiling that is hours of C-compiler work. Other targets can only produce
+    // Source. Build compiles all the way to a binary and fails loudly if it
+    // cannot, instead of silently degrading.
     auto* format_row = new QHBoxLayout();
     format_row->addWidget(new QLabel(tr("Export Format:"), this));
     output_format_combo = new QComboBox(this);
@@ -428,7 +430,7 @@ void GameExportDialog::SetupUi() {
            "'recompiled' executable and the shared library suyu loads to run the game on its own "
            "recompiler. Build can take hours on large titles; the window stays responsive while "
            "it works."));
-    output_format_combo->setCurrentIndex(0);
+    output_format_combo->setCurrentIndex(1);
     format_row->addWidget(output_format_combo, 1);
     layout->addLayout(format_row);
 
@@ -548,14 +550,20 @@ void GameExportDialog::SetupUi() {
                    "recompiler. Build can take hours on large titles; the window stays responsive while "
                    "it works."));
         }
-        // AddGameShortcut launches suyu with -g; it cannot faithfully publish
-        // the standalone launcher produced here. Keep this disabled until the
-        // Steam integration provides a launcher-specific, durable API.
-        steam_shortcut_checkbox->setChecked(false);
-        steam_shortcut_checkbox->setEnabled(false);
+        // Only a Windows package has a launcher executable to point a shortcut at: the JIT
+        // baseline, or a static or Hybrid Build. A Source export deletes the launcher.
+        const bool has_launcher = is_windows && (!uses_aot || WantsCompiledOutput());
+        steam_shortcut_checkbox->setEnabled(has_launcher);
+        if (!has_launcher) {
+            steam_shortcut_checkbox->setChecked(false);
+        }
         steam_shortcut_checkbox->setToolTip(
-            tr("Steam shortcuts for exported standalone launchers are not available yet."));
-        steam_replace_rom_checkbox->setEnabled(false);
+            has_launcher ? tr("Adds the exported game to Steam as a non-Steam shortcut that runs "
+                              "its own executable. Restart Steam to see it.")
+                         : tr("Needs a Windows export with a launcher: choose Build, or the JIT "
+                              "baseline."));
+        steam_replace_rom_checkbox->setEnabled(has_launcher &&
+                                               steam_shortcut_checkbox->isChecked());
         if (backend == RecompileBackend::SuyuStatic) {
             note_label->setText(
                 tr("Experimental: translates the game's ARM64 code ahead of time with no JIT "
@@ -574,9 +582,36 @@ void GameExportDialog::SetupUi() {
     };
     connect(backend_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
             update_options);
+    connect(platform_combo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+        if (platform_combo->currentData().toInt() == static_cast<int>(TargetPlatform::Windows)) {
+            output_format_combo->setCurrentIndex(1);
+        }
+    });
     connect(platform_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
             update_options);
+    connect(output_format_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            update_options);
     update_options(backend_combo->currentIndex());
+}
+
+QString GameExportDialog::MaybeAddToSteam(const QString& game_title, const QString& exe_path,
+                                          const QString& backend_label, bool replace) {
+    SteamIntegration steam;
+    if (!steam.IsSteamInstalled()) {
+        return tr("\n\nSteam was not found, so no Steam shortcut was added.");
+    }
+    if (!QFileInfo(exe_path).isFile()) {
+        return tr("\n\nNo launcher executable was found in the package, so no Steam shortcut "
+                  "was added.");
+    }
+    // Replacing takes over the game's own name; keeping both needs a distinct one.
+    const QString app_name =
+        replace ? game_title : QStringLiteral("%1 (%2)").arg(game_title, backend_label);
+    if (!steam.AddLauncherShortcut(app_name, exe_path, replace ? game_title : QString())) {
+        return tr("\n\nThe Steam shortcut could not be written. Steam's shortcut list was left "
+                  "unchanged.");
+    }
+    return tr("\n\nAdded to Steam as \"%1\". Restart Steam to see it.").arg(app_name);
 }
 
 // Deconstructed titles keep the multi-gigabyte RomFS beside the NSOs. Stage
@@ -783,17 +818,6 @@ void GameExportDialog::SetRomPath(const QString& path, quint64 program_id) {
     rom_path_edit->setText(path);
     rom_program_id = program_id;
     rom_program_id_path = path;
-
-    const bool allow_portable_data = program_id != 0;
-    include_save_data_checkbox->setEnabled(allow_portable_data);
-    include_shader_cache_checkbox->setEnabled(allow_portable_data);
-    include_custom_config_checkbox->setEnabled(allow_portable_data);
-
-    if (!allow_portable_data) {
-        include_save_data_checkbox->setChecked(false);
-        include_shader_cache_checkbox->setChecked(false);
-        include_custom_config_checkbox->setChecked(false);
-    }
     RefreshUpdateStatus();
 }
 
@@ -864,12 +888,6 @@ void GameExportDialog::OnBrowseRom() {
     if (!file.isEmpty()) {
         rom_path_edit->setText(file);
         rom_program_id = 0;
-        include_save_data_checkbox->setChecked(false);
-        include_shader_cache_checkbox->setChecked(false);
-        include_custom_config_checkbox->setChecked(false);
-        include_save_data_checkbox->setEnabled(false);
-        include_shader_cache_checkbox->setEnabled(false);
-        include_custom_config_checkbox->setEnabled(false);
         RefreshUpdateStatus();
     }
 }
@@ -914,11 +932,17 @@ quint64 GameExportDialog::SelectedProgramId() const {
     if (!file) {
         return 0;
     }
+    // Parsing opens and decrypts the container headers, so remember the answer per path.
+    if (path == cached_program_id_path) {
+        return cached_program_id;
+    }
     const auto loader = Loader::GetLoader(system_, file);
     u64 program_id{};
     if (!loader || loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {
-        return 0;
+        program_id = 0;
     }
+    cached_program_id_path = path;
+    cached_program_id = program_id;
     return program_id;
 }
 
@@ -977,6 +1001,16 @@ GameExportDialog::UpdateState GameExportDialog::CurrentUpdateState(QString* vers
 void GameExportDialog::RefreshUpdateStatus() {
     if (!update_status_label) {
         return;
+    }
+    // Save data, shaders and per-game config are all keyed by title ID; the library may not
+    // supply one (cartridge dumps, browsed files), so read it the same way the Update row does.
+    const bool allow_portable_data = SelectedProgramId() != 0;
+    for (QCheckBox* box : {include_save_data_checkbox, include_shader_cache_checkbox,
+                           include_custom_config_checkbox}) {
+        box->setEnabled(allow_portable_data);
+        if (!allow_portable_data) {
+            box->setChecked(false);
+        }
     }
     QString version;
     const UpdateState state = CurrentUpdateState(&version);
@@ -3971,15 +4005,24 @@ void GameExportDialog::OnExport() {
     const bool include_save_data = include_save_data_checkbox->isChecked();
     const bool include_shader_cache = include_shader_cache_checkbox->isChecked();
     const bool include_custom_config = include_custom_config_checkbox->isChecked();
+    // Read once: a Build can run for hours with the dialog responsive, and the ROM field or
+    // these options may change meanwhile.
+    const u64 export_program_id = SelectedProgramId();
+    const bool add_to_steam =
+        steam_shortcut_checkbox->isEnabled() && steam_shortcut_checkbox->isChecked();
+    const bool steam_replace = steam_replace_rom_checkbox->isChecked();
     const QFileInfo rom_info(rom_path);
     // Prefer the NACP/library title; fall back to filename if not found.
     QString game_name = rom_info.completeBaseName();
+    // The unsanitized title: what the library's own Steam shortcut for this game is called.
+    QString game_title = game_name;
     bool matched_library_entry = false;
     for (const auto& entry : library_entries_) {
         if (QFileInfo(entry.path) == rom_info) {
             matched_library_entry = true;
             if (!entry.title.trimmed().isEmpty()) {
                 game_name = entry.title.trimmed();
+                game_title = game_name;
                 // Strip characters that are illegal in Windows filenames
                 static const QRegularExpression kIllegal(QStringLiteral("[\\\\/:*?\"<>|]"));
                 game_name.replace(kIllegal, QStringLiteral("_"));
@@ -4112,7 +4155,7 @@ void GameExportDialog::OnExport() {
 
     // Step 5: Bundle portable data (save, shader, config)
     if ((include_save_data || include_shader_cache || include_custom_config) &&
-        rom_program_id != 0) {
+        export_program_id != 0) {
         status_label->setText(tr("Bundling portable data..."));
         QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
@@ -4130,7 +4173,7 @@ void GameExportDialog::OnExport() {
             break;
         }
 
-        if (!CopyPortableSupportData(rom_program_id, pkg_root, include_save_data,
+        if (!CopyPortableSupportData(export_program_id, pkg_root, include_save_data,
                                      include_shader_cache, include_custom_config)) {
             throw std::runtime_error("Failed to bundle portable support data");
         }
@@ -4197,6 +4240,12 @@ void GameExportDialog::OnExport() {
                 .arg(last_fallback_modules.size())
                 .arg(last_fallback_modules.join(QStringLiteral("\n  ")));
     }
+    if (add_to_steam && platform == TargetPlatform::Windows) {
+        fallback_note += MaybeAddToSteam(
+            game_title, final_path + QDir::separator() + export_name + QStringLiteral(".exe"),
+            !uses_aot ? tr("Dynarmic JIT") : is_hybrid ? tr("Hybrid") : tr("suyu static"),
+            steam_replace);
+    }
 
     if (!uses_aot) {
         QMessageBox::information(
@@ -4204,7 +4253,8 @@ void GameExportDialog::OnExport() {
             tr("The Dynarmic JIT (Baseline) package was exported to:\n%1\n\n"
                "Run %2.exe and compare it with the suyu static (Experimental) export of the "
                "same game.")
-                .arg(final_path, export_name));
+                    .arg(final_path, export_name) +
+                fallback_note);
     } else if (is_hybrid) {
         QMessageBox::information(
             this, tr("Hybrid Export Complete"),
