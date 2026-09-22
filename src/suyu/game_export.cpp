@@ -896,8 +896,9 @@ static bool RomFileIncludesUpdate(const QString& rom_path, u64 program_id) {
                                     FileSys::ContentRecordType::Program,
                                     FileSys::TitleType::Update);
     // An update whose code cannot be opened is skipped by the extractors, so it does not count.
-    return update != nullptr && update->GetStatus() == Loader::ResultStatus::Success &&
-           update->GetExeFS() != nullptr;
+    // Its status is not checked: an update NCA opened without its base always reports
+    // ErrorMissingBKTRBaseRomFS, yet its ExeFS - all the extractors take from it - is fine.
+    return update != nullptr && update->GetExeFS() != nullptr;
 }
 
 quint64 GameExportDialog::SelectedProgramId() const {
@@ -949,9 +950,10 @@ GameExportDialog::UpdateState GameExportDialog::CurrentUpdateState(QString* vers
     // An enabled installed update wins over one packed in the file for both ExeFS and RomFS.
     if (selection.installed_exefs) {
         const auto update = content_provider.GetEntry(update_id, FileSys::ContentRecordType::Program);
-        // PatchExeFS silently keeps the base code when the update cannot be opened.
-        if (update == nullptr || update->GetStatus() != Loader::ResultStatus::Success ||
-            update->GetExeFS() == nullptr) {
+        // PatchExeFS silently keeps the base code when the update's ExeFS cannot be opened.
+        // Status is not checked: without its base an update NCA always reports
+        // ErrorMissingBKTRBaseRomFS, even when its ExeFS reads fine.
+        if (update == nullptr || update->GetExeFS() == nullptr) {
             return UpdateState::Unreadable;
         }
         if (version) {
