@@ -22,6 +22,7 @@
 #include <QJsonObject>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QProgressDialog>
 #include <QCloseEvent>
 #include <QEventLoop>
 #include <QProcess>
@@ -71,6 +72,7 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/recompiler/arm64_to_c.h"
+#include "frontend_common/content_manager.h"
 #include "frontend_common/firmware_manager.h"
 
 // ---------------------------------------------------------------------------
@@ -304,6 +306,19 @@ void GameExportDialog::SetupUi() {
     rom_row->addWidget(rom_browse_btn);
     layout->addLayout(rom_row);
 
+    // Update row: exports use the game's installed update, so say which one, and let a fresh
+    // suyu install add it here instead of sending the user to File > Install first.
+    auto* update_row = new QHBoxLayout();
+    update_row->addWidget(new QLabel(tr("Update:"), this));
+    update_status_label = new QLabel(this);
+    update_status_label->setWordWrap(true);
+    update_row->addWidget(update_status_label, 1);
+    install_update_button = new QPushButton(tr("Install Update File..."), this);
+    install_update_button->setToolTip(
+        tr("Install a game update (.nsp) into suyu so the export uses that version."));
+    update_row->addWidget(install_update_button);
+    layout->addLayout(update_row);
+
     // Output path row
     auto* out_row = new QHBoxLayout();
     out_row->addWidget(new QLabel(tr("Output:"), this));
@@ -482,6 +497,17 @@ void GameExportDialog::SetupUi() {
     connect(rom_browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseRom);
     connect(browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseOutput);
     connect(export_button, &QPushButton::clicked, this, &GameExportDialog::OnExport);
+    connect(install_update_button, &QPushButton::clicked, this,
+            &GameExportDialog::OnInstallUpdate);
+    connect(rom_path_edit, &QLineEdit::editingFinished, this, [this] {
+        if (rom_path_edit->text() != rom_program_id_path) {
+            rom_program_id = 0;
+        }
+        if (!export_in_progress) {
+            RefreshUpdateStatus();
+        }
+    });
+    RefreshUpdateStatus();
     const auto update_options = [this, note_label](int) {
         const bool is_windows = platform_combo->currentData().toInt() ==
                                 static_cast<int>(TargetPlatform::Windows);
@@ -756,6 +782,7 @@ void GameExportDialog::SetGameIcon(const QPixmap& icon) {
 void GameExportDialog::SetRomPath(const QString& path, quint64 program_id) {
     rom_path_edit->setText(path);
     rom_program_id = program_id;
+    rom_program_id_path = path;
 
     const bool allow_portable_data = program_id != 0;
     include_save_data_checkbox->setEnabled(allow_portable_data);
@@ -767,6 +794,7 @@ void GameExportDialog::SetRomPath(const QString& path, quint64 program_id) {
         include_shader_cache_checkbox->setChecked(false);
         include_custom_config_checkbox->setChecked(false);
     }
+    RefreshUpdateStatus();
 }
 
 void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QString& output_dir,
@@ -842,6 +870,263 @@ void GameExportDialog::OnBrowseRom() {
         include_save_data_checkbox->setEnabled(false);
         include_shader_cache_checkbox->setEnabled(false);
         include_custom_config_checkbox->setEnabled(false);
+        RefreshUpdateStatus();
+    }
+}
+
+// Cartridge dumps and some NSPs carry the update next to the base game; the ExeFS
+// extractor applies it from there, so such a game needs nothing installed.
+static bool RomFileIncludesUpdate(const QString& rom_path, u64 program_id) {
+    static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    const auto file = vfs->OpenFile(rom_path.toStdString(), FileSys::OpenMode::Read);
+    if (!file) {
+        return false;
+    }
+    std::shared_ptr<FileSys::NSP> nsp;
+    if (rom_path.endsWith(QStringLiteral(".nsp"), Qt::CaseInsensitive)) {
+        nsp = std::make_shared<FileSys::NSP>(file);
+    } else if (rom_path.endsWith(QStringLiteral(".xci"), Qt::CaseInsensitive)) {
+        const FileSys::XCI xci{file};
+        nsp = xci.GetSecurePartitionNSP();
+    }
+    if (!nsp || nsp->GetStatus() != Loader::ResultStatus::Success) {
+        return false;
+    }
+    const auto update = nsp->GetNCA(FileSys::GetUpdateTitleID(program_id),
+                                    FileSys::ContentRecordType::Program,
+                                    FileSys::TitleType::Update);
+    // An update whose code cannot be opened is skipped by the extractors, so it does not count.
+    return update != nullptr && update->GetStatus() == Loader::ResultStatus::Success &&
+           update->GetExeFS() != nullptr;
+}
+
+quint64 GameExportDialog::SelectedProgramId() const {
+    if (rom_program_id != 0) {
+        return rom_program_id;
+    }
+    const QString path = rom_path_edit->text();
+    if (path.isEmpty() || !QFile::exists(path)) {
+        return 0;
+    }
+    static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    const auto file = vfs->OpenFile(path.toStdString(), FileSys::OpenMode::Read);
+    if (!file) {
+        return 0;
+    }
+    const auto loader = Loader::GetLoader(system_, file);
+    u64 program_id{};
+    if (!loader || loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {
+        return 0;
+    }
+    return program_id;
+}
+
+GameExportDialog::UpdateState GameExportDialog::CurrentUpdateState(QString* version) const {
+    const QString rom_path = rom_path_edit->text();
+    if (rom_path.isEmpty()) {
+        return UpdateState::NoGame;
+    }
+    // Only NSP and XCI exports go through the update: a standalone NCA exports its own ExeFS,
+    // and pairing an installed update's RomFS with it is refused as inconsistent.
+    if (!rom_path.endsWith(QStringLiteral(".nsp"), Qt::CaseInsensitive) &&
+        !rom_path.endsWith(QStringLiteral(".xci"), Qt::CaseInsensitive)) {
+        return UpdateState::NotApplicable;
+    }
+    const u64 program_id = SelectedProgramId();
+    if (program_id == 0) {
+        return UpdateState::NoGame;
+    }
+    // Ask PatchManager the question the extractors will: whether the add-on settings let an
+    // update replace the ExeFS and the RomFS. Reading the Add-Ons list instead gets this wrong,
+    // since one "Update (SDMC)" flag turns off a NAND copy too.
+    const FileSys::PatchManager pm{program_id, system_.GetFileSystemController(),
+                                   system_.GetContentProvider()};
+    const auto selection = pm.GetUpdateSelection();
+    const u64 update_id = FileSys::GetUpdateTitleID(program_id);
+    const auto& content_provider = system_.GetContentProvider();
+    // Includes updates the game list registered from game files, which PatchManager uses too.
+    const bool any_update = content_provider.HasEntry(update_id, FileSys::ContentRecordType::Program);
+    // An enabled installed update wins over one packed in the file for both ExeFS and RomFS.
+    if (selection.installed_exefs) {
+        const auto update = content_provider.GetEntry(update_id, FileSys::ContentRecordType::Program);
+        // PatchExeFS silently keeps the base code when the update cannot be opened.
+        if (update == nullptr || update->GetStatus() != Loader::ResultStatus::Success ||
+            update->GetExeFS() == nullptr) {
+            return UpdateState::Unreadable;
+        }
+        if (version) {
+            // The display version ("4.0.0") from the control data, with the update applied the
+            // same way the patcher applies it.
+            const auto metadata = pm.GetControlMetadata();
+            if (metadata.first) {
+                *version = QString::fromStdString(metadata.first->GetVersionString());
+            }
+        }
+        return UpdateState::Installed;
+    }
+    // A packed update reaches the ExeFS unconditionally but the RomFS only while updates are
+    // enabled; otherwise the pair would not match and the export refuses it.
+    if (RomFileIncludesUpdate(rom_path, program_id)) {
+        return selection.romfs_enabled ? UpdateState::Bundled : UpdateState::BundledDisabled;
+    }
+    return any_update ? UpdateState::Disabled : UpdateState::None;
+}
+
+void GameExportDialog::RefreshUpdateStatus() {
+    if (!update_status_label) {
+        return;
+    }
+    QString version;
+    const UpdateState state = CurrentUpdateState(&version);
+    install_update_button->setEnabled(state != UpdateState::NoGame &&
+                                      state != UpdateState::NotApplicable);
+    switch (state) {
+    case UpdateState::NoGame:
+        update_status_label->setText(tr("Select a game to check for an update."));
+        break;
+    case UpdateState::NotApplicable:
+        update_status_label->setText(
+            tr("Updates apply to .nsp and .xci games. This file exports as it is."));
+        break;
+    case UpdateState::None:
+        update_status_label->setText(
+            tr("No update installed. The export will use the base game version."));
+        break;
+    case UpdateState::Disabled:
+        update_status_label->setText(
+            tr("Updates are turned off for this game (Properties > Add-Ons), so the export "
+               "will not use its update."));
+        break;
+    case UpdateState::Installed:
+        update_status_label->setText(
+            version.isEmpty()
+                ? tr("An update is available and turned on. The export will use it.")
+                : tr("Update %1 is available and turned on. The export will use it.")
+                      .arg(version));
+        break;
+    case UpdateState::Bundled:
+        update_status_label->setText(
+            tr("Update included in this game file. The export will use it."));
+        break;
+    case UpdateState::BundledDisabled:
+        update_status_label->setText(
+            tr("This game file includes an update, but updates are turned off for this game "
+               "(Properties > Add-Ons). Turn them on to export it."));
+        break;
+    case UpdateState::Unreadable:
+        update_status_label->setText(
+            tr("The installed update cannot be read. It may need keys that are not installed, "
+               "or be damaged. Reinstall it, or the export will use the base game version."));
+        break;
+    }
+}
+
+void GameExportDialog::OnInstallUpdate() {
+    if (!export_in_progress) {
+        PromptAndInstallUpdate();
+    }
+}
+
+bool GameExportDialog::PromptAndInstallUpdate() {
+    const u64 program_id = SelectedProgramId();
+    if (program_id == 0) {
+        QMessageBox::warning(this, tr("No Game Selected"),
+                             tr("Select the game first, then install its update."));
+        return false;
+    }
+    const QString update_path = QFileDialog::getOpenFileName(
+        this, tr("Select Update File"), QString(),
+        tr("Switch update (*.nsp);;All files (*.*)"), nullptr,
+        QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
+    if (update_path.isEmpty()) {
+        return false;
+    }
+    if (!update_path.endsWith(QStringLiteral(".nsp"), Qt::CaseInsensitive)) {
+        QMessageBox::warning(this, tr("Not an Update File"),
+                             tr("Game updates are .nsp files. Choose the update .nsp for this "
+                                "game."));
+        return false;
+    }
+
+    // Check the file before copying gigabytes into the NAND: it must be an update, and for
+    // this game rather than another one.
+    const auto vfs = system_.GetFilesystem();
+    const auto file = vfs->OpenFile(update_path.toStdString(), FileSys::OpenMode::Read);
+    const u64 update_id = FileSys::GetUpdateTitleID(program_id);
+    bool readable = false;
+    bool is_this_update = false;
+    if (file) {
+        const FileSys::NSP nsp{file};
+        readable = nsp.GetStatus() == Loader::ResultStatus::Success && !nsp.IsExtractedType();
+        is_this_update = readable && nsp.GetNCA(update_id, FileSys::ContentRecordType::Program,
+                                                FileSys::TitleType::Update) != nullptr;
+    }
+    if (!readable) {
+        QMessageBox::warning(this, tr("Update Not Readable"),
+                             tr("This update file could not be read. It may be damaged, or it "
+                                "may need keys that are not installed."));
+        return false;
+    }
+    if (!is_this_update) {
+        QMessageBox::warning(
+            this, tr("Not an Update for This Game"),
+            tr("This file is not an update for the selected game (update title ID %1).\n\n"
+               "Choose the update .nsp for this game. Base games and DLC are installed with "
+               "File > Install Files to NAND.")
+                .arg(QStringLiteral("%1").arg(update_id, 16, 16, QLatin1Char('0')).toUpper()));
+        return false;
+    }
+
+    // No Cancel button: InstallEntry removes a previously installed update before copying,
+    // so stopping partway would leave neither version usable.
+    QProgressDialog progress(tr("Installing update..."), QString(), 0, 1000, this);
+    progress.setCancelButton(nullptr);
+    progress.setWindowTitle(tr("Install Update"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    install_update_button->setEnabled(false);
+    export_button->setEnabled(false);
+    const auto result = ContentManager::InstallNSP(
+        system_, *vfs, update_path.toStdString(), [&progress](size_t total, size_t done) {
+            progress.setValue(total == 0 ? 0 : static_cast<int>(done * 1000 / total));
+            QCoreApplication::processEvents();
+            return false;
+        });
+    progress.close();
+    export_button->setEnabled(true);
+    // A failed install can leave the cache listing files it no longer has.
+    system_.GetFileSystemController().GetUserNANDContents()->Refresh();
+    RefreshUpdateStatus();
+
+    switch (result) {
+    case ContentManager::InstallResult::Success:
+    case ContentManager::InstallResult::Overwrite: {
+        // Judge by what the export will actually get, not by the install succeeding.
+        const UpdateState after = CurrentUpdateState();
+        if (after == UpdateState::Installed || after == UpdateState::Bundled) {
+            QMessageBox::information(this, tr("Update Installed"),
+                                     tr("The update was installed. The export will use it."));
+            return true;
+        }
+        QMessageBox::information(
+            this, tr("Update Installed"),
+            after == UpdateState::Unreadable
+                ? tr("The update was installed, but suyu still cannot read the update it would "
+                     "use for this game. It may need keys that are not installed.")
+                : tr("The update was installed, but updates are turned off for this game. Turn "
+                     "them on in the game's Properties > Add-Ons to export the updated game."));
+        return false;
+    }
+    case ContentManager::InstallResult::BaseInstallAttempted:
+        QMessageBox::warning(this, tr("Not an Update"),
+                             tr("This file is a base game, not an update."));
+        return false;
+    case ContentManager::InstallResult::Failure:
+    default:
+        QMessageBox::warning(this, tr("Update Not Installed"),
+                             tr("The update could not be installed. The file may be "
+                                "damaged or need keys that are not installed."));
+        return false;
     }
 }
 
@@ -3586,6 +3871,58 @@ void GameExportDialog::OnExport() {
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (answer != QMessageBox::Yes) {
             return;
+        }
+    }
+
+    // A fresh suyu install may have the game but not its update. Offer to install it here
+    // rather than silently exporting the base version.
+    if (!test_driven_export) {
+        const UpdateState update_state = CurrentUpdateState();
+        if (update_state == UpdateState::BundledDisabled) {
+            // The ExeFS would come from the file's update and the RomFS from the base game,
+            // which packaging refuses - after the whole compile. Stop before it starts.
+            QMessageBox::warning(
+                this, tr("Updates Turned Off"),
+                tr("This game file includes an update, but updates are turned off for this "
+                   "game. The export cannot mix the update's code with the base game's data.\n\n"
+                   "Turn updates on in the game's Properties > Add-Ons, then export again."));
+            return;
+        }
+        if (update_state == UpdateState::None || update_state == UpdateState::Disabled ||
+            update_state == UpdateState::Unreadable) {
+            QMessageBox box(QMessageBox::Question,
+                            update_state == UpdateState::None ? tr("No Game Update")
+                                                              : tr("Game Update Not Used"),
+                            update_state == UpdateState::None
+                                ? tr("No update is installed for this game, so the export "
+                                     "will use the base game version.\n\nIf you have the "
+                                     "update file (.nsp), install it now so the export uses "
+                                     "the updated game.")
+                            : update_state == UpdateState::Disabled
+                                ? tr("Updates are turned off for this game, so the export will "
+                                     "not use its update.\n\nTurn updates on in the game's "
+                                     "Properties > Add-Ons to export the updated game.")
+                                : tr("The installed update cannot be read, so the export will "
+                                     "use the base game version.\n\nIt may need keys that are "
+                                     "not installed, or be damaged. Reinstalling it may help."),
+                            QMessageBox::NoButton, this);
+            QPushButton* install_button = nullptr;
+            if (update_state == UpdateState::None || update_state == UpdateState::Unreadable) {
+                install_button =
+                    box.addButton(tr("Install Update File..."), QMessageBox::AcceptRole);
+            }
+            QPushButton* base_button =
+                box.addButton(tr("Export Without Update"), QMessageBox::DestructiveRole);
+            box.addButton(QMessageBox::Cancel);
+            box.setDefaultButton(QMessageBox::Cancel);
+            box.exec();
+            if (install_button && box.clickedButton() == install_button) {
+                if (!PromptAndInstallUpdate()) {
+                    return;
+                }
+            } else if (box.clickedButton() != base_button) {
+                return;
+            }
         }
     }
 

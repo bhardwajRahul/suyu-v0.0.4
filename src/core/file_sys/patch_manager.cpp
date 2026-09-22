@@ -781,6 +781,73 @@ VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs
     return romfs;
 }
 
+PatchManager::UpdateSelection PatchManager::GetUpdateSelection() const {
+    const auto& disabled = Settings::values.disabled_addons[title_id];
+    const auto is_disabled = [&disabled](std::string_view name) {
+        return std::find(disabled.cbegin(), disabled.cend(), name) != disabled.cend();
+    };
+    const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
+    const auto update_tid = GetUpdateTitleID(title_id);
+
+    // External, then Android's manual provider: the first one listing versions decides.
+    bool listed = false;
+    bool listed_enabled = false;
+    if (content_union) {
+        const auto check = [&](const auto& versions) {
+            if (listed || versions.empty()) {
+                return;
+            }
+            listed = true;
+            for (const auto& entry : versions) {
+                if (!IsVersionedExternalUpdateDisabled(disabled, entry.version)) {
+                    listed_enabled = true;
+                    break;
+                }
+            }
+        };
+        if (const auto* external = content_union->GetExternalProvider()) {
+            check(external->ListUpdateVersions(update_tid));
+        }
+        if (const auto* manual = static_cast<const ManualContentProvider*>(
+                content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual))) {
+            check(manual->ListUpdateVersions(update_tid));
+        }
+    }
+
+    const bool nand_disabled = is_disabled("Update (NAND)");
+    const bool sdmc_disabled = is_disabled("Update (SDMC)");
+    UpdateSelection selection;
+    if (!listed) {
+        // NAND/SD only: any of the three flags turns updates off. PatchExeFS also needs one
+        // installed; PatchRomFS does not, which is what lets it apply a packed update.
+        const bool flags_clear = !nand_disabled && !sdmc_disabled && !is_disabled("Update");
+        selection.installed_exefs =
+            flags_clear && content_provider.HasEntry(update_tid, ContentRecordType::Program);
+        selection.romfs_enabled = flags_clear;
+        return selection;
+    }
+    if (listed_enabled) {
+        selection.installed_exefs = true;
+        selection.romfs_enabled = true;
+        return selection;
+    }
+    // Every listed version is off: a NAND or SD copy may still apply by its own flag.
+    if (content_union && (!nand_disabled || !sdmc_disabled)) {
+        for (const auto& [slot, entry] : content_union->ListEntriesFilterOrigin(
+                 std::nullopt, TitleType::Update, ContentRecordType::Program, update_tid)) {
+            const bool nand = slot == ContentProviderUnionSlot::UserNAND ||
+                              slot == ContentProviderUnionSlot::SysNAND;
+            if ((nand && !nand_disabled) ||
+                (slot == ContentProviderUnionSlot::SDMC && !sdmc_disabled)) {
+                selection.installed_exefs = true;
+                selection.romfs_enabled = true;
+                break;
+            }
+        }
+    }
+    return selection;
+}
+
 std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     if (title_id == 0) {
         return {};

@@ -114,6 +114,17 @@ public:
     // Returns a vector of patches
     [[nodiscard]] std::vector<Patch> GetPatches(VirtualFile update_raw = nullptr) const;
 
+    struct UpdateSelection {
+        /// PatchExeFS will replace the ExeFS with an installed (external, NAND or SD) update.
+        bool installed_exefs{};
+        /// PatchRomFS treats updates as enabled, so it applies an installed update or, failing
+        /// that, one packed in the game file.
+        bool romfs_enabled{};
+    };
+    // Whether the add-on settings let PatchExeFS and PatchRomFS apply an update. Mirrors their
+    // own selection rules, which differ slightly; keep the three in sync.
+    [[nodiscard]] UpdateSelection GetUpdateSelection() const;
+
     // If the game update exists, returns the u32 version field in its Meta-type NCA. If that fails,
     // it will fallback to the Meta-type NCA of the base game. If that fails, the result will be
     // std::nullopt

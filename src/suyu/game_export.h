@@ -117,6 +117,7 @@ private slots:
     void OnSelectFromLibrary();
     void OnBrowseOutput();
     void OnExport();
+    void OnInstallUpdate();
 
 protected:
     // An export pumps the event loop for as long as the compilers take (tens of
@@ -131,6 +132,26 @@ protected:
 
 private:
     void SetupUi();
+
+    /// What the export will run for the selected game's update.
+    enum class UpdateState {
+        NoGame,    ///< No ROM selected, or its title ID could not be read
+        NotApplicable, ///< NCA/NRO/extracted input: the exporter never applies an update
+        None,      ///< Neither installed nor included in the ROM file
+        Disabled,  ///< Installed, but turned off in the game's add-on settings
+        Installed, ///< Installed in suyu, and used by the export
+        Bundled,   ///< Included in the selected NSP/XCI itself
+        BundledDisabled, ///< Included in the file, but updates are off: the export would refuse
+        Unreadable,      ///< Turned on but its code cannot be read (missing keys or damage)
+    };
+    /// Title ID of the selected ROM: the library's when known, else read from the file.
+    quint64 SelectedProgramId() const;
+    UpdateState CurrentUpdateState(QString* version = nullptr) const;
+    /// Refresh the Update row after the ROM changes or an update is installed.
+    void RefreshUpdateStatus();
+    /// Ask for an update NSP, check it belongs to the selected game, and install it.
+    /// Returns true when an update was installed.
+    bool PromptAndInstallUpdate();
 
     /// True from the moment OnExport() starts until it returns. Guards both
     /// dialog teardown and re-entry into OnExport() itself: the automation RPC
@@ -182,7 +203,11 @@ private:
     QProgressBar* progress_bar{};
     QPushButton* export_button{};
     QLabel* status_label{};
+    QLabel* update_status_label{};
+    QPushButton* install_update_button{};
     quint64 rom_program_id{};
+    /// ROM path rom_program_id belongs to; a hand-typed different path invalidates it.
+    QString rom_program_id_path;
     QVector<LibraryEntry> library_entries_;
     Core::System& system_;
     QPixmap game_icon_;
