@@ -15,7 +15,7 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 <p align="center">
   <a href="#status">Status</a> |
   <a href="#static-recompilation">Static recompilation</a> |
-  <a href="docs/releases/v0.0.10.md">Changes in v0.0.10</a> |
+  <a href="docs/releases/v0.0.11.md">Changes in v0.0.11</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
@@ -26,11 +26,11 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 >
 > [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
 > archive and no further development was planned there. This fork picks it up
-> from commit `d1d09321d7` and continues the numbering: **v0.0.10**.
+> from commit `d1d09321d7` and continues the numbering, now at **v0.0.11**.
 >
 > The name and version line are kept deliberately, so the lineage stays legible.
-> `BUILD_FULLNAME` reads `suyu v0.0.10 (mk8-recomp)` — the suffix says *which*
-> 0.0.10 a binary is, since the archived repository could in principle be picked
+> `BUILD_FULLNAME` reads `suyu v0.0.11 (mk8-recomp)` — the suffix says *which*
+> 0.0.11 a binary is, since the archived repository could in principle be picked
 > up by others too. See [PROVENANCE.md](PROVENANCE.md).
 >
 > Work happens on the `mk8-recomp` branch, driven by
@@ -50,18 +50,19 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Current version: **v0.0.10**, continuing from the archived v0.04.
+Current version: **v0.0.11**, continuing from the archived v0.04.
 
 Upstream was inconsistent about its own version — the repository is named
 `suyu-v0.0.4`, the tag reads `v0.04-latest`, and `BUILD_FULLNAME` was hardcoded
 to `v0.04`. This fork normalises to the three-part form. Read literally, `v0.04`
 means 0.4, which was evidently not the intent.
 
-Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs.
-The GUI comes up, and games now boot under Vulkan/MoltenVK with the bundled
-MoltenVK library; see [macOS](#macos).
-Tests are off in that configuration. Android is inherited from upstream and
-untested since the fork; iOS is not included.
+Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs:
+games boot under Vulkan/MoltenVK with the bundled MoltenVK library, and MK8D
+races at 59–60 fps on the JIT; see [macOS](#macos). A RetroArch (libretro) core
+builds for Windows, Linux and macOS. Android: the APK and an opt-in ARM64
+libretro core build, but have run only in a software emulator; real devices are
+untested. iOS is not included.
 
 Linux needs five things Windows does not, all handled by
 [`scripts/build-suyu.sh`][bld] in the consuming project:
@@ -82,25 +83,33 @@ resolved only where CPM had fetched boost.
 
 ## Static recompilation
 
-[v0.0.10 downloads](https://github.com/dougchansan/suyu-v0.0.4/releases/tag/v0.0.10) are an experimental static execution checkpoint. **Use Hybrid AOT + JIT for best performance.** Static can load and run more slowly; this is a compatibility milestone, with optimization still in progress.
+**File > Export Game** turns a game into its own package. On Windows, a **Build**
+export is a standalone program with your settings, optional shader cache and
+automatic controller setup, and can be added to Steam directly. Linux and macOS
+exports are Source only. Exports never contain keys or firmware; they read them from
+the installed suyu. See the [Export Game guide](docs/user/GameExport.md).
 
-| Mode | Purpose |
+Static and Hybrid execution are experimental. **For MK8D today, the Dynarmic JIT
+export is the fastest** (Windows: JIT 60 fps, Hybrid 31–35, static ~25 in a race).
+Speeding up recompiled code on x86 is the next focus.
+
+| Mode (in Export Game order) | Purpose |
 |---|---|
-| suyu static (Experimental) | Ahead-of-time AArch64 code with suyu HLE; use the separate `no-jit` binaries for a host with Dynarmic entirely absent. |
-| Dynarmic JIT (Baseline) | Dynamic compilation for comparison and general compatibility. |
-| Hybrid AOT + JIT | Static code with JIT fallback; recommended for normal play and performance. |
+| suyu Dynarmic JIT (Baseline) | Default. Dynamic compilation; the most compatible and currently the fastest for MK8D. |
+| suyu Hybrid JIT + AOT | Static code with JIT fallback. Performance varies by game; compare it with the Dynarmic JIT export. |
+| suyu static AOT (Experimental) | Ahead-of-time AArch64 code with suyu HLE; use the separate `no-jit` binaries for a host with Dynarmic entirely absent. |
 
 The `no-jit` downloads are compiled with `-DSUYU_NO_JIT=ON` and audited for Dynarmic build inputs and executable symbols. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
-**Regenerate existing static modules for ABI 5.** ABI 5 validates the generated-image revision, instruction coverage, and memory guards more strictly; ABI 4 bundles are intentionally rejected. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
+**Re-export old builds (ABI 4 → ABI 5).** ABI 5 validates the generated-image revision, instruction coverage, and memory guards more strictly; ABI 4 bundles are intentionally rejected. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
 
-Current local testing reaches controller prompts, menus, attract rendering and the race starting grid without fallback. The starting grid was verified during a bounded idle observation after the replay ended. Race transitions outlast the JIT fixture; matching timing and full-race validation remain open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
+A strict-static MK8D v4.0.0 TAS replay reaches a rendered, controllable race segment with zero JIT fallbacks. Full-race validation remains open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
 
 Recording and playback are armed at boot. Use separate functional fixtures when loading times differ, record screenshots at milestones, and retain a bounded idle observation after EOF. Keep exact EOF and later milestone verdicts separate. Compare performance only with identical work, interleaved arms and an idle machine.
 
-Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe v0.0.10 gameplay performance. The current slowdown is being profiled; no new speedup is claimed.
+Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe current gameplay performance; the race figures above do (MK8D v4.0.0, measured 2026-09-22, full table in the release notes).
 
-See [release notes](docs/releases/v0.0.10.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
+See [release notes](docs/releases/v0.0.11.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
 
 ## Changes in v0.0.5
 
