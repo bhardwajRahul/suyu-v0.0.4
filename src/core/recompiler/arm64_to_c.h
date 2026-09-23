@@ -6417,13 +6417,15 @@ static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t b
 
    This runs on entry to every block, so the per-word loop below costs one
    indirect host callback per guest instruction before any guest work happens -
-   the largest single cost in the profile. When the whole block lies inside one
-   mapped page with a real backing pointer, the identical comparison is one
-   memcmp, so take that. It is a faster spelling of the same check, not a weaker
-   one: the same words are compared, and every case the fast path cannot prove
-   safe (unmapped, debug or GPU-tracked memory, a page crossing, an address
-   outside the space, a mismatch) falls through to the loop, which is also what
-   produces the precise diagnostic naming the offending word. */
+   the largest single cost in the profile. Where the block's words lie in mapped
+   pages with real backing pointers, the identical comparison is one memcmp per
+   page, so take that. A block that crosses a page boundary is compared as its
+   in-page pieces; sending it to the loop instead cost one callback per word on
+   every entry. It is a faster spelling of the same check, not a weaker one: the
+   same words are compared, and every case the fast path cannot prove safe
+   (unmapped, debug or GPU-tracked memory, an address outside the space, a
+   mismatch) falls through to the loop, which is also what produces the precise
+   diagnostic naming the offending word. */
 void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint32_t count,int host_guard_version){
   uint32_t k;
   if(c->host_mem && host_guard_version!=2){
@@ -6433,10 +6435,16 @@ void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint
   }
   if(c->host_mem && c->host_mem->page_entries && c->host_mem->page_bits<63 && count){
     uint64_t page_size=UINT64_C(1)<<c->host_mem->page_bits;
-    uint64_t bytes=(uint64_t)count*4;
-    if(bytes<=page_size && (pc&(page_size-1))<=page_size-bytes){
-      const unsigned char* p=recomp_host_ptr_n(c,pc,bytes);
-      if(p && memcmp(p,expected,(size_t)bytes)==0)return;
+    uint64_t bytes=(uint64_t)count*4, done=0;
+    if(pc<=UINT64_C(0xffffffffffff) && bytes<=UINT64_C(0xffffffffffff)-pc){
+      while(done<bytes){
+        uint64_t va=pc+done, room=page_size-(va&(page_size-1));
+        uint64_t n=bytes-done<room?bytes-done:room;
+        const unsigned char* p=recomp_host_ptr_n(c,va,n);
+        if(!p || memcmp(p,(const unsigned char*)expected+done,(size_t)n)!=0)break;
+        done+=n;
+      }
+      if(done==bytes)return;
     }
   }
   for(k=0;k<count;++k){

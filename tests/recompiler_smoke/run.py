@@ -47,7 +47,8 @@ def main():
         runner = executable(root / "run", "smoke_run")
         for mode in ("slice", "ordinary-page", "cross-page", "special-page"):
             call([runner, mode], timeout=15)
-        for mode in ("mutated", "mutated-entry", "unmapped-zero"):
+        for mode in ("mutated", "mutated-entry", "unmapped-zero",
+                     "cross-page-mutated", "cross-page-unmapped"):
             call([runner, mode], expected=86, timeout=15)
         call([executable(root / "run", "smoke_static")], timeout=15)
         print("All synthetic ABI5 smoke checks passed.")

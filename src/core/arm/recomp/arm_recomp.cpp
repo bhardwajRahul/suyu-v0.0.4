@@ -865,8 +865,11 @@ struct ArmRecomp::Impl {
         auto* self = static_cast<Impl*>(user);
         auto& memory = self->system.ApplicationMemory();
         if (size == 0) {
-            for (u32 offset = 0; offset < bytes; ++offset) {
-                if (!memory.IsValidVirtualAddress(va + offset)) return 0;
+            // Validity is per guest page, so the word's first and last bytes
+            // cover it; they are the same page unless the word straddles one.
+            if (!memory.IsValidVirtualAddress(va) ||
+                !memory.IsValidVirtualAddress(va + bytes - 1)) {
+                return 0;
             }
             return (u64{1} << 32) | memory.Read32(va);
         }

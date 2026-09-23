@@ -17,6 +17,7 @@ static uintptr_t pages[3];
 static unsigned reads;
 static uintptr_t stack_min = UINTPTR_MAX, stack_max;
 static int unmapped;
+static uint64_t unmapped_from = UINT64_MAX;
 static GuestContext context;
 static uint64_t abort_pc;
 static uint64_t checked_load(void* user, uint64_t va, uint32_t size) {
@@ -26,7 +27,7 @@ static uint64_t checked_load(void* user, uint64_t va, uint32_t size) {
     if ((uintptr_t)&word < stack_min) stack_min = (uintptr_t)&word;
     if ((uintptr_t)&word > stack_max) stack_max = (uintptr_t)&word;
     ++reads;
-    if (unmapped || va < 0x1000 || va - 0x1000 > sizeof(memory) - 4) return 0;
+    if (unmapped || va >= unmapped_from || va < 0x1000 || va - 0x1000 > sizeof(memory) - 4) return 0;
     memcpy(&word, memory + va - 0x1000, 4);
     return word | UINT64_C(0x100000000);
 }
@@ -117,11 +118,13 @@ int main(int argc, char** argv) {
         CHECK(0); /* No generated effect may precede guard rejection. */
     } else {
         uint32_t expected[] = {0xd503201f, 0};
-        uint64_t pc = !strcmp(mode, "cross-page") ? 0x1ffc : 0x1080;
+        const int cross = !strncmp(mode, "cross-page", 10);
+        uint64_t pc = cross ? 0x1ffc : 0x1080;
         memcpy(memory + pc - 0x1000, expected, sizeof(expected));
         reset(pc, 3);
         context.x[0] = 99;
-        if (!strcmp(mode, "mutated")) {
+        if (!strcmp(mode, "mutated") || !strcmp(mode, "cross-page-mutated")) {
+            /* For cross-page, the changed word is the one on the second page. */
             memory[pc - 0x1000 + 4] ^= 1;
             abort_pc = pc + 4;
             signal(SIGABRT, guard_aborted);
@@ -132,6 +135,12 @@ int main(int argc, char** argv) {
             unmapped = 1;
             abort_pc = pc;
             signal(SIGABRT, guard_aborted);
+        } else if (!strcmp(mode, "cross-page-unmapped")) {
+            /* The second page is gone, though its expected word (0) matches. */
+            pages[2] = 0;
+            unmapped_from = 0x2000;
+            abort_pc = pc + 4;
+            signal(SIGABRT, guard_aborted);
         } else if (!strcmp(mode, "special-page")) {
             /* A nonzero mapping tag without an ordinary backing pointer. */
             pages[1] = 1;
@@ -139,8 +148,11 @@ int main(int argc, char** argv) {
         }
         recomp_code_guard(&context, pc, expected,
                           !strcmp(mode, "unmapped-zero") ? 1 : 2, 2);
-        CHECK(strcmp(mode, "mutated") && strcmp(mode, "unmapped-zero"));
-        CHECK(reads == ((!strcmp(mode, "cross-page") || !strcmp(mode, "special-page")) ? 2u : 0u));
+        CHECK(strcmp(mode, "mutated") && strcmp(mode, "unmapped-zero") &&
+              strcmp(mode, "cross-page-mutated") && strcmp(mode, "cross-page-unmapped"));
+        /* A page crossing is compared per page without callbacks; only the
+           special mapping needs the checked loop. */
+        CHECK(reads == (!strcmp(mode, "special-page") ? 2u : 0u));
         CHECK(context.x[0] == 99);
     }
     printf("PASS %s\n", mode);
