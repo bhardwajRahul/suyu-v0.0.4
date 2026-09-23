@@ -19,6 +19,64 @@ the presence text. Linux and macOS export packaging currently produces source
 artifacts, not a playable launcher; a future compiled launcher can use the
 same `suyu-cmd` presence path.
 
+### Cover art
+
+Discord accepts an `https` image URL as the activity's large image and fetches
+it through its own media proxy. Suyu uses the lead image of the game's English
+Wikipedia article, with the Suyu logo as the small image. When no cover is
+known, the Suyu logo is the large image, as before.
+
+The lookup uses Wikipedia's public REST page summary
+(`https://en.wikipedia.org/api/rest_v1/page/summary/<page>`), trying
+"`<title> (video game)`" and then "`<title>`". A page is used only when its
+short description says "video game" and not "series", "franchise" or
+"character". The request carries only the game's title in the page name and a
+`User-Agent` identifying Suyu; nothing else about the player, the ROM or the
+system is sent. The page's `thumbnail` image (a few hundred pixels wide) is
+preferred, then its `originalimage`. Discord then downloads that image from
+Wikimedia when it shows the activity.
+
+- **Qt frontend.** While `enable_discord_presence` is on, starting a game
+  publishes the presence immediately with the Suyu logo and looks the title up
+  on Wikipedia on a worker thread (at most 6 s), so the GUI never waits on the
+  network. When a cover is found and the same game is still running, the
+  presence is updated with it. Results, including misses, are cached per title
+  for the session. Earlier builds sent the title to `suyu.dev` for the same
+  purpose whenever presence was on; that site no longer serves box art. The
+  setting remains the only switch: turning it off sends nothing to Discord or
+  Wikipedia.
+- **Exported games.** The export dialog's "Show this game in Discord (cover
+  art from Wikipedia)" option (on by default, for Windows packages with a
+  launcher) looks the cover up once, at export time, and reuses that lookup for
+  the Steam artwork when both are chosen. `suyu-cmd` itself never goes to the
+  network for presence.
+
+### `discord.ini` in exported packages
+
+The export writes `discord.ini` next to the package's executable:
+
+```ini
+enabled=1
+cover_url=https://upload.wikimedia.org/...
+```
+
+With the option unchecked it writes `enabled=0` and an empty `cover_url`. The
+file can be edited later; it is the off switch for an exported game and for the
+Steam shortcut that starts it.
+
+`suyu-cmd` reads the file from its own directory at start:
+
+- `enabled=0` (also `false`, `no`, `off`): Discord is never initialized, so
+  no IPC connection is made.
+- `cover_url`: used as the large image, with the Suyu logo as the small image,
+  when it is an `https://` URL of at most 256 bytes with no spaces or control
+  characters. Anything else is ignored and the Suyu logo is used.
+- Keys are case-insensitive, whitespace is trimmed, CRLF and a UTF-8 BOM are
+  accepted, unknown keys and comment lines are ignored, and only the first
+  4 KiB is read.
+- With no file, as with plain `suyu-cmd` or packages exported before this
+  change, presence behaves as before: enabled, with the Suyu logo.
+
 ## Join from Discord
 
 Discord's current [Social SDK activity documentation](https://discord.com/developers/docs/social-sdk/classdiscordpp_1_1Activity.html)

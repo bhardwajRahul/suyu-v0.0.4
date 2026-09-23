@@ -106,6 +106,70 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "common/linux/gamemode.h"
 #endif
 
+#ifdef USE_DISCORD_PRESENCE
+namespace {
+
+struct DiscordPackageSettings {
+    bool enabled = true;
+    std::string cover_url;
+};
+
+// discord.ini beside the executable, written by the game export dialog and editable by the
+// user: "enabled=0" keeps the game from contacting Discord, "cover_url" is an https image to
+// show instead of the suyu logo. Without the file nothing changes. Unknown keys and comment
+// lines are ignored; only the first 4 KiB is read.
+DiscordPackageSettings ReadDiscordIni(const std::filesystem::path& exe_dir) {
+    DiscordPackageSettings settings;
+    std::ifstream file(exe_dir / "discord.ini", std::ios::binary);
+    if (!file) {
+        return settings;
+    }
+    std::string text(4096, '\0');
+    file.read(text.data(), static_cast<std::streamsize>(text.size()));
+    text.resize(static_cast<size_t>(file.gcount()));
+    if (text.starts_with("\xEF\xBB\xBF")) {
+        text.erase(0, 3);
+    }
+    const auto trim = [](std::string_view value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string_view::npos) {
+            return std::string{};
+        }
+        return std::string(value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1));
+    };
+    const auto lower = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value;
+    };
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        const std::string key = lower(trim(std::string_view(line).substr(0, equals)));
+        const std::string value = trim(std::string_view(line).substr(equals + 1));
+        if (key == "enabled") {
+            const std::string flag = lower(value);
+            settings.enabled = !(flag == "0" || flag == "false" || flag == "no" || flag == "off");
+        } else if (key == "cover_url") {
+            // Discord takes an image key of at most 256 bytes. A longer or non-https value
+            // would only break the presence, so it is dropped rather than cut.
+            const bool usable =
+                value.size() <= 256 && value.starts_with("https://") &&
+                std::none_of(value.begin(), value.end(),
+                             [](unsigned char c) { return c <= 0x20 || c == 0x7f; });
+            settings.cover_url = usable ? value : std::string{};
+        }
+    }
+    return settings;
+}
+
+} // namespace
+#endif
+
 // Statically linked recompiled CPU modules.
 //
 // A per-game build of this executable (see SUYU_CMD_RECOMP_DIR in
@@ -1693,17 +1757,28 @@ int main(int argc, char** argv) {
 #ifdef USE_DISCORD_PRESENCE
     // Both suyu-cmd and the renamed executable shipped by a game export run
     // through this path, including when Steam starts the exported shortcut.
+#ifdef _WIN32
+    wchar_t discord_exe_buffer[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, discord_exe_buffer, MAX_PATH);
+    const std::filesystem::path discord_exe_path(discord_exe_buffer);
+#else
+    const std::filesystem::path discord_exe_path(argv[0]);
+#endif
+    const DiscordPackageSettings discord_settings =
+        ReadDiscordIni(discord_exe_path.parent_path());
+    const bool discord_enabled = discord_settings.enabled;
+    if (!discord_enabled) {
+        LOG_INFO(Frontend, "Discord presence disabled by discord.ini");
+    }
     std::string discord_title;
     system.GetAppLoader().ReadTitle(discord_title);
     if (discord_title.empty()) {
         // Extracted ExeFS exports may not carry the control data used for a
         // title. Their executable is already named after the game by the exporter.
 #ifdef _WIN32
-        wchar_t discord_exe_path[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, discord_exe_path, MAX_PATH);
-        discord_title = Common::UTF16ToUTF8(std::filesystem::path(discord_exe_path).stem().wstring());
+        discord_title = Common::UTF16ToUTF8(discord_exe_path.stem().wstring());
 #else
-        discord_title = std::filesystem::path(argv[0]).stem().string();
+        discord_title = discord_exe_path.stem().string();
 #endif
         if (discord_title == "suyu-cmd" || discord_title == "suyu-cmd-static") {
             discord_title = std::filesystem::path(filepath).stem().string();
@@ -1720,22 +1795,35 @@ int main(int argc, char** argv) {
         value.resize(length);
     };
     limit_discord_text(discord_title);
-    DiscordEventHandlers discord_handlers{};
-    // Share the Suyu application ID used by the Qt frontend.
-    Discord_Initialize("1221314350216646828", &discord_handlers, 0, nullptr);
     DiscordRichPresence discord_presence{};
-    discord_presence.details = "Playing a Nintendo Switch game";
     std::string discord_state = discord_title;
-    discord_presence.state = discord_state.c_str();
-    discord_presence.largeImageKey = "suyu_logo";
-    discord_presence.largeImageText = discord_title.c_str();
-    discord_presence.startTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                                          std::chrono::system_clock::now().time_since_epoch())
-                                          .count();
-    Discord_UpdatePresence(&discord_presence);
+    if (discord_enabled) {
+        DiscordEventHandlers discord_handlers{};
+        // Share the Suyu application ID used by the Qt frontend.
+        Discord_Initialize("1221314350216646828", &discord_handlers, 0, nullptr);
+        discord_presence.details = "Playing a Nintendo Switch game";
+        discord_presence.state = discord_state.c_str();
+        // Discord proxies an https image given as the key. The suyu logo then moves to the
+        // small image, as in the Qt frontend.
+        if (discord_settings.cover_url.empty()) {
+            discord_presence.largeImageKey = "suyu_logo";
+        } else {
+            discord_presence.largeImageKey = discord_settings.cover_url.c_str();
+            discord_presence.smallImageKey = "suyu_logo";
+        }
+        discord_presence.largeImageText = discord_title.c_str();
+        discord_presence.startTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count();
+        LOG_INFO(Frontend, "Discord presence: publishing \"{}\" with image key {}", discord_title,
+                 discord_presence.largeImageKey);
+        Discord_UpdatePresence(&discord_presence);
+    }
     SCOPE_EXIT {
-        Discord_ClearPresence();
-        Discord_Shutdown();
+        if (discord_enabled) {
+            Discord_ClearPresence();
+            Discord_Shutdown();
+        }
     };
 #endif
 
@@ -1851,17 +1939,19 @@ int main(int argc, char** argv) {
         // runs with no input, which keeps a NetPlay join or leave current in Discord.
         emu_window->WaitEvent();
 #ifdef USE_DISCORD_PRESENCE
-        std::string next_state = discord_title;
-        if (const auto member = system.GetRoomNetwork().GetRoomMember().lock();
-            member && member->IsConnected()) {
-            const auto room_name = member->GetRoomInformation().name;
-            next_state = room_name.empty() ? "In a NetPlay room" : "NetPlay: " + room_name;
-        }
-        limit_discord_text(next_state);
-        if (next_state != discord_state) {
-            discord_state = std::move(next_state);
-            discord_presence.state = discord_state.c_str();
-            Discord_UpdatePresence(&discord_presence);
+        if (discord_enabled) {
+            std::string next_state = discord_title;
+            if (const auto member = system.GetRoomNetwork().GetRoomMember().lock();
+                member && member->IsConnected()) {
+                const auto room_name = member->GetRoomInformation().name;
+                next_state = room_name.empty() ? "In a NetPlay room" : "NetPlay: " + room_name;
+            }
+            limit_discord_text(next_state);
+            if (next_state != discord_state) {
+                discord_state = std::move(next_state);
+                discord_presence.state = discord_state.c_str();
+                Discord_UpdatePresence(&discord_presence);
+            }
         }
 #endif
         if (capture_dir.empty() || system.Renderer().IsScreenshotPending() ||

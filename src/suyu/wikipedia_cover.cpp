@@ -3,6 +3,7 @@
 
 #include "suyu/wikipedia_cover.h"
 
+#include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QJsonDocument>
@@ -11,6 +12,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QTimer>
 #include <QUrl>
 
@@ -88,6 +90,24 @@ QString DiscordImageUrl(const CoverUrls& urls) {
         }
     }
     return {};
+}
+
+bool WriteDiscordIni(const QString& package_dir, bool enabled, const QString& cover_url) {
+    QSaveFile file(QDir(package_dir).filePath(QStringLiteral("discord.ini")));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+    QByteArray text =
+        QByteArrayLiteral("# Discord Rich Presence for this exported game.\r\n"
+                          "# enabled=0 stops the game from contacting Discord at all.\r\n"
+                          "# cover_url is the https image Discord shows; leave empty for the "
+                          "suyu logo.\r\n");
+    text += enabled ? QByteArrayLiteral("enabled=1\r\n") : QByteArrayLiteral("enabled=0\r\n");
+    text += QByteArrayLiteral("cover_url=") +
+            (enabled ? DiscordImageUrl({cover_url, {}}).toUtf8() : QByteArray{}) +
+            QByteArrayLiteral("\r\n");
+    file.write(text);
+    return file.commit();
 }
 
 } // namespace WikipediaCover

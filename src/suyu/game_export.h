@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <QCheckBox>
 #include <QDialog>
 #include <QComboBox>
@@ -15,6 +16,8 @@
 #include <QString>
 #include <QStringList>
 #include <QVector>
+
+#include "suyu/wikipedia_cover.h"
 
 namespace Core {
 class System;
@@ -200,6 +203,9 @@ private:
     QCheckBox* steam_shortcut_checkbox{};
     QCheckBox* steam_replace_rom_checkbox{};
     QCheckBox* steam_wikipedia_checkbox{};
+    /// Writes discord.ini beside a Windows package's launcher: enabled, with a cover URL
+    /// found on Wikipedia, or disabled.
+    QCheckBox* discord_checkbox{};
     /// Export format: index 0 = source only, index 1 = build to a native binary.
     /// "Build" is a promise, not a hint - when it is selected the export runs
     /// cmake to completion and reports a hard error if a binary cannot be
@@ -210,7 +216,8 @@ private:
     /// Add the finished package's launcher to Steam when asked to. Returns a note for the
     /// completion message, empty when Steam was not requested.
     QString MaybeAddToSteam(const QString& game_title, const QString& exe_path,
-                            const QString& backend_label, bool replace, bool use_wikipedia);
+                            const QString& backend_label, bool replace, bool use_wikipedia,
+                            const std::optional<WikipediaCover::CoverUrls>& known_cover);
     QProgressBar* progress_bar{};
     QPushButton* export_button{};
     QLabel* status_label{};

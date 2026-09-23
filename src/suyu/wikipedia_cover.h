@@ -35,4 +35,8 @@ CoverUrls FindCoverUrls(QNetworkAccessManager& network, const QString& title,
 /// URL of at most 256 bytes, which is what Discord accepts as an image key.
 QString DiscordImageUrl(const CoverUrls& urls);
 
+/// Writes discord.ini into package_dir, beside the exported launcher. suyu-cmd reads it at
+/// start: enabled=0 keeps it from contacting Discord, cover_url is the image it shows.
+bool WriteDiscordIni(const QString& package_dir, bool enabled, const QString& cover_url);
+
 } // namespace WikipediaCover

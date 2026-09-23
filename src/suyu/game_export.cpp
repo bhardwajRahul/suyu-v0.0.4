@@ -439,6 +439,16 @@ void GameExportDialog::SetupUi() {
     steam_replace_rom_checkbox->setEnabled(false);
     steam_wikipedia_checkbox->setEnabled(false);
 
+    discord_checkbox =
+        new QCheckBox(tr("Show this game in Discord (cover art from Wikipedia)"), this);
+    discord_checkbox->setChecked(true);
+    discord_checkbox->setToolTip(
+        tr("While the exported game runs, Discord shows it as your activity, with its box art. "
+           "The art is looked up once, at export time, on English Wikipedia, which receives the "
+           "game's title. The choice is saved as discord.ini next to the game's executable; set "
+           "enabled=0 there later to turn Discord off for this game and its Steam shortcut."));
+    layout->addWidget(discord_checkbox);
+
     fallback_to_interpreter_checkbox = new QCheckBox(
         tr("Allow Dynarmic fallback if a module fails to recompile"), this);
     fallback_to_interpreter_checkbox->setChecked(true);
@@ -607,6 +617,7 @@ void GameExportDialog::SetupUi() {
         steam_replace_rom_checkbox->setEnabled(has_launcher &&
                                                steam_shortcut_checkbox->isChecked());
         steam_wikipedia_checkbox->setEnabled(has_launcher && steam_shortcut_checkbox->isChecked());
+        discord_checkbox->setEnabled(has_launcher);
         if (backend == RecompileBackend::SuyuStatic) {
             note_label->setText(
                 tr("Experimental: translates the game's ARM64 code ahead of time with no JIT "
@@ -641,15 +652,17 @@ void GameExportDialog::SetupUi() {
 // Box art for the Steam step: the lead image of the game's article, from Wikipedia's public
 // page summary API (see WikipediaCover::FindCoverUrls for how a page is matched). The lookup
 // and the image download share one short deadline; any failure just leaves the icon-based
-// artwork.
-static QImage FetchWikipediaCover(const QString& title) {
+// artwork. A lookup already made for this export, found or not, is reused instead of repeated.
+static QImage FetchWikipediaCover(const QString& title,
+                                  const std::optional<WikipediaCover::CoverUrls>& known) {
     constexpr qint64 kBudgetMs = 6000;
     const QString user_agent = QStringLiteral("suyu-game-export (Steam artwork)");
     QNetworkAccessManager network;
     QElapsedTimer clock;
     clock.start();
     const WikipediaCover::CoverUrls urls =
-        WikipediaCover::FindCoverUrls(network, title, clock, kBudgetMs, user_agent);
+        known ? *known
+              : WikipediaCover::FindCoverUrls(network, title, clock, kBudgetMs, user_agent);
     return urls.original.isEmpty()
                ? QImage{}
                : QImage::fromData(WikipediaCover::GetWithin(network, QUrl(urls.original), clock,
@@ -658,7 +671,8 @@ static QImage FetchWikipediaCover(const QString& title) {
 
 QString GameExportDialog::MaybeAddToSteam(const QString& game_title, const QString& exe_path,
                                           const QString& backend_label, bool replace,
-                                          bool use_wikipedia) {
+                                          bool use_wikipedia,
+                                          const std::optional<WikipediaCover::CoverUrls>& known) {
     SteamIntegration steam;
     if (!steam.IsSteamInstalled()) {
         return tr("\n\nSteam was not found, so no Steam shortcut was added.");
@@ -677,7 +691,7 @@ QString GameExportDialog::MaybeAddToSteam(const QString& game_title, const QStri
 
     status_label->setText(tr("Adding Steam library artwork..."));
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    const QImage cover = use_wikipedia ? FetchWikipediaCover(game_title) : QImage{};
+    const QImage cover = use_wikipedia ? FetchWikipediaCover(game_title, known) : QImage{};
     QString artwork_note;
     if (!steam.WriteLauncherArtwork(app_name, exe_path, game_icon_.toImage(), cover)) {
         artwork_note = tr(" Its library artwork could not be written.");
@@ -4412,6 +4426,7 @@ void GameExportDialog::OnExport() {
         steam_shortcut_checkbox->isEnabled() && steam_shortcut_checkbox->isChecked();
     const bool steam_replace = steam_replace_rom_checkbox->isChecked();
     const bool steam_wikipedia = steam_wikipedia_checkbox->isChecked();
+    const bool show_in_discord = discord_checkbox->isChecked();
     const QFileInfo rom_info(rom_path);
     // Prefer the NACP/library title; fall back to filename if not found.
     QString game_name = rom_info.completeBaseName();
@@ -4670,14 +4685,39 @@ void GameExportDialog::OnExport() {
 
     // Done before the export reports completion, so the dialog is not held up afterwards
     // and its status line ends on the completion text.
+    const QString launcher_exe =
+        final_path + QDir::separator() + export_name + QStringLiteral(".exe");
+    // The Discord switch for the package's launcher, which suyu-cmd reads at start. The
+    // Wikipedia lookup made for it is handed to the Steam step, which needs the same page.
+    std::optional<WikipediaCover::CoverUrls> cover_urls;
+    if (platform == TargetPlatform::Windows && QFileInfo(launcher_exe).isFile()) {
+        QString discord_cover;
+        if (show_in_discord && !test_driven_export) {
+            status_label->setText(tr("Looking up cover art for Discord..."));
+            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+            QNetworkAccessManager network;
+            QElapsedTimer clock;
+            clock.start();
+            cover_urls = WikipediaCover::FindCoverUrls(
+                network, game_title, clock, 6000,
+                QStringLiteral("suyu-game-export (Discord cover art)"));
+            discord_cover = WikipediaCover::DiscordImageUrl(*cover_urls);
+        }
+        if (!WikipediaCover::WriteDiscordIni(final_path, show_in_discord, discord_cover)) {
+            LOG_WARNING(Frontend, "Could not write discord.ini in the package");
+        } else {
+            LOG_INFO(Frontend, "Wrote discord.ini: enabled={}, cover_url={}",
+                     show_in_discord ? 1 : 0, discord_cover.toStdString());
+        }
+    }
+
     QString steam_note;
     if (!test_driven_export && add_to_steam && platform == TargetPlatform::Windows) {
-        steam_note = MaybeAddToSteam(
-            game_title, final_path + QDir::separator() + export_name + QStringLiteral(".exe"),
-            !uses_aot    ? tr("suyu Dynarmic JIT")
-            : is_hybrid ? tr("suyu Hybrid JIT + AOT")
-                        : tr("suyu static AOT"),
-            steam_replace, steam_wikipedia);
+        steam_note = MaybeAddToSteam(game_title, launcher_exe,
+                                     !uses_aot    ? tr("suyu Dynarmic JIT")
+                                     : is_hybrid ? tr("suyu Hybrid JIT + AOT")
+                                                 : tr("suyu static AOT"),
+                                     steam_replace, steam_wikipedia, cover_urls);
     }
 
     export_button->setEnabled(true);
