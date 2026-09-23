@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <QImage>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -46,6 +47,13 @@ public:
     /// the launcher takes their place.
     bool AddLauncherShortcut(const QString& app_name, const QString& launcher_path,
                              const QString& replace_title = {});
+
+    /// Write library artwork for a shortcut added by AddLauncherShortcut into the grid folder
+    /// of the same Steam account: portrait and wide capsules, hero, logo and icon, named by
+    /// the shortcut's appid. @p cover, when not null, is used for the capsules and hero in
+    /// place of @p icon. Only this shortcut's files are touched, each replaced atomically.
+    bool WriteLauncherArtwork(const QString& app_name, const QString& launcher_path,
+                              const QImage& icon, const QImage& cover = {});
 
     enum class ArtworkType {
         Grid,
