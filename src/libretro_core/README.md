@@ -1,7 +1,11 @@
 # suyu libretro core
 
 The current libretro video path supports Vulkan. Core options are read when
-content loads; close and reopen content after changing an option. RetroArch's
+content loads; close and reopen content after changing an option. The exception
+is **Show Game Performance** (on by default), which applies immediately: once a
+second it shows the game's own frame rate, the average frame time and shader builds.
+RetroArch's FPS counter counts every frame it presents, including repeats while
+the game has not drawn a new one, so it can read far higher. RetroArch's
 **Restart** command invokes `retro_reset`, which is not implemented by this
 core. Close and reopen content to restart it. Save states are unsupported.
 

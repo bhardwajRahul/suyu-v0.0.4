@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "core/frontend/emu_window.h"
 
 namespace InputCommon::TasInput {
@@ -34,7 +36,13 @@ public:
     void SetTasPlayback(InputCommon::TasInput::Tas* tas);
     void OnFrameDisplayed() override;
 
+    /// Frames the renderer has composited; the headless frame buffer changes only when this does.
+    u64 FramesDisplayed() const {
+        return frames_displayed.load(std::memory_order_acquire);
+    }
+
 private:
+    std::atomic<u64> frames_displayed{};
     InputCommon::TasInput::Tas* tas_playback{};
     u64 tas_completion_generation{};
     u64 tas_frame_callbacks{};

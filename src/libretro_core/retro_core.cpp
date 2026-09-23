@@ -72,7 +72,9 @@
 #include "libretro_core/libretro.h"
 #include "libretro_core/retro_emu_window.h"
 #include "suyu_cmd/explicit_update.h"
+#include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
+#include "video_core/shader_notify.h"
 
 namespace {
 
@@ -114,6 +116,16 @@ std::filesystem::path g_previous_tas_directory;
 bool g_sample_perf = false;
 std::chrono::steady_clock::time_point g_perf_start;
 std::chrono::steady_clock::time_point g_perf_last_sample;
+// On-screen game performance readout (core option). It shares the per-second
+// sampler above, because GetAndResetPerfStats may only be read once per interval.
+bool g_show_perf = true;
+bool g_message_ext = false;
+bool g_can_dupe = false;
+// FramesDisplayed() value of the frame last uploaded; equal means nothing new to show.
+u64 g_presented_frame = 0;
+bool g_have_presented = false;
+unsigned g_perf_frontend_frames = 0;
+unsigned g_perf_unique_frames = 0;
 // False: suyu drives a host audio device directly (default, sounds correct).
 // True: samples are handed to the frontend via retro_audio_sample_batch.
 bool g_use_frontend_audio = false;
@@ -183,6 +195,31 @@ void PrepareLibretroKeys() {
     }
 }
 
+bool ReadShowPerfOption() {
+    retro_variable var{"suyu_show_perf", nullptr};
+    return !(g_environ_cb && g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value &&
+             std::string(var.value) == "Off");
+}
+
+void ShowPerfMessage(const std::string& text) {
+    // Refreshed every second; the duration overlaps the next update so it never
+    // blinks, and a status message replaces the previous one instead of queueing.
+    if (g_message_ext) {
+        retro_message_ext message{};
+        message.msg = text.c_str();
+        message.duration = 1500;
+        message.priority = 1;
+        message.level = RETRO_LOG_INFO;
+        message.target = RETRO_MESSAGE_TARGET_OSD;
+        message.type = RETRO_MESSAGE_TYPE_STATUS;
+        message.progress = -1;
+        g_environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &message);
+    } else {
+        retro_message message{text.c_str(), 90};
+        g_environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -212,6 +249,9 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         // sync, so it works here - it just needs somewhere to be configured,
         // which is what these are.
         {"suyu_online_enable", "suyu Online Play (reload content); Disabled|Enabled"},
+        // The frontend's FPS counter counts every presented frame, including
+        // repeats while the game has not drawn a new one; this shows the game's own rate.
+        {"suyu_show_perf", "Show Game Performance; On|Off"},
         // Legacy variables cannot accept free-form strings. Online endpoint
         // and nickname are supplied through environment variables instead.
         {nullptr, nullptr},
@@ -389,27 +429,75 @@ bool g_prev_buttons[20] = {};
 RETRO_API void retro_run() {
     // This frontend is the sole periodic consumer of the destructive stats read.
     // Sample guest rendering/timing, independently of retro_run's frontend FPS.
-    if (g_sample_perf && g_system && g_game_loaded) {
+    if (g_system && g_game_loaded) {
         const auto now = std::chrono::steady_clock::now();
         if (now - g_perf_last_sample >= std::chrono::seconds{1}) {
-            const auto stats = g_system->GetAndResetPerfStats();
-            const double interval = std::chrono::duration<double>(now - g_perf_last_sample).count();
-            const double elapsed = std::chrono::duration<double>(now - g_perf_start).count();
+            bool discard_stale_stats = false;
+            bool options_updated = false;
+            if (g_environ_cb &&
+                g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &options_updated) &&
+                options_updated) {
+                const bool was_shown = g_show_perf;
+                g_show_perf = ReadShowPerfOption();
+                // Nothing read the counters while the readout was off, so the next read
+                // would average that whole period; drop it and report from the next one.
+                discard_stale_stats = g_show_perf && !was_shown && !g_sample_perf;
+            }
+            if (discard_stale_stats) {
+                (void)g_system->GetAndResetPerfStats();
+            } else if (g_sample_perf || g_show_perf) {
+                const auto stats = g_system->GetAndResetPerfStats();
+                if (g_sample_perf) {
+                    const double interval =
+                        std::chrono::duration<double>(now - g_perf_last_sample).count();
+                    const double elapsed =
+                        std::chrono::duration<double>(now - g_perf_start).count();
+                    const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                    const auto metric = [](double value) {
+                        return std::isfinite(value) && value >= 0.0
+                                   ? fmt::format("{:.3f}", value)
+                                   : std::string{"unavailable"};
+                    };
+                    const bool has_system_frames =
+                        std::isfinite(stats.system_fps) && stats.system_fps > 0.0;
+                    LOG_INFO(Frontend,
+                             "libretro PERF unix_ms={} elapsed_s={:.3f} interval_s={:.3f} "
+                             "average_game_fps={} system_fps={} emulation_speed={} "
+                             "frametime_ms={} has_system_frames={} frontend_frames={} "
+                             "unique_frames={}",
+                             unix_ms, elapsed, interval, metric(stats.average_game_fps),
+                             metric(stats.system_fps), metric(stats.emulation_speed),
+                             has_system_frames ? metric(stats.frametime * 1000.0) : "unavailable",
+                             has_system_frames, g_perf_frontend_frames, g_perf_unique_frames);
+                }
+                if (g_show_perf && g_environ_cb) {
+                    const auto finite = [](double value) {
+                        return std::isfinite(value) && value >= 0.0 ? value : 0.0;
+                    };
+                    // Not "speed": with multicore on (the default) guest time is the host wall
+                    // clock, so emulation_speed is ~100% however slowly the game runs. The
+                    // average host time between guest frames is the honest measure.
+                    std::string text = fmt::format("Game {:.1f} FPS", finite(stats.average_game_fps));
+                    if (std::isfinite(stats.system_fps) && stats.system_fps > 0.0) {
+                        text += fmt::format(" · {:.1f} ms", finite(stats.frametime) * 1000.0);
+                    }
+                    if (!Settings::values.use_multi_core.GetValue()) {
+                        text += fmt::format(" · speed {:.0f}%",
+                                            finite(stats.emulation_speed) * 100.0);
+                    }
+                    if (const int building = g_system->GPU().ShaderNotify().ShadersBuilding();
+                        building > 0) {
+                        text += fmt::format(" · Building {} shader{}", building,
+                                            building == 1 ? "" : "s");
+                    }
+                    ShowPerfMessage(text);
+                }
+            }
             g_perf_last_sample = now;
-            const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::system_clock::now().time_since_epoch()).count();
-            const auto metric = [](double value) {
-                return std::isfinite(value) && value >= 0.0 ? fmt::format("{:.3f}", value)
-                                                          : std::string{"unavailable"};
-            };
-            const bool has_system_frames = std::isfinite(stats.system_fps) && stats.system_fps > 0.0;
-            LOG_INFO(Frontend, "libretro PERF unix_ms={} elapsed_s={:.3f} interval_s={:.3f} "
-                               "average_game_fps={} system_fps={} emulation_speed={} "
-                               "frametime_ms={} has_system_frames={}",
-                     unix_ms, elapsed, interval, metric(stats.average_game_fps),
-                     metric(stats.system_fps), metric(stats.emulation_speed),
-                     has_system_frames ? metric(stats.frametime * 1000.0) : "unavailable",
-                     has_system_frames);
+            g_perf_frontend_frames = 0;
+            g_perf_unique_frames = 0;
         }
     }
     if (g_input_poll_cb) {
@@ -484,8 +572,21 @@ RETRO_API void retro_run() {
     if (g_video_cb && g_system && g_game_loaded) {
         auto& renderer = g_system->Renderer();
         if (renderer.IsHeadless()) {
+            // Read before the upload: a frame composited during it is shown next call.
+            const u64 displayed = g_emu_window ? g_emu_window->FramesDisplayed() : 0;
+            ++g_perf_frontend_frames;
+            if (g_can_dupe && g_have_presented && displayed == g_presented_frame) {
+                // Nothing new since the last upload; tell the frontend it is a repeat.
+                g_video_cb(nullptr, renderer.GetHeadlessWidth(), renderer.GetHeadlessHeight(), 0);
+                return;
+            }
             const auto& frame = renderer.GetLastRenderedFrame();
             if (!frame.empty()) {
+                if (!g_have_presented || displayed != g_presented_frame) {
+                    ++g_perf_unique_frames;
+                }
+                g_presented_frame = displayed;
+                g_have_presented = true;
                 // No channel swap: the renderer produces VK_FORMAT_B8G8R8A8,
                 // i.e. B,G,R,A in ascending byte order, and libretro's
                 // XRGB8888 is the 32-bit word 0xXXRRGGBB, which on a
@@ -823,10 +924,21 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
 
     const auto perf_setting = GetRuntimeOption("SUYU_LIBRETRO_PERF", "debug.suyu.libretro.perf");
     g_sample_perf = perf_setting == "1";
-    if (g_sample_perf) {
-        (void)g_system->GetAndResetPerfStats();
-        g_perf_start = g_perf_last_sample = std::chrono::steady_clock::now();
+    g_show_perf = ReadShowPerfOption();
+    unsigned message_version = 0;
+    g_message_ext = g_environ_cb &&
+                    g_environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION,
+                                 &message_version) &&
+                    message_version >= 1;
+    g_can_dupe = false;
+    if (g_environ_cb && !g_environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &g_can_dupe)) {
+        g_can_dupe = false;
     }
+    g_have_presented = false;
+    g_perf_frontend_frames = 0;
+    g_perf_unique_frames = 0;
+    (void)g_system->GetAndResetPerfStats();
+    g_perf_start = g_perf_last_sample = std::chrono::steady_clock::now();
     g_system->Run();
     g_game_loaded = true;
     LOG_INFO(Frontend, "libretro core: game loaded and running");
@@ -840,6 +952,7 @@ RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retr
 
 RETRO_API void retro_unload_game() {
     g_sample_perf = false;
+    g_have_presented = false;
     if (g_system && g_game_loaded) {
         g_system->ShutdownMainProcess();
     }

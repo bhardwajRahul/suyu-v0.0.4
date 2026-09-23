@@ -46,6 +46,7 @@ void RetroEmuWindow::SetTasPlayback(InputCommon::TasInput::Tas* tas) {
 }
 
 void RetroEmuWindow::OnFrameDisplayed() {
+    frames_displayed.fetch_add(1, std::memory_order_release);
     if (!tas_playback) {
         return;
     }
