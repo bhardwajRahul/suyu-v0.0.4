@@ -53,6 +53,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging/backend.h"
 #include "common/logging/log.h"
+#include "common/scm_rev.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/crypto/key_manager.h"
@@ -383,8 +384,25 @@ RETRO_API unsigned retro_api_version() {
 
 RETRO_API void retro_get_system_info(struct retro_system_info* info) {
     std::memset(info, 0, sizeof(*info));
+    // RetroArch shows "<name> <version>" in its core information. Take the
+    // version from the build ("suyu v0.0.11 (mk8-recomp)" -> "v0.0.11
+    // (mk8-recomp)") and add the commit when the build knows it, so the core
+    // can be matched to the release it came from.
+    static const std::string version = [] {
+        std::string text = Common::g_build_fullname;
+        const std::string prefix = std::string(Common::g_build_name) + " ";
+        if (text.starts_with(prefix)) {
+            text.erase(0, prefix.size());
+        }
+        const std::string_view rev = Common::g_scm_rev;
+        if (rev.size() >= 10 && rev.find_first_not_of("0123456789abcdef") == std::string_view::npos) {
+            text += " ";
+            text += rev.substr(0, 10);
+        }
+        return text;
+    }();
     info->library_name = "suyu";
-    info->library_version = "0.04";
+    info->library_version = version.c_str();
     info->valid_extensions = "nsp|xci|nca|nro";
     info->need_fullpath = true;
     info->block_extract = false;
