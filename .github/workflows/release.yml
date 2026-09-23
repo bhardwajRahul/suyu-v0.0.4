@@ -224,6 +224,272 @@ jobs:
           path: ${{ matrix.archive }}
           if-no-files-found: error
 
+  build-macos:
+    name: macOS (arm64)
+    # Apple Silicon only. Homebrew supplies Qt, FFmpeg and SDL3; macdeployqt
+    # copies them into the bundle so the download does not need Homebrew. The
+    # bundle is ad-hoc signed, not notarized.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install cmake ninja pkgconf boost ffmpeg sdl3 libusb enet glslang nasm qt
+      - name: Test static recompiler
+        run: python3 tests/recompiler_smoke/run.py
+      - name: Configure
+        run: |
+          cmake --version
+          cmake -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
+            -Dfmt_FORCE_BUNDLED=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+      - name: Build
+        run: cmake --build build --target suyu suyu-cmd
+      - name: Package
+        run: |
+          APP=build/bin/suyu.app
+          cp build/bin/suyu-cmd "$APP/Contents/MacOS/"
+          "$(brew --prefix qt)/bin/macdeployqt" "$APP" \
+            -executable="$APP/Contents/MacOS/suyu-cmd" -always-overwrite
+          # macdeployqt adds plugins whose Qt modules suyu does not use and
+          # cannot deploy (QtSvg, QtPdf, QtVirtualKeyboard); drop them.
+          rm -f "$APP/Contents/PlugIns/iconengines/libqsvgicon.dylib" \
+                "$APP/Contents/PlugIns/imageformats/libqpdf.dylib" \
+                "$APP/Contents/PlugIns/platforminputcontexts/libqtvirtualkeyboardplugin.dylib"
+          # It also leaves the executables searching Homebrew first, which
+          # loads a second Qt, and some libraries still naming themselves by
+          # their Homebrew path.
+          for exe in suyu suyu-cmd; do
+            install_name_tool -delete_rpath "$(brew --prefix)/lib" \
+              -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/$exe"
+          done
+          for f in "$APP"/Contents/Frameworks/*.dylib; do
+            case "$(otool -D "$f" | sed -n 2p)" in
+              /opt/homebrew/*|/usr/local/*)
+                install_name_tool -id "@executable_path/../Frameworks/${f##*/}" "$f" ;;
+            esac
+          done
+          # Every Mach-O in the bundle must resolve inside it or the system.
+          if find "$APP" -type f \( -perm -u+x -o -name '*.dylib' \) -print0 \
+              | xargs -0 otool -L 2>/dev/null | grep -E '^[[:space:]]+/(opt/homebrew|usr/local)/'; then
+            echo "Bundle still references Homebrew libraries" >&2
+            exit 1
+          fi
+          for exe in suyu suyu-cmd; do
+            if otool -l "$APP/Contents/MacOS/$exe" | grep -A2 LC_RPATH \
+                | grep -E 'path /(opt/homebrew|usr/local)/'; then
+              echo "$exe still searches Homebrew for libraries" >&2
+              exit 1
+            fi
+          done
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          mkdir -p _pkg out
+          ditto "$APP" _pkg/suyu.app
+          cp LICENSE.txt _pkg/
+          (cd _pkg && ditto -c -k --sequesterRsrc . ../out/suyu-macos-arm64.zip)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/suyu-macos-arm64.zip
+          if-no-files-found: error
+
+  build-libretro:
+    name: libretro core (${{ matrix.platform }})
+    # Built on its own so enabling the core (position-independent code) never
+    # changes the standalone binaries above.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+            archive: suyu-libretro-linux-x86_64.tar.gz
+          - platform: windows
+            os: windows-latest
+            archive: suyu-libretro-windows-x86_64.zip
+          - platform: macos
+            os: macos-15
+            archive: suyu-libretro-macos-arm64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Install dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ninja-build nasm autoconf glslang-tools \
+            libboost-dev libboost-filesystem-dev libboost-context-dev \
+            libusb-1.0-0-dev libssl-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+            libswscale-dev libswresample-dev \
+            libzstd-dev liblz4-dev libgl1-mesa-dev \
+            libasound2-dev libpulse-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxkbcommon-dev libxss-dev libxtst-dev \
+            libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
+            libegl-dev libdrm-dev libgbm-dev libvulkan-dev
+          V=3.31.6
+          curl -fsSL -o /tmp/cmake.tar.gz \
+            "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-x86_64.tar.gz"
+          sudo mkdir -p /opt/cmake
+          sudo tar xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
+          echo /opt/cmake/bin >> "$GITHUB_PATH"
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.platform == 'windows'
+      - name: Install dependencies (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk -y --no-progress
+          $sdk = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
+          "$($sdk.FullName)\Bin" >> $env:GITHUB_PATH
+      - name: Install dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew update
+          brew install cmake ninja pkgconf boost ffmpeg sdl3 libusb enet glslang nasm dylibbundler
+      - name: Configure
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: '1'
+        run: |
+          extra=()
+          case '${{ matrix.platform }}' in
+            linux) extra+=(-Dfmt_FORCE_BUNDLED=ON) ;;
+            macos) extra+=(-Dfmt_FORCE_BUNDLED=ON -DVulkanHeaders_FORCE_BUNDLED=ON
+                           "-DCMAKE_PREFIX_PATH=$(brew --prefix)") ;;
+          esac
+          cmake -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_QT=OFF -DYUZU_CMD=OFF -DYUZU_TESTS=OFF \
+            -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF -DENABLE_WEB_SERVICE=OFF \
+            -DSUYU_BUILD_LIBRETRO_CORE=ON "${extra[@]}"
+      - name: Build
+        shell: bash
+        run: cmake --build build --target suyu_libretro
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          mkdir -p _pkg
+          cp "$(find build -name suyu_libretro.so -print -quit)" _pkg/
+          strip --strip-debug _pkg/suyu_libretro.so
+          cp LICENSE.txt _pkg/
+          tar -czf '${{ matrix.archive }}' -C _pkg .
+      - name: Package (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force _pkg | Out-Null
+          $core = Get-ChildItem build -Recurse -File -Filter suyu_libretro.dll | Select-Object -First 1
+          Copy-Item $core.FullName _pkg\
+          Copy-Item LICENSE.txt _pkg\
+          Compress-Archive -Path _pkg\* -DestinationPath '${{ matrix.archive }}'
+      - name: Package (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          mkdir -p _pkg
+          cp "$(find build -name suyu_libretro.dylib -print -quit)" _pkg/
+          # RetroArch loads the core from its cores folder; the Homebrew
+          # libraries it needs travel beside it, found through an rpath of
+          # @loader_path/suyu_libretro_libs.
+          dylibbundler -cd -of -b -x _pkg/suyu_libretro.dylib \
+            -d _pkg/suyu_libretro_libs -p @rpath/
+          install_name_tool -add_rpath @loader_path/suyu_libretro_libs _pkg/suyu_libretro.dylib
+          if otool -L _pkg/suyu_libretro.dylib _pkg/suyu_libretro_libs/*.dylib \
+              | grep -E '^[[:space:]]+/(opt/homebrew|usr/local)/'; then
+            echo "Core still references Homebrew libraries" >&2
+            exit 1
+          fi
+          for f in _pkg/suyu_libretro_libs/*.dylib _pkg/suyu_libretro.dylib; do
+            codesign --force --sign - "$f"
+          done
+          cp LICENSE.txt _pkg/
+          (cd _pkg && zip -qry "../${{ matrix.archive }}" .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libretro-${{ matrix.platform }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  build-android:
+    name: Android (arm64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK packages
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" "ndk;28.2.13676358" "cmake;3.31.6"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build glslang-tools nasm
+      - name: Build APK
+        # Signed with the release key when the ANDROID_KEYSTORE_* secrets are
+        # set; otherwise with the public test key in the repository.
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          GIT_TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_B64" ]; then
+            unset ANDROID_KEYSTORE_B64 ANDROID_KEYSTORE_PASS ANDROID_KEY_ALIAS
+            echo "::warning::No release keystore secret; the APK is signed with the public test key."
+          fi
+          sh .ci/android/build.sh -t standard -b Release
+          mkdir -p out
+          cp artifacts/app-mainline-release.apk out/suyu-android-arm64.apk
+      - name: Build libretro core
+        # Reuses the NDK configuration Gradle generated for the APK, switched to
+        # the libretro core (no app JNI glue, OpenSSL built with no-asm).
+        run: |
+          cache="$(find src/android/app/.cxx -path '*arm64-v8a/CMakeCache.txt' -print -quit)"
+          test -n "$cache"
+          dir="$(dirname "$cache")"
+          CMAKE="$ANDROID_HOME/cmake/3.31.6/bin/cmake"
+          "$CMAKE" -S . -B "$dir" \
+            -DSUYU_BUILD_LIBRETRO_CORE=ON -DSUYU_ANDROID_LIBRETRO=ON \
+            -DYUZU_USE_BUNDLED_OPENSSL=OFF
+          "$CMAKE" --build "$dir" --target suyu_libretro
+          core="$(find src/android/app -name suyu_libretro.so -path '*arm64-v8a*' -print -quit)"
+          test -n "$core"
+          mkdir -p _pkg
+          "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-debug -o _pkg/suyu_libretro_android.so "$core"
+          cp LICENSE.txt _pkg/
+          (cd _pkg && zip -qr ../out/suyu-libretro-android-arm64.zip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: |
+            out/suyu-android-arm64.apk
+            out/suyu-libretro-android-arm64.zip
+          if-no-files-found: error
+
   source:
     name: Source archive
     runs-on: ubuntu-latest
@@ -275,7 +541,7 @@ jobs:
     # used `if: always()`, so a release could go out with a platform missing or
     # a failed build silently omitted.
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-linux, build-windows, source]
+    needs: [build-linux, build-windows, build-macos, build-libretro, build-android, source]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -287,12 +553,18 @@ jobs:
       - name: Collect
         run: |
           mkdir -p out
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} out/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.apk' \) -exec mv {} out/ \;
           for asset in \
             suyu-linux-x86_64.tar.gz \
             suyu-linux-x86_64-no-jit.tar.gz \
             suyu-windows-x86_64.zip \
             suyu-windows-x86_64-no-jit.zip \
+            suyu-macos-arm64.zip \
+            suyu-android-arm64.apk \
+            suyu-libretro-linux-x86_64.tar.gz \
+            suyu-libretro-windows-x86_64.zip \
+            suyu-libretro-macos-arm64.zip \
+            suyu-libretro-android-arm64.zip \
             "suyu-${GITHUB_REF_NAME}-source.tar.gz"; do
             test -s "out/$asset"
           done
