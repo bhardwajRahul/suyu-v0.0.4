@@ -282,7 +282,8 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
         }
     }
 
-    // Game Updates
+    // Game Updates. GetExeFSUpdate names the same update for the export dialog; keep the
+    // two selections in sync.
     std::unique_ptr<NCA> update = nullptr;
 
     // If we have a specific enabled version from external provider, use it
@@ -846,6 +847,91 @@ PatchManager::UpdateSelection PatchManager::GetUpdateSelection() const {
         }
     }
     return selection;
+}
+
+std::optional<PatchManager::ExeFSUpdate> PatchManager::GetExeFSUpdate() const {
+    if (!GetUpdateSelection().installed_exefs) {
+        return std::nullopt;
+    }
+    const auto& disabled = Settings::values.disabled_addons[title_id];
+    const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
+    const auto update_tid = GetUpdateTitleID(title_id);
+    const auto cnmt_version = [](const VirtualFile& meta_file) -> u32 {
+        if (meta_file == nullptr) {
+            return 0;
+        }
+        const NCA meta{meta_file};
+        const auto sections = meta.GetSubdirectories();
+        if (meta.GetStatus() != Loader::ResultStatus::Success || sections.empty()) {
+            return 0;
+        }
+        for (const auto& file : sections[0]->GetFiles()) {
+            if (file->GetExtension() == "cnmt") {
+                return CNMT{file}.GetTitleVersion();
+            }
+        }
+        return 0;
+    };
+
+    // As PatchExeFS: whichever of the external and manual providers lists versions first
+    // decides, and its first enabled version is the one read.
+    std::optional<ExternalUpdateEntry> enabled;
+    const auto pick = [&](const std::vector<ExternalUpdateEntry>& versions) {
+        if (enabled || versions.empty()) {
+            return !versions.empty();
+        }
+        for (const auto& entry : versions) {
+            if (!IsVersionedExternalUpdateDisabled(disabled, entry.version)) {
+                enabled = entry;
+                break;
+            }
+        }
+        return true;
+    };
+    const auto* external = content_union->GetExternalProvider();
+    const auto* manual = static_cast<const ManualContentProvider*>(
+        content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual));
+    if (!(external && pick(external->ListUpdateVersions(update_tid))) && manual) {
+        pick(manual->ListUpdateVersions(update_tid));
+    }
+
+    ExeFSUpdate update;
+    const auto from_provider = [&](ContentProviderUnionSlot slot, const auto* provider) {
+        if (provider == nullptr) {
+            return false;
+        }
+        auto program =
+            provider->GetEntryForVersion(update_tid, ContentRecordType::Program, enabled->version);
+        if (program == nullptr) {
+            return false;
+        }
+        update.slot = slot;
+        update.program = std::move(program);
+        update.version = enabled->version;
+        update.version_string = enabled->version_string;
+        if (update.version == 0) {
+            update.version = cnmt_version(
+                provider->GetEntryForVersion(update_tid, ContentRecordType::Meta, enabled->version));
+        }
+        return true;
+    };
+    if (enabled && (from_provider(ContentProviderUnionSlot::External, external) ||
+                    from_provider(ContentProviderUnionSlot::FrontendManual, manual))) {
+        return update;
+    }
+
+    // Otherwise the union answers, NAND and SD first.
+    update.slot = content_union->GetSlotForEntry(update_tid, ContentRecordType::Program);
+    update.program = content_union->GetEntryRaw(update_tid, ContentRecordType::Program);
+    if (update.program == nullptr) {
+        return std::nullopt;
+    }
+    update.version = content_union->GetEntryVersion(update_tid).value_or(0);
+    if (update.version == 0) {
+        // The frontend's manual provider records no versions for what it registers.
+        update.version = cnmt_version(content_union->GetEntryRaw(update_tid, ContentRecordType::Meta));
+    }
+    return update;
 }
 
 std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {

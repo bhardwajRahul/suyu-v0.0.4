@@ -27,6 +27,7 @@ class FileSystemController;
 namespace FileSys {
 
 class ContentProvider;
+enum class ContentProviderUnionSlot;
 class NCA;
 class NACP;
 
@@ -124,6 +125,22 @@ public:
     // Whether the add-on settings let PatchExeFS and PatchRomFS apply an update. Mirrors their
     // own selection rules, which differ slightly; keep the three in sync.
     [[nodiscard]] UpdateSelection GetUpdateSelection() const;
+
+    struct ExeFSUpdate {
+        /// The provider the update is read from.
+        std::optional<ContentProviderUnionSlot> slot;
+        /// Its Program NCA, as PatchExeFS opens it.
+        VirtualFile program;
+        /// Title version from the provider or, failing that, the update's own CNMT; 0 if
+        /// neither says.
+        u32 version{};
+        /// Display version when the provider records one ("4.0.0"); otherwise empty.
+        std::string version_string;
+    };
+    // The update PatchExeFS replaces the ExeFS with, chosen by the same rules: the external
+    // provider's enabled version, then the manual provider's, then the first NAND or SD copy.
+    // nullopt when it applies none. Keep in sync with PatchExeFS.
+    [[nodiscard]] std::optional<ExeFSUpdate> GetExeFSUpdate() const;
 
     // If the game update exists, returns the u32 version field in its Meta-type NCA. If that fails,
     // it will fallback to the Meta-type NCA of the base game. If that fails, the result will be
