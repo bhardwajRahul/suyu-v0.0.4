@@ -3,6 +3,7 @@
 
 #include "suyu/game_export.h"
 #include "suyu/steam_integration.h"
+#include "suyu/wikipedia_cover.h"
 
 #include <QApplication>
 #include <QBuffer>
@@ -638,67 +639,21 @@ void GameExportDialog::SetupUi() {
 }
 
 // Box art for the Steam step: the lead image of the game's article, from Wikipedia's public
-// page summary API. "<title> (video game)" is tried before the plain title, and a page is used
-// only when its short description calls it a video game, so an unrelated article that shares
-// the name is never picked. All requests share one short deadline; any failure just leaves
-// the icon-based artwork.
+// page summary API (see WikipediaCover::FindCoverUrls for how a page is matched). The lookup
+// and the image download share one short deadline; any failure just leaves the icon-based
+// artwork.
 static QImage FetchWikipediaCover(const QString& title) {
     constexpr qint64 kBudgetMs = 6000;
+    const QString user_agent = QStringLiteral("suyu-game-export (Steam artwork)");
     QNetworkAccessManager network;
     QElapsedTimer clock;
     clock.start();
-    const auto get = [&](const QUrl& url) {
-        QByteArray body;
-        const qint64 remaining = kBudgetMs - clock.elapsed();
-        if (remaining <= 0 || !url.isValid()) {
-            return body;
-        }
-        QNetworkRequest request(url);
-        // Wikimedia asks API clients to identify themselves.
-        request.setHeader(QNetworkRequest::UserAgentHeader,
-                          QStringLiteral("suyu-game-export (Steam artwork)"));
-        request.setTransferTimeout(static_cast<int>(remaining));
-        QNetworkReply* reply = network.get(request);
-        QEventLoop loop;
-        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-        QTimer::singleShot(static_cast<int>(remaining), &loop, &QEventLoop::quit);
-        loop.exec(QEventLoop::ExcludeUserInputEvents);
-        if (reply->isFinished() && reply->error() == QNetworkReply::NoError) {
-            body = reply->readAll();
-        } else {
-            reply->abort();
-        }
-        delete reply;
-        return body;
-    };
-
-    QString page = title;
-    page.remove(QRegularExpression(QStringLiteral("[\\x{2122}\\x{00AE}\\x{00A9}]")));
-    page = page.simplified().replace(QLatin1Char(' '), QLatin1Char('_'));
-    for (const QString& candidate : {QString(page + QStringLiteral("_(video_game)")), page}) {
-        const QJsonObject json =
-            QJsonDocument::fromJson(
-                get(QUrl::fromEncoded(QByteArray(
-                    QByteArrayLiteral("https://en.wikipedia.org/api/rest_v1/page/summary/") +
-                    QUrl::toPercentEncoding(candidate)))))
-                .object();
-        // One game, not a series, franchise or character that shares the name.
-        static const QRegularExpression kNotOneGame(
-            QStringLiteral("series|franchise|character"),
-            QRegularExpression::CaseInsensitiveOption);
-        const QString description = json.value(QStringLiteral("description")).toString();
-        if (json.value(QStringLiteral("type")).toString() != QStringLiteral("standard") ||
-            !description.contains(QStringLiteral("video game"), Qt::CaseInsensitive) ||
-            description.contains(kNotOneGame)) {
-            continue;
-        }
-        const QString image_url = json.value(QStringLiteral("originalimage"))
-                                      .toObject()
-                                      .value(QStringLiteral("source"))
-                                      .toString();
-        return image_url.isEmpty() ? QImage{} : QImage::fromData(get(QUrl(image_url)));
-    }
-    return {};
+    const WikipediaCover::CoverUrls urls =
+        WikipediaCover::FindCoverUrls(network, title, clock, kBudgetMs, user_agent);
+    return urls.original.isEmpty()
+               ? QImage{}
+               : QImage::fromData(WikipediaCover::GetWithin(network, QUrl(urls.original), clock,
+                                                            kBudgetMs, user_agent));
 }
 
 QString GameExportDialog::MaybeAddToSteam(const QString& game_title, const QString& exe_path,
