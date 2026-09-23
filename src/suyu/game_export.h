@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <QCheckBox>
 #include <QDialog>
 #include <QComboBox>
@@ -60,8 +61,8 @@ public:
     /// directly.
     /// @param format_index optional output-format combo index to select first
     ///        (0 = Source, 1 = Build); negative leaves the current selection.
-    /// @param backend_index optional CPU-backend combo index to select first
-    ///        (0 = suyu static, 1 = Hybrid AOT + JIT, 2 = Dynarmic JIT);
+    /// @param backend_index optional CPU backend to select first, as its RecompileBackend
+    ///        value (0 = suyu static, 1 = Hybrid AOT + JIT, 2 = Dynarmic JIT);
     ///        negative leaves the current selection. Without this the harness
     ///        can only ever exercise the default backend, which is why the
     ///        hybrid path went untested.
@@ -148,7 +149,11 @@ private:
     };
     /// Title ID of the selected ROM: the library's when known, else read from the file.
     quint64 SelectedProgramId() const;
-    UpdateState CurrentUpdateState(QString* version = nullptr) const;
+    /// @p version gets a used update's display version ("4.0.0") and @p title_version its
+    /// numeric title version, as the game will be told them. @p source says where it is read
+    /// from: the install location (with the file for NAND), or the game file itself.
+    UpdateState CurrentUpdateState(QString* version = nullptr, QString* source = nullptr,
+                                   quint32* title_version = nullptr) const;
     /// Refresh the Update row after the ROM changes or an update is installed.
     void RefreshUpdateStatus();
     /// Ask for an update NSP, check it belongs to the selected game, and install it.
@@ -194,6 +199,7 @@ private:
     QCheckBox* fallback_to_interpreter_checkbox{};
     QCheckBox* steam_shortcut_checkbox{};
     QCheckBox* steam_replace_rom_checkbox{};
+    QCheckBox* steam_wikipedia_checkbox{};
     /// Export format: index 0 = source only, index 1 = build to a native binary.
     /// "Build" is a promise, not a hint - when it is selected the export runs
     /// cmake to completion and reports a hard error if a binary cannot be
@@ -204,11 +210,23 @@ private:
     /// Add the finished package's launcher to Steam when asked to. Returns a note for the
     /// completion message, empty when Steam was not requested.
     QString MaybeAddToSteam(const QString& game_title, const QString& exe_path,
-                            const QString& backend_label, bool replace);
+                            const QString& backend_label, bool replace, bool use_wikipedia);
     QProgressBar* progress_bar{};
     QPushButton* export_button{};
     QLabel* status_label{};
+    /// The stages of one export, each weighted by the share of the work it does, so the
+    /// progress bar follows the work rather than a few fixed steps.
+    enum class ExportStage { Extract, Lift, Compile, Link, Package, Count };
+    /// Where each stage starts on the bar (0..1); the last entry is the end, 1.
+    std::array<double, static_cast<std::size_t>(ExportStage::Count) + 1> stage_bounds_{};
+    /// Weights the stages this export actually runs: Source exports skip compiling and
+    /// linking, and the JIT baseline is packaging alone.
+    void SetupExportStages(bool uses_aot, bool compiled);
+    /// Moves the bar to @p fraction of @p stage - never backwards - and, when given, shows
+    /// @p status.
+    void ReportStage(ExportStage stage, double fraction, const QString& status = {});
     QLabel* update_status_label{};
+    QLabel* update_source_label{};
     QPushButton* install_update_button{};
     quint64 rom_program_id{};
     /// ROM path rom_program_id belongs to; a hand-typed different path invalidates it.

@@ -590,6 +590,16 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
             QTimer::singleShot(0, this, [this]() { ApplyAppMode(AppMode::Gamer); });
             continue;
         }
+        // Open straight into Tools > Install Decryption Keys / Install Firmware, once the
+        // window is up. An exported game missing either starts suyu this way.
+        if (args[i] == QStringLiteral("-install-keys")) {
+            QTimer::singleShot(0, this, [this]() { OnInstallDecryptionKeys(); });
+            continue;
+        }
+        if (args[i] == QStringLiteral("-install-firmware")) {
+            QTimer::singleShot(0, this, [this]() { OnInstallFirmware(); });
+            continue;
+        }
         // Launch game with a specific user
         if (args[i] == QStringLiteral("-u")) {
             if (i >= args.size() - 1) {
@@ -1246,7 +1256,7 @@ void GMainWindow::InitializeWidgets() {
     cpu_backend_label = new QLabel();
     cpu_backend_label->setToolTip(
         tr("NO JIT identifies a build without a dynamic recompiler. suyu static is experimental "
-           "and can load or run more slowly; use Hybrid AOT + JIT for best performance. "
+           "and can load or run more slowly; performance of each backend varies by game. "
            "When JIT is available, the counter shows transitions from AOT code to Dynarmic. "
            "Zero means no transitions have occurred in this run."));
 
@@ -6054,7 +6064,7 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         // Return the RPC response before the long export begins.
                         // The caller polls get_aot_export_status while OnExport
                         // pumps the nested Qt event loop.
-                        // Combo order: 0 = suyu static, 1 = Hybrid AOT + JIT,
+                        // RecompileBackend values: 0 = suyu static, 1 = Hybrid AOT + JIT,
                         // 2 = Dynarmic JIT. Without this the harness could only
                         // ever drive whichever backend the dialog opened on.
                         const QString backend_name =
@@ -8195,7 +8205,7 @@ void GMainWindow::UpdateStatusBar() {
         if (!cpu.backend_active) {
             backend_name = tr("DYNARMIC JIT");
         } else if (cpu.strict_mode || !cpu.jit_available) {
-            backend_name = tr("suyu static (Experimental)");
+            backend_name = tr("suyu static AOT (Experimental)");
         } else {
             backend_name = tr("AOT");
         }

@@ -12,6 +12,7 @@
 #include <QPixmap>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -23,20 +24,29 @@
 #include <QJsonObject>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QProgressDialog>
 #include <QCloseEvent>
 #include <QEventLoop>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSettings>
 #include <QSizePolicy>
 #include <QStandardPaths>
 #include <QStandardItemModel>
 #include <QTextStream>
 #include <QThread>
+#include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <array>
+#include <functional>
+#include <map>
 #include <chrono>
 #include <cstring>
 #include <span>
@@ -247,7 +257,10 @@ static bool CopyPortableSupportData(quint64 program_id, const QString& package_r
     }
 
     if (include_config) {
-        const QString config_file_name = QStringLiteral("%1.ini").arg(program_id, 16, 16, QLatin1Char('0')).toUpper();
+        // Only the hex is uppercase: suyu names these files "<TITLE ID>.ini".
+        const QString config_file_name =
+            QStringLiteral("%1").arg(program_id, 16, 16, QLatin1Char('0')).toUpper() +
+            QStringLiteral(".ini");
         const QString config_src = QString::fromStdString(
             Common::FS::PathToUTF8String(Common::FS::GetSuyuPath(Common::FS::SuyuPath::ConfigDir))) +
             QDir::separator() + QStringLiteral("custom") + QDir::separator() + config_file_name;
@@ -265,11 +278,15 @@ static bool CopyPortableSupportData(quint64 program_id, const QString& package_r
     }
 
     if (include_shader) {
+        // The package reads ShaderDir as user/cache/shader, and the renderers name the
+        // per-title folder in lowercase hex; any other destination is never loaded.
+        const QString shader_title_dir = title_id_hex.toLower();
         const QString shader_src = QString::fromStdString(
             Common::FS::PathToUTF8String(Common::FS::GetSuyuPath(Common::FS::SuyuPath::ShaderDir))) +
-            QDir::separator() + title_id_hex;
-        const QString shader_dst = output_user_root + QDir::separator() + QStringLiteral("shader") +
-                                   QDir::separator() + title_id_hex;
+            QDir::separator() + shader_title_dir;
+        const QString shader_dst = output_user_root + QDir::separator() + QStringLiteral("cache") +
+                                   QDir::separator() + QStringLiteral("shader") +
+                                   QDir::separator() + shader_title_dir;
         if (QDir(shader_src).exists()) {
             if (!CopyDirectoryRecursive(shader_src, shader_dst)) {
                 return false;
@@ -319,6 +336,14 @@ void GameExportDialog::SetupUi() {
         tr("Install a game update (.nsp) into suyu so the export uses that version."));
     update_row->addWidget(install_update_button);
     layout->addLayout(update_row);
+    // Where that update comes from, in smaller type; long paths are elided, in full on hover.
+    update_source_label = new QLabel(this);
+    QFont source_font = update_source_label->font();
+    source_font.setPointSizeF(source_font.pointSizeF() * 0.85);
+    update_source_label->setFont(source_font);
+    update_source_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    update_source_label->setVisible(false);
+    layout->addWidget(update_source_label);
 
     // Output path row
     auto* out_row = new QHBoxLayout();
@@ -355,15 +380,18 @@ void GameExportDialog::SetupUi() {
     // CPU backend used by the exported comparison build.
     auto* backend_row = new QHBoxLayout();
     backend_row->addWidget(new QLabel(tr("CPU Backend:"), this));
+    // Items are told apart by their RecompileBackend data, never by position. The JIT
+    // baseline comes first and is the default: it needs no compiler and is the reference
+    // the recompiled backends are measured against.
     backend_combo = new QComboBox(this);
-    backend_combo->addItem(tr("suyu static (Experimental)"),
-                           static_cast<int>(RecompileBackend::SuyuStatic));
 #ifndef SUYU_NO_JIT
-    backend_combo->addItem(tr("Hybrid AOT + JIT"),
-                           static_cast<int>(RecompileBackend::Hybrid));
-    backend_combo->addItem(tr("Dynarmic JIT (Baseline)"),
+    backend_combo->addItem(tr("suyu Dynarmic JIT (Baseline)"),
                            static_cast<int>(RecompileBackend::Dynarmic));
+    backend_combo->addItem(tr("suyu Hybrid JIT + AOT"),
+                           static_cast<int>(RecompileBackend::Hybrid));
 #endif
+    backend_combo->addItem(tr("suyu static AOT (Experimental)"),
+                           static_cast<int>(RecompileBackend::SuyuStatic));
     backend_combo->setCurrentIndex(0);
     backend_row->addWidget(backend_combo);
     layout->addLayout(backend_row);
@@ -389,14 +417,26 @@ void GameExportDialog::SetupUi() {
     steam_replace_rom_checkbox->setChecked(true);
     steam_replace_rom_checkbox->setToolTip(
         tr("A shortcut added earlier for this title - pointing at the ROM through the emulator - "
-           "is removed first, so the exported build takes its place under the game's name. "
-           "Uncheck to keep both entries; the exported one is then named after its CPU "
-           "backend."));
+           "is removed first, so the exported build takes its place. Uncheck to keep both "
+           "entries. Either way the exported one is named after its CPU backend, such as "
+           "\"(suyu Hybrid JIT + AOT)\", so exports of the same game with different backends stay "
+           "apart."));
     layout->addWidget(steam_replace_rom_checkbox);
+
+    steam_wikipedia_checkbox =
+        new QCheckBox(tr("...and fetch cover art from Wikipedia"), this);
+    steam_wikipedia_checkbox->setChecked(true);
+    steam_wikipedia_checkbox->setToolTip(
+        tr("Looks the game up on English Wikipedia, which receives the game's title, and uses "
+           "its box art for the Steam library images. Without it, the images are made from "
+           "the game's own icon."));
+    layout->addWidget(steam_wikipedia_checkbox);
     connect(steam_shortcut_checkbox, &QCheckBox::toggled, this, [this](bool enabled) {
         steam_replace_rom_checkbox->setEnabled(enabled && steam_shortcut_checkbox->isEnabled());
+        steam_wikipedia_checkbox->setEnabled(enabled && steam_shortcut_checkbox->isEnabled());
     });
     steam_replace_rom_checkbox->setEnabled(false);
+    steam_wikipedia_checkbox->setEnabled(false);
 
     fallback_to_interpreter_checkbox = new QCheckBox(
         tr("Allow Dynarmic fallback if a module fails to recompile"), this);
@@ -470,7 +510,7 @@ void GameExportDialog::SetupUi() {
 
     // Progress
     progress_bar = new QProgressBar(this);
-    progress_bar->setRange(0, 100);
+    progress_bar->setRange(0, 1000);
     progress_bar->setValue(0);
     progress_bar->setVisible(false);
     // A hidden widget occupies no space, so the progress bar appearing when the
@@ -522,7 +562,8 @@ void GameExportDialog::SetupUi() {
                 model->item(jit_index)->setEnabled(is_windows);
             }
             if (!is_windows && backend_combo->currentIndex() == jit_index) {
-                backend_combo->setCurrentIndex(0);
+                backend_combo->setCurrentIndex(
+                    backend_combo->findData(static_cast<int>(RecompileBackend::Hybrid)));
             }
         }
 #endif
@@ -564,16 +605,18 @@ void GameExportDialog::SetupUi() {
                               "baseline."));
         steam_replace_rom_checkbox->setEnabled(has_launcher &&
                                                steam_shortcut_checkbox->isChecked());
+        steam_wikipedia_checkbox->setEnabled(has_launcher && steam_shortcut_checkbox->isChecked());
         if (backend == RecompileBackend::SuyuStatic) {
             note_label->setText(
                 tr("Experimental: translates the game's ARM64 code ahead of time with no JIT "
                    "fallback. Loading and gameplay can be slower. Uncovered code stops execution; "
-                   "compatibility must be checked for each title. Use Hybrid AOT + JIT for best "
-                   "performance."));
+                   "compatibility must be checked for each title. suyu Hybrid JIT + AOT falls back "
+                   "to the JIT instead; performance varies by game."));
         } else if (is_hybrid) {
             note_label->setText(
-                tr("Recommended for best performance. Runs recompiled AOT code first and uses "
-                   "Dynarmic JIT for uncovered blocks or modules."));
+                tr("Runs recompiled code first and falls back to the Dynarmic JIT for uncovered "
+                   "code. Performance varies by game; compare it with the suyu Dynarmic JIT "
+                   "export."));
         } else {
             note_label->setText(
                 tr("Packages the game with Dynarmic as a JIT baseline for direct comparison. "
@@ -594,8 +637,73 @@ void GameExportDialog::SetupUi() {
     update_options(backend_combo->currentIndex());
 }
 
+// Box art for the Steam step: the lead image of the game's article, from Wikipedia's public
+// page summary API. "<title> (video game)" is tried before the plain title, and a page is used
+// only when its short description calls it a video game, so an unrelated article that shares
+// the name is never picked. All requests share one short deadline; any failure just leaves
+// the icon-based artwork.
+static QImage FetchWikipediaCover(const QString& title) {
+    constexpr qint64 kBudgetMs = 6000;
+    QNetworkAccessManager network;
+    QElapsedTimer clock;
+    clock.start();
+    const auto get = [&](const QUrl& url) {
+        QByteArray body;
+        const qint64 remaining = kBudgetMs - clock.elapsed();
+        if (remaining <= 0 || !url.isValid()) {
+            return body;
+        }
+        QNetworkRequest request(url);
+        // Wikimedia asks API clients to identify themselves.
+        request.setHeader(QNetworkRequest::UserAgentHeader,
+                          QStringLiteral("suyu-game-export (Steam artwork)"));
+        request.setTransferTimeout(static_cast<int>(remaining));
+        QNetworkReply* reply = network.get(request);
+        QEventLoop loop;
+        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        QTimer::singleShot(static_cast<int>(remaining), &loop, &QEventLoop::quit);
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+        if (reply->isFinished() && reply->error() == QNetworkReply::NoError) {
+            body = reply->readAll();
+        } else {
+            reply->abort();
+        }
+        delete reply;
+        return body;
+    };
+
+    QString page = title;
+    page.remove(QRegularExpression(QStringLiteral("[\\x{2122}\\x{00AE}\\x{00A9}]")));
+    page = page.simplified().replace(QLatin1Char(' '), QLatin1Char('_'));
+    for (const QString& candidate : {QString(page + QStringLiteral("_(video_game)")), page}) {
+        const QJsonObject json =
+            QJsonDocument::fromJson(
+                get(QUrl::fromEncoded(QByteArray(
+                    QByteArrayLiteral("https://en.wikipedia.org/api/rest_v1/page/summary/") +
+                    QUrl::toPercentEncoding(candidate)))))
+                .object();
+        // One game, not a series, franchise or character that shares the name.
+        static const QRegularExpression kNotOneGame(
+            QStringLiteral("series|franchise|character"),
+            QRegularExpression::CaseInsensitiveOption);
+        const QString description = json.value(QStringLiteral("description")).toString();
+        if (json.value(QStringLiteral("type")).toString() != QStringLiteral("standard") ||
+            !description.contains(QStringLiteral("video game"), Qt::CaseInsensitive) ||
+            description.contains(kNotOneGame)) {
+            continue;
+        }
+        const QString image_url = json.value(QStringLiteral("originalimage"))
+                                      .toObject()
+                                      .value(QStringLiteral("source"))
+                                      .toString();
+        return image_url.isEmpty() ? QImage{} : QImage::fromData(get(QUrl(image_url)));
+    }
+    return {};
+}
+
 QString GameExportDialog::MaybeAddToSteam(const QString& game_title, const QString& exe_path,
-                                          const QString& backend_label, bool replace) {
+                                          const QString& backend_label, bool replace,
+                                          bool use_wikipedia) {
     SteamIntegration steam;
     if (!steam.IsSteamInstalled()) {
         return tr("\n\nSteam was not found, so no Steam shortcut was added.");
@@ -604,14 +712,27 @@ QString GameExportDialog::MaybeAddToSteam(const QString& game_title, const QStri
         return tr("\n\nNo launcher executable was found in the package, so no Steam shortcut "
                   "was added.");
     }
-    // Replacing takes over the game's own name; keeping both needs a distinct one.
-    const QString app_name =
-        replace ? game_title : QStringLiteral("%1 (%2)").arg(game_title, backend_label);
+    // Always named after the backend, so exports of one game with different backends can be
+    // told apart. Replacing removes only the library's own shortcut, which has the plain title.
+    const QString app_name = QStringLiteral("%1 (%2)").arg(game_title, backend_label);
     if (!steam.AddLauncherShortcut(app_name, exe_path, replace ? game_title : QString())) {
         return tr("\n\nThe Steam shortcut could not be written. Steam's shortcut list was left "
                   "unchanged.");
     }
-    return tr("\n\nAdded to Steam as \"%1\". Restart Steam to see it.").arg(app_name);
+
+    status_label->setText(tr("Adding Steam library artwork..."));
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    const QImage cover = use_wikipedia ? FetchWikipediaCover(game_title) : QImage{};
+    QString artwork_note;
+    if (!steam.WriteLauncherArtwork(app_name, exe_path, game_icon_.toImage(), cover)) {
+        artwork_note = tr(" Its library artwork could not be written.");
+    }
+    const QString added =
+        replace ? tr("\n\nAdded to Steam as \"%1\", replacing any \"%2\" shortcut that started the "
+                     "game through suyu. Restart Steam to see it.")
+                      .arg(app_name, game_title)
+                : tr("\n\nAdded to Steam as \"%1\". Restart Steam to see it.").arg(app_name);
+    return added + artwork_note;
 }
 
 // Deconstructed titles keep the multi-gigabyte RomFS beside the NSOs. Stage
@@ -779,27 +900,113 @@ static bool ReadCachedFallbackPolicy(const QByteArray& manifest, bool requested,
 
 static bool WritePortableVersionOverride(const QString& config_path, u32 app_version,
                                          const QString& display_version) {
-    if (app_version == 0 && !QFile::exists(config_path)) {
+    const bool has_override = app_version != 0 || !display_version.isEmpty();
+    if (!has_override && !QFile::exists(config_path)) {
         return true;
     }
-    if (app_version != 0 && !QDir().mkpath(QFileInfo(config_path).absolutePath())) {
+    if (has_override && !QDir().mkpath(QFileInfo(config_path).absolutePath())) {
         return false;
     }
+    // QSettings writes "a/b" as the "a\b" key frontend_common reads. A literal backslash in
+    // the name never becomes that key (Qt 6.10 writes "application_version_overridedefault"),
+    // so the "\default" flag was lost and an existing "\default=true" made suyu-cmd ignore
+    // the value.
     QSettings portable(config_path, QSettings::IniFormat);
     const QString number = QStringLiteral("System/application_version_override");
     const QString display = QStringLiteral("System/application_display_version_override");
-    if (app_version != 0) {
+    if (has_override) {
         portable.setValue(number, app_version);
-        portable.setValue(number + QStringLiteral("\\default"), false);
-        portable.setValue(number + QStringLiteral("\\use_global"), true);
+        portable.setValue(number + QStringLiteral("/default"), false);
+        portable.setValue(number + QStringLiteral("/use_global"), true);
         portable.setValue(display, display_version);
-        portable.setValue(display + QStringLiteral("\\default"), false);
-        portable.setValue(display + QStringLiteral("\\use_global"), true);
+        portable.setValue(display + QStringLiteral("/default"), false);
+        portable.setValue(display + QStringLiteral("/use_global"), true);
     } else {
         for (const auto& key : {number, display}) {
             portable.remove(key);
-            portable.remove(key + QStringLiteral("\\default"));
-            portable.remove(key + QStringLiteral("\\use_global"));
+            portable.remove(key + QStringLiteral("/default"));
+            portable.remove(key + QStringLiteral("/use_global"));
+        }
+    }
+    portable.sync();
+    return portable.status() == QSettings::NoError;
+}
+
+// A package reads only its own sdl2-config.ini, so it used to play on suyu-cmd's defaults
+// (FIFO vsync among them) whatever the user had chosen in suyu. Both frontends store settings
+// under the same keys, so the global values that decide how the game runs are copied across,
+// then this game's own overrides when its custom configuration is included: the package never
+// reads config/custom itself. The settings are chosen by category through the settings
+// linkage, so debug and unsafe CPU/GPU options, which share these ini sections, stay behind
+// along with paths, UI, input and web settings, and values that name this machine's devices
+// or this user.
+static bool SeedPortableConfig(const QString& config_path, quint64 program_id,
+                               bool include_custom) {
+    const QString config_dir = QString::fromStdString(
+        Common::FS::PathToUTF8String(Common::FS::GetSuyuPath(Common::FS::SuyuPath::ConfigDir)));
+    const QString global_path = config_dir + QDir::separator() + QStringLiteral("qt-config.ini");
+    if (!QFile::exists(global_path)) {
+        return true;
+    }
+    if (!QDir().mkpath(QFileInfo(config_path).absolutePath())) {
+        return false;
+    }
+    using Settings::Category;
+    static constexpr std::array kCategories{
+        Category::Core,          Category::Cpu,
+        Category::Renderer,      Category::RendererAdvanced,
+        Category::RendererHacks, Category::RendererExtensions,
+        Category::Audio,         Category::System,
+        Category::SystemAudio,   Category::LibraryApplet,
+    };
+    static const QStringList kSkipped{
+        QStringLiteral("vulkan_device"),  QStringLiteral("output_device"),
+        QStringLiteral("input_device"),   QStringLiteral("device_name"),
+        QStringLiteral("current_user"),   QStringLiteral("program_args"),
+        // WritePortableVersionOverride owns these.
+        QStringLiteral("application_version_override"),
+        QStringLiteral("application_display_version_override")};
+    // "Section/label" as QSettings names them; it reads a key's "label\default" companion
+    // as "label/default".
+    QStringList keys;
+    for (const Category category : kCategories) {
+        const QString section = QString::fromUtf8(Settings::TranslateCategory(category));
+        for (const Settings::BasicSetting* setting :
+             Settings::values.linkage.by_category[category]) {
+            const QString label = QString::fromStdString(setting->GetLabel());
+            if (setting->Save() && !kSkipped.contains(label)) {
+                keys.append(section + QLatin1Char('/') + label);
+            }
+        }
+    }
+
+    const QSettings global(global_path, QSettings::IniFormat);
+    QSettings portable(config_path, QSettings::IniFormat);
+    const QString is_default = QStringLiteral("/default");
+    for (const QString& key : keys) {
+        if (global.contains(key)) {
+            portable.setValue(key, global.value(key));
+        }
+        if (global.contains(key + is_default)) {
+            portable.setValue(key + is_default, global.value(key + is_default));
+        }
+    }
+
+    const QString custom_path =
+        config_dir + QDir::separator() + QStringLiteral("custom") + QDir::separator() +
+        QStringLiteral("%1").arg(program_id, 16, 16, QLatin1Char('0')).toUpper() +
+        QStringLiteral(".ini");
+    if (include_custom && program_id != 0 && QFile::exists(custom_path)) {
+        // A per-game file stores a value only where "use_global" is false.
+        const QSettings custom(custom_path, QSettings::IniFormat);
+        for (const QString& key : keys) {
+            if (custom.value(key + QStringLiteral("/use_global")).toString() ==
+                    QStringLiteral("false") &&
+                custom.contains(key)) {
+                portable.setValue(key, custom.value(key));
+                portable.setValue(key + is_default,
+                                  custom.value(key + is_default, QStringLiteral("false")));
+            }
         }
     }
     portable.sync();
@@ -828,8 +1035,13 @@ void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QS
     // Backend first: changing it re-runs the backend-options handler, which
     // rewrites the fallback checkbox and the Export Format combo's enabled
     // state. Applying format first would just be undone here.
-    if (backend_index >= 0 && backend_combo && backend_index < backend_combo->count()) {
-        backend_combo->setCurrentIndex(backend_index);
+    // backend_index keeps its documented meaning (0 = static, 1 = Hybrid, 2 = JIT), which is
+    // the RecompileBackend value, whatever the combo's display order.
+    if (backend_index >= 0 && backend_combo) {
+        const int item = backend_combo->findData(backend_index);
+        if (item >= 0) {
+            backend_combo->setCurrentIndex(item);
+        }
     }
     if (format_index >= 0 && output_format_combo &&
         format_index < output_format_combo->count()) {
@@ -894,11 +1106,12 @@ void GameExportDialog::OnBrowseRom() {
 
 // Cartridge dumps and some NSPs carry the update next to the base game; the ExeFS
 // extractor applies it from there, so such a game needs nothing installed.
-static bool RomFileIncludesUpdate(const QString& rom_path, u64 program_id) {
+// The NSP, or an XCI's secure partition, of a game file; null when it cannot be read.
+static std::shared_ptr<FileSys::NSP> OpenRomContainer(const QString& rom_path) {
     static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
     const auto file = vfs->OpenFile(rom_path.toStdString(), FileSys::OpenMode::Read);
     if (!file) {
-        return false;
+        return nullptr;
     }
     std::shared_ptr<FileSys::NSP> nsp;
     if (rom_path.endsWith(QStringLiteral(".nsp"), Qt::CaseInsensitive)) {
@@ -907,7 +1120,40 @@ static bool RomFileIncludesUpdate(const QString& rom_path, u64 program_id) {
         const FileSys::XCI xci{file};
         nsp = xci.GetSecurePartitionNSP();
     }
-    if (!nsp || nsp->GetStatus() != Loader::ResultStatus::Success) {
+    return nsp && nsp->GetStatus() == Loader::ResultStatus::Success ? nsp : nullptr;
+}
+
+// The version of the update packed in a game file: the title version from its CNMT and the
+// display version from its control data. Each is left alone when the file does not say.
+static void ReadRomFileUpdateVersion(const QString& rom_path, const FileSys::PatchManager& pm,
+                                     u32& title_version, QString& display) {
+    const auto nsp = OpenRomContainer(rom_path);
+    if (!nsp) {
+        return;
+    }
+    const u64 update_tid = FileSys::GetUpdateTitleID(pm.GetTitleID());
+    if (const auto meta = nsp->GetNCA(update_tid, FileSys::ContentRecordType::Meta,
+                                      FileSys::TitleType::Update);
+        meta && !meta->GetSubdirectories().empty()) {
+        for (const auto& file : meta->GetSubdirectories()[0]->GetFiles()) {
+            if (file->GetExtension() == "cnmt") {
+                title_version = FileSys::CNMT{file}.GetTitleVersion();
+                break;
+            }
+        }
+    }
+    if (const auto control = nsp->GetNCA(update_tid, FileSys::ContentRecordType::Control,
+                                         FileSys::TitleType::Update)) {
+        const auto metadata = pm.ParseControlNCA(*control);
+        if (metadata.first) {
+            display = QString::fromStdString(metadata.first->GetVersionString());
+        }
+    }
+}
+
+static bool RomFileIncludesUpdate(const QString& rom_path, u64 program_id) {
+    const auto nsp = OpenRomContainer(rom_path);
+    if (!nsp) {
         return false;
     }
     const auto update = nsp->GetNCA(FileSys::GetUpdateTitleID(program_id),
@@ -946,7 +1192,9 @@ quint64 GameExportDialog::SelectedProgramId() const {
     return program_id;
 }
 
-GameExportDialog::UpdateState GameExportDialog::CurrentUpdateState(QString* version) const {
+GameExportDialog::UpdateState GameExportDialog::CurrentUpdateState(QString* version,
+                                                                   QString* source,
+                                                                   quint32* title_version) const {
     const QString rom_path = rom_path_edit->text();
     if (rom_path.isEmpty()) {
         return UpdateState::NoGame;
@@ -973,26 +1221,75 @@ GameExportDialog::UpdateState GameExportDialog::CurrentUpdateState(QString* vers
     const bool any_update = content_provider.HasEntry(update_id, FileSys::ContentRecordType::Program);
     // An enabled installed update wins over one packed in the file for both ExeFS and RomFS.
     if (selection.installed_exefs) {
-        const auto update = content_provider.GetEntry(update_id, FileSys::ContentRecordType::Program);
+        // The very update PatchExeFS will apply, so the source and version shown are its.
+        const auto update = pm.GetExeFSUpdate();
         // PatchExeFS silently keeps the base code when the update's ExeFS cannot be opened.
         // Status is not checked: without its base an update NCA always reports
         // ErrorMissingBKTRBaseRomFS, even when its ExeFS reads fine.
-        if (update == nullptr || update->GetExeFS() == nullptr) {
+        if (!update || FileSys::NCA{update->program}.GetExeFS() == nullptr) {
             return UpdateState::Unreadable;
         }
         if (version) {
             // The display version ("4.0.0") from the control data, with the update applied the
             // same way the patcher applies it.
-            const auto metadata = pm.GetControlMetadata();
-            if (metadata.first) {
-                *version = QString::fromStdString(metadata.first->GetVersionString());
+            auto metadata = pm.GetControlMetadata();
+            // That needs the base game's control data in a provider, which a browsed file with
+            // its update in NAND lacks; the update carries control data of its own.
+            if (!metadata.first) {
+                if (const auto control = content_provider.GetEntry(
+                        update_id, FileSys::ContentRecordType::Control)) {
+                    metadata = pm.ParseControlNCA(*control);
+                }
             }
+            *version = metadata.first
+                           ? QString::fromStdString(metadata.first->GetVersionString())
+                           : QString::fromStdString(update->version_string);
+        }
+        if (title_version) {
+            *title_version = update->version;
+        }
+        if (source) {
+            // Only a NAND copy is a file of its own worth naming; the others live inside a
+            // container file or a directory listing, so the source is named instead.
+            using Slot = FileSys::ContentProviderUnionSlot;
+            const auto slot = update->slot;
+            const bool nand = slot && (*slot == Slot::SysNAND || *slot == Slot::UserNAND);
+            const QString where = !slot                     ? tr("installed content")
+                                  : *slot == Slot::SysNAND  ? tr("suyu's system NAND")
+                                  : *slot == Slot::UserNAND ? tr("suyu's NAND")
+                                  : *slot == Slot::SDMC     ? tr("suyu's SD card")
+                                  : *slot == Slot::External ? tr("an external content folder")
+                                                            : tr("a game in the game list");
+            // The game list registers the NCAs of every game file it scans, so an update found
+            // there or in a content folder is this very file's own when the file carries one.
+            const bool this_file = slot &&
+                                   (*slot == Slot::FrontendManual || *slot == Slot::External) &&
+                                   RomFileIncludesUpdate(rom_path, program_id);
+            *source = this_file ? tr("this game file (bundled)")
+                      : nand    ? QStringLiteral("%1: %2").arg(
+                                   where, QDir::toNativeSeparators(QString::fromStdString(
+                                              update->program->GetFullPath())))
+                                : where;
         }
         return UpdateState::Installed;
     }
     // A packed update reaches the ExeFS unconditionally but the RomFS only while updates are
     // enabled; otherwise the pair would not match and the export refuses it.
     if (RomFileIncludesUpdate(rom_path, program_id)) {
+        if (source) {
+            *source = tr("this game file (bundled)");
+        }
+        if (version || title_version) {
+            u32 number = 0;
+            QString display;
+            ReadRomFileUpdateVersion(rom_path, pm, number, display);
+            if (version) {
+                *version = display;
+            }
+            if (title_version) {
+                *title_version = number;
+            }
+        }
         return selection.romfs_enabled ? UpdateState::Bundled : UpdateState::BundledDisabled;
     }
     return any_update ? UpdateState::Disabled : UpdateState::None;
@@ -1013,9 +1310,18 @@ void GameExportDialog::RefreshUpdateStatus() {
         }
     }
     QString version;
-    const UpdateState state = CurrentUpdateState(&version);
+    QString source;
+    const UpdateState state = CurrentUpdateState(&version, &source);
     install_update_button->setEnabled(state != UpdateState::NoGame &&
                                       state != UpdateState::NotApplicable);
+    const bool used = state == UpdateState::Installed || state == UpdateState::Bundled;
+    if (update_source_label) {
+        const QString line = tr("From: %1").arg(source);
+        update_source_label->setText(update_source_label->fontMetrics().elidedText(
+            line, Qt::ElideMiddle, std::max(width() - 40, 400)));
+        update_source_label->setToolTip(line);
+        update_source_label->setVisible(used && !source.isEmpty());
+    }
     switch (state) {
     case UpdateState::NoGame:
         update_status_label->setText(tr("Select a game to check for an update."));
@@ -1042,7 +1348,10 @@ void GameExportDialog::RefreshUpdateStatus() {
         break;
     case UpdateState::Bundled:
         update_status_label->setText(
-            tr("Update included in this game file. The export will use it."));
+            version.isEmpty()
+                ? tr("Update included in this game file. The export will use it.")
+                : tr("Update %1 included in this game file. The export will use it.")
+                      .arg(version));
         break;
     case UpdateState::BundledDisabled:
         update_status_label->setText(
@@ -2158,7 +2467,8 @@ static QString FindBestCmakeExecutable() {
 // ever gets spawned for the remaining files. Everything read is accumulated
 // into `captured` so callers still get the full log for diagnostics.
 static int RunProcessDrained(QProcess& proc, const QString& program, const QStringList& args,
-                             QString* captured = nullptr) {
+                             QString* captured = nullptr,
+                             const std::function<void(const QString&)>& on_output = {}) {
     QString sink;
     QString& out = captured ? *captured : sink;
     out.clear();
@@ -2173,7 +2483,11 @@ static int RunProcessDrained(QProcess& proc, const QString& program, const QStri
     const auto drain = [&] {
         const QByteArray chunk = proc.readAllStandardOutput();
         if (!chunk.isEmpty()) {
-            out += QString::fromLocal8Bit(chunk);
+            const QString text = QString::fromLocal8Bit(chunk);
+            if (on_output) {
+                on_output(text);
+            }
+            out += text;
             // Keep the retained log bounded; only the tail is ever reported.
             if (out.size() > 1 << 20) {
                 out = out.right(1 << 19);
@@ -2207,11 +2521,59 @@ static int RunProcessDrained(QProcess& proc, const QString& program, const QStri
     return proc.exitCode();
 }
 
+// The last "[done/total]" step counter ninja prints in @p text, if any.
+static bool LastBuildStep(const QString& text, int& done, int& total) {
+    static const QRegularExpression kStep(QStringLiteral("\\[(\\d+)/(\\d+)\\]"));
+    bool found = false;
+    for (auto it = kStep.globalMatch(text); it.hasNext();) {
+        const auto match = it.next();
+        done = match.captured(1).toInt();
+        total = match.captured(2).toInt();
+        found = true;
+    }
+    return found;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // AOT Pre-compilation — Real Implementation
 // ---------------------------------------------------------------------------
+
+void GameExportDialog::SetupExportStages(bool uses_aot, bool compiled) {
+    // Rough shares of an export's wall time: compiling the lifted C dominates a Build.
+    const std::array<double, static_cast<std::size_t>(ExportStage::Count)> weights{
+        uses_aot ? 2.0 : 0.0,              // Extract: read and decompress the ExeFS
+        uses_aot ? 20.0 : 0.0,             // Lift: ARM64 to C
+        uses_aot && compiled ? 60.0 : 0.0, // Compile the generated C
+        uses_aot && compiled ? 8.0 : 0.0,  // Link the single-file executable
+        10.0,                              // Package: ExeFS, RomFS, launcher, data
+    };
+    double total = 0.0;
+    for (const double weight : weights) {
+        total += weight;
+    }
+    double position = 0.0;
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        stage_bounds_[i] = position / total;
+        position += weights[i];
+    }
+    stage_bounds_.back() = 1.0;
+}
+
+void GameExportDialog::ReportStage(ExportStage stage, double fraction, const QString& status) {
+    const auto i = static_cast<std::size_t>(stage);
+    const double position =
+        stage_bounds_[i] + std::clamp(fraction, 0.0, 1.0) * (stage_bounds_[i + 1] - stage_bounds_[i]);
+    const int value = static_cast<int>(position * progress_bar->maximum());
+    if (value > progress_bar->value()) {
+        progress_bar->setValue(value);
+    }
+    if (!status.isEmpty()) {
+        status_label->setText(status);
+    }
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+}
 
 bool GameExportDialog::WantsCompiledOutput() const {
     return output_format_combo && platform_combo &&
@@ -2377,6 +2739,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             };
 
             for (const auto& nso_file : nso_files) {
+                ReportStage(ExportStage::Extract,
+                            static_cast<double>(module_results.size()) / nso_files.size(),
+                            tr("Reading %1...").arg(QString::fromStdString(nso_file->GetName())));
                 const auto t_file_start = std::chrono::steady_clock::now();
                 auto result = AnalyzeNsoFile(nso_file, full_scan);
                 const auto t_file_end = std::chrono::steady_clock::now();
@@ -2437,6 +2802,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     if (module_results.empty()) {
         return QString();
     }
+    ReportStage(ExportStage::Extract, 1.0);
 
     // Compute totals
     u32 total_blocks = 0;
@@ -2494,10 +2860,29 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     QStringList recomp_module_dirs;
     QStringList fallback_modules;
 
+    // EmitProject reports nothing while it runs, so lifting advances per module, weighted
+    // by code size; the same weights split the compile stage below.
+    std::map<QString, u64> module_code_bytes;
+    u64 total_code_bytes = 0;
+    for (const auto& mod : module_results) {
+        module_code_bytes[mod.name] = mod.text_bytes.size();
+        total_code_bytes += mod.text_bytes.size();
+    }
+    u64 lifted_code_bytes = 0;
+    std::size_t lifted_modules = 0;
+
     for (const auto& mod : module_results) {
         if (mod.text_bytes.empty()) {
             continue;
         }
+        ReportStage(ExportStage::Lift,
+                    total_code_bytes ? static_cast<double>(lifted_code_bytes) / total_code_bytes
+                                     : 0.0,
+                    tr("Lifting module %1 (%2 of %3) to C...")
+                        .arg(mod.name)
+                        .arg(++lifted_modules)
+                        .arg(module_results.size()));
+        lifted_code_bytes += mod.text_bytes.size();
         const QString mod_dir = recomp_root + QDir::separator() + mod.name;
         QDir().mkpath(mod_dir);
 
@@ -2576,7 +2961,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             if (!fallback_enabled) {
                 QMessageBox::critical(
                     this, tr("Export Failed"),
-                    tr("Module '%1' could not be recompiled.\n\nChoose Hybrid AOT + JIT "
+                    tr("Module '%1' could not be recompiled.\n\nChoose suyu Hybrid JIT + AOT "
                        "to skip failed modules and use the dynarmic JIT for them at runtime.")
                         .arg(mod.name));
                 return {};
@@ -2777,8 +3162,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         "generic launcher; the export will use recompiled DLLs instead of a single "
                         "static executable");
         } else {
-            status_label->setText(tr("Linking the single-file executable..."));
-            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+            ReportStage(ExportStage::Lift, 1.0, tr("Configuring the build..."));
 
             QString conf_log;
             QString link_log;
@@ -2883,9 +3267,26 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             // way to tell which one to drop.
             QStringList failed_to_compile;
             if (conf_rc == 0) {
+                u64 compile_total = 0;
                 for (const QString& m : recomp_module_dirs) {
-                    status_label->setText(tr("Compiling %1 (this takes a while)...").arg(m));
-                    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+                    compile_total += module_code_bytes[m];
+                }
+                u64 compiled_bytes = 0;
+                for (const QString& m : recomp_module_dirs) {
+                    const u64 module_bytes = module_code_bytes[m];
+                    const auto report = [&](int done, int total) {
+                        const double within = total > 0 ? static_cast<double>(done) / total : 0.0;
+                        ReportStage(ExportStage::Compile,
+                                    compile_total ? (compiled_bytes + within * module_bytes) /
+                                                        static_cast<double>(compile_total)
+                                                  : 0.0,
+                                    total > 0 ? tr("Compiling %1/%2 files (%3)")
+                                                    .arg(done)
+                                                    .arg(total)
+                                                    .arg(m)
+                                              : tr("Compiling %1...").arg(m));
+                    };
+                    report(0, 0);
 
                     QProcess mod_build;
                     mod_build.setProcessEnvironment(vs_env);
@@ -2896,7 +3297,14 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                          QStringLiteral("recomp_static_") + m, QStringLiteral("--config"),
                          QStringLiteral("Release"), QStringLiteral("--parallel"),
                          QStringLiteral("2")},
-                        &mod_log);
+                        &mod_log, [&](const QString& text) {
+                            int done = 0;
+                            int total = 0;
+                            if (LastBuildStep(text, done, total)) {
+                                report(done, total);
+                            }
+                        });
+                    compiled_bytes += module_bytes;
                     if (mod_rc == 0) {
                         continue;
                     }
@@ -2906,7 +3314,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         QMessageBox::critical(
                             this, tr("Build Failed"),
                             tr("Compiling module '%1' failed.\n\nThe generated sources are still "
-                               "in:\n%2\n\nChoose Hybrid AOT + JIT to continue despite build "
+                               "in:\n%2\n\nChoose suyu Hybrid JIT + AOT to continue despite build "
                                "failures. See the suyu log for the compiler output.")
                                 .arg(m, recomp_root + QDir::separator() + m));
                         return {};
@@ -2960,13 +3368,26 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             if (conf_rc == 0) {
                 QProcess bld;
                 bld.setProcessEnvironment(vs_env);
-                link_rc = RunProcessDrained(bld, cmake_exe,
-                                            {QStringLiteral("--build"), build_tree,
-                                             QStringLiteral("--target"),
-                                             QStringLiteral("suyu-cmd-static"),
-                                             QStringLiteral("--config"), QStringLiteral("Release"),
-                                             QStringLiteral("--parallel"), QStringLiteral("2")},
-                                            &link_log);
+                ReportStage(ExportStage::Compile, 1.0);
+                ReportStage(ExportStage::Link, 0.0,
+                            tr("Linking the single-file executable..."));
+                link_rc = RunProcessDrained(
+                    bld, cmake_exe,
+                    {QStringLiteral("--build"), build_tree, QStringLiteral("--target"),
+                     QStringLiteral("suyu-cmd-static"), QStringLiteral("--config"),
+                     QStringLiteral("Release"), QStringLiteral("--parallel"), QStringLiteral("2")},
+                    &link_log, [&](const QString& text) {
+                        int done = 0;
+                        int total = 0;
+                        if (LastBuildStep(text, done, total)) {
+                            ReportStage(ExportStage::Link,
+                                        static_cast<double>(done) / std::max(total, 1),
+                                        tr("Linking the single-file executable (%1/%2)")
+                                            .arg(done)
+                                            .arg(total));
+                        }
+                    });
+                ReportStage(ExportStage::Link, 1.0);
                 if (link_rc != 0) {
                     LOG_ERROR(Frontend, "suyu-cmd-static failed to link:\n{}",
                               link_log.right(4000).toStdString());
@@ -3285,6 +3706,11 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         constexpr u64 kChunk = 64ULL * 1024 * 1024;
         const u64 total = romfs_vf->GetSize();
         for (u64 off = 0; off < total; off += kChunk) {
+            // Game data is most of packaging; the rest (ExeFS, launcher, DLLs) is small.
+            ReportStage(ExportStage::Package, 0.05 + 0.85 * static_cast<double>(off) / total,
+                        tr("Copying game data: %1 of %2 MB")
+                            .arg(off >> 20)
+                            .arg(total >> 20));
             const u64 len = std::min(kChunk, total - off);
             const auto bytes = romfs_vf->ReadBytes(len, off);
             if (bytes.size() != len ||
@@ -3453,8 +3879,8 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // root above, the whole generated-C build tree - per-module source,
         // object files, .lib artifacts, often several GB - is now dead
         // weight sitting in what's supposed to be a tidy, standalone game
-        // folder. Delete it; a repeat export just recompiles (fast, thanks
-        // to the /O1 + /MP codegen flags) rather than reusing this cache.
+        // folder. Delete it; a repeat export just recompiles it rather than
+        // reusing this cache.
         if (has_static_launcher || !uses_aot) {
             QDir(cache_dir).removeRecursively();
         } else {
@@ -3469,17 +3895,19 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         if (readme.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream out(&readme);
             if (!uses_aot) {
-                out << "Dynarmic JIT (Baseline) — standalone comparison package\n\n"
+                out << "suyu Dynarmic JIT (Baseline) — standalone comparison package\n\n"
                     << "Run: double-click launch.bat (or " << package_name << ".exe directly)\n\n"
                     << "The game's extracted ARM64 code runs through the Dynarmic JIT. This build\n"
-                    << "is the baseline for comparing suyu static (Experimental) and Hybrid AOT + JIT.\n"
-                    << "No original ROM or decryption keys are needed at runtime.\n";
+                    << "is the baseline for comparing suyu static AOT (Experimental) and\n"
+                    << "suyu Hybrid JIT + AOT.\n"
+                    << "No original ROM is needed at runtime. Keys and system firmware are read\n"
+                    << "from the installed suyu and are never copied into this package.\n";
                 readme.close();
                 return true;
             }
             out << (is_hybrid
-                        ? "Recompiled native build — Hybrid AOT + JIT\n\n"
-                        : "Recompiled native build — suyu static (Experimental), no JIT fallback\n\n");
+                        ? "Recompiled native build — suyu Hybrid JIT + AOT\n\n"
+                        : "Recompiled native build — suyu static AOT (Experimental), no JIT fallback\n\n");
             out << "Run: double-click launch.bat (or " << package_name << ".exe directly)\n\n";
             out << "This is the game itself, statically recompiled to x86 machine code and\n";
             out << "linked into " << package_name << ".exe alongside suyu's HLE/GPU/audio backend\n";
@@ -3493,19 +3921,22 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             if (is_hybrid) {
                 out << "- Fallback: Dynarmic JIT executes blocks or modules not covered by the\n"
                     << "            static image, then returns control to AOT code.\n\n";
-                out << "Recommended for best performance.\n\n";
+                out << "Performance varies by game; compare it with the suyu Dynarmic JIT\n"
+                    << "export.\n\n";
             } else {
                 out << "- Fallback: disabled. Uncovered code stops execution. A successful run\n"
                     << "            validates only the paths exercised in that run.\n\n";
                 out << "Experimental: loading and gameplay can be slower. Compatibility must be\n"
-                    << "checked for each title. Use Hybrid AOT + JIT for best performance.\n\n";
+                    << "checked for each title. Performance varies by game; compare it with\n"
+                    << "the suyu Hybrid JIT + AOT and suyu Dynarmic JIT exports.\n\n";
             }
             out << "Contents:\n";
             out << "- " << package_name
                 << ".exe : the game (recompiled code + HLE/GPU backend, one file)\n";
             out << "- launch.bat      : one-click launcher\n";
             out << "- exefs/          : the game's own executables and data, extracted once at\n";
-            out << "                    export time so no ROM or decryption keys are needed to run\n";
+            out << "                    export time so no ROM is needed to run (keys and firmware\n";
+            out << "                    are read from the installed suyu, never from this folder)\n";
             out << "- *.dll           : runtime libraries (FFmpeg, Vulkan, OpenSSL)\n";
             out << "- mods/           : optional; drop <title_id>/<mod name>/ folders here\n";
             out << "- user/           : this game's own config, saves, and logs (not suyu's)\n\n";
@@ -4008,9 +4439,23 @@ void GameExportDialog::OnExport() {
     // Read once: a Build can run for hours with the dialog responsive, and the ROM field or
     // these options may change meanwhile.
     const u64 export_program_id = SelectedProgramId();
+    // The update this export is built from, read now for the same reason. Every package
+    // loads a deconstructed ExeFS with no control data, so unless the package config
+    // names a version the game reports 0 and "1.0.0" while the update's code runs.
+    u32 update_version = 0;
+    QString update_display;
+    if (export_program_id != 0) {
+        const UpdateState update_state =
+            CurrentUpdateState(&update_display, nullptr, &update_version);
+        if (update_state != UpdateState::Installed && update_state != UpdateState::Bundled) {
+            update_version = 0;
+            update_display.clear();
+        }
+    }
     const bool add_to_steam =
         steam_shortcut_checkbox->isEnabled() && steam_shortcut_checkbox->isChecked();
     const bool steam_replace = steam_replace_rom_checkbox->isChecked();
+    const bool steam_wikipedia = steam_wikipedia_checkbox->isChecked();
     const QFileInfo rom_info(rom_path);
     // Prefer the NACP/library title; fall back to filename if not found.
     QString game_name = rom_info.completeBaseName();
@@ -4072,10 +4517,11 @@ void GameExportDialog::OnExport() {
     export_button->setEnabled(false);
     progress_bar->setVisible(true);
     progress_bar->setValue(0);
+    SetupExportStages(uses_aot, uses_aot && WantsCompiledOutput());
     status_label->setText(
         uses_aot ? (is_hybrid ? tr("Preparing hybrid AOT + JIT export...")
-                              : tr("Preparing suyu static (Experimental) export..."))
-                 : tr("Preparing Dynarmic JIT (Baseline)..."));
+                              : tr("Preparing suyu static AOT (Experimental) export..."))
+                 : tr("Preparing suyu Dynarmic JIT (Baseline)..."));
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
     try {
@@ -4092,7 +4538,6 @@ void GameExportDialog::OnExport() {
         uses_aot ? AotCacheDirFor(output_dir, export_name, platform)
                  : work_dir + QDir::separator() + QStringLiteral("jit_baseline");
     QDir().mkpath(cache_work);
-    progress_bar->setValue(5);
 
     if (uses_aot) {
         if (QDir(exefs_work).exists() && !QDir(exefs_work).removeRecursively()) {
@@ -4116,10 +4561,10 @@ void GameExportDialog::OnExport() {
         }
 
         // For packaged ROM files (NSP/XCI/NCA), the AOT step uses VFS to extract ExeFS directly.
-        progress_bar->setValue(15);
+        ReportStage(ExportStage::Extract, 0.1);
         status_label->setText(
-            is_hybrid ? tr("Running AOT pre-compilation (Hybrid AOT + JIT)...")
-                      : tr("Running AOT pre-compilation: suyu static (Experimental)..."));
+            is_hybrid ? tr("Running AOT pre-compilation (suyu Hybrid JIT + AOT)...")
+                      : tr("Running AOT pre-compilation: suyu static AOT (Experimental)..."));
         QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
         if (RunAotPrecompile(exefs_work, cache_work, backend, game_name).isEmpty()) {
@@ -4133,11 +4578,8 @@ void GameExportDialog::OnExport() {
             return;
         }
     }
-    progress_bar->setValue(40);
-
     // Step 4: Package native export artifacts
-    status_label->setText(tr("Packaging native export artifacts..."));
-    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    ReportStage(ExportStage::Package, 0.0, tr("Packaging native export artifacts..."));
 
     const bool pkg_ok =
         PackageNativeExport(rom_path, cache_work, output_dir, game_name, platform, backend);
@@ -4151,7 +4593,7 @@ void GameExportDialog::OnExport() {
         emit ExportFinished(false, {});
         return;
     }
-    progress_bar->setValue(75);
+    ReportStage(ExportStage::Package, 0.9);
 
     // Step 5: Bundle portable data (save, shader, config)
     if ((include_save_data || include_shader_cache || include_custom_config) &&
@@ -4178,30 +4620,83 @@ void GameExportDialog::OnExport() {
             throw std::runtime_error("Failed to bundle portable support data");
         }
     }
-    progress_bar->setValue(90);
+    ReportStage(ExportStage::Package, 0.97);
 
     // Deconstructed ExeFS has no update CNMT, so preserve an explicitly
     // selected application version in the portable CLI config. This keeps
     // the game's reported version aligned with the code/data in the export.
     if (platform == TargetPlatform::Windows) {
-        const u32 app_version = test_app_version != 0
-                                    ? test_app_version
-                                    : Settings::values.application_version_override.GetValue();
-        const QString display_version = !test_display_version.isEmpty()
-                                            ? test_display_version
-                                            : QString::fromStdString(Settings::values
-                                                                          .application_display_version_override
-                                                                          .GetValue());
+        u32 app_version = test_app_version != 0
+                              ? test_app_version
+                              : Settings::values.application_version_override.GetValue();
+        QString display_version = !test_display_version.isEmpty()
+                                      ? test_display_version
+                                      : QString::fromStdString(Settings::values
+                                                                    .application_display_version_override
+                                                                    .GetValue());
+        // With no explicit override, the version of the update the export was built from.
+        // suyu-cmd applies these keys for every package type, JIT baseline included.
+        if (app_version == 0 && display_version.isEmpty() &&
+            (update_version != 0 || !update_display.isEmpty())) {
+            app_version = update_version;
+            display_version = update_display;
+            LOG_INFO(Frontend, "Export: reporting the update's application version {} ({})",
+                     app_version, display_version.toStdString());
+        }
         const QString config_path = output_dir + QDir::separator() + export_name +
                                     QStringLiteral("/user/config/sdl2-config.ini");
+        if (!SeedPortableConfig(config_path, export_program_id, include_custom_config)) {
+            throw std::runtime_error("Could not write portable settings config");
+        }
         if (!WritePortableVersionOverride(config_path, app_version, display_version)) {
             throw std::runtime_error("Could not write portable version config");
+        }
+        // Lets the package's missing keys/firmware dialog open this suyu's installer. A Source
+        // export is built into a launcher on some other machine, where this path means nothing.
+        const QString record_dir = QFileInfo(config_path).absolutePath();
+        const QString install_record = record_dir + QStringLiteral("/suyu-install.txt");
+        if (!uses_aot || WantsCompiledOutput()) {
+            // One line per way of finding suyu again, tried in order: relative to this file,
+            // for a package that stays put, then absolute, for one moved elsewhere on this
+            // computer. A package may be shared, so neither names the account: the relative
+            // line is left out when it would pass through the profile folder, and the
+            // absolute one names the home folder as %USERPROFILE% (%HOME% elsewhere), expanded
+            // when it is read.
+            const QString suyu_path = QDir::cleanPath(QCoreApplication::applicationFilePath());
+            const QString home = QDir::cleanPath(QDir::homePath());
+            QStringList lines;
+            const QString relative = QDir(record_dir).relativeFilePath(suyu_path);
+            if (QDir::isRelativePath(relative) &&
+                !relative.split(QLatin1Char('/')).contains(QDir(home).dirName(),
+                                                           Qt::CaseInsensitive)) {
+                lines.append(relative);
+            }
+#ifdef _WIN32
+            const QString home_token = QStringLiteral("%USERPROFILE%");
+            constexpr auto home_case = Qt::CaseInsensitive;
+#else
+            const QString home_token = QStringLiteral("%HOME%");
+            constexpr auto home_case = Qt::CaseSensitive;
+#endif
+            lines.append(suyu_path.startsWith(home + QLatin1Char('/'), home_case)
+                             ? home_token + suyu_path.mid(home.size())
+                             : suyu_path);
+            QSaveFile record(install_record);
+            if (!QDir().mkpath(record_dir) || !record.open(QIODevice::WriteOnly) ||
+                record.write(QDir::toNativeSeparators(lines.join(QLatin1Char('\n')))
+                                 .toUtf8()
+                                 .append('\n')) < 0 ||
+                !record.commit()) {
+                LOG_WARNING(Frontend, "Could not record the suyu installation in the package");
+            }
+        } else {
+            QFile::remove(install_record);
         }
     }
 
     // Step 6: Clean up working directory
     QDir(work_dir).removeRecursively();
-    progress_bar->setValue(100);
+    ReportStage(ExportStage::Package, 1.0);
 
     // Determine final output path for display
     QString final_path;
@@ -4215,6 +4710,18 @@ void GameExportDialog::OnExport() {
     case TargetPlatform::MacOS:
         final_path = output_dir + QDir::separator() + export_name + QStringLiteral(".app");
         break;
+    }
+
+    // Done before the export reports completion, so the dialog is not held up afterwards
+    // and its status line ends on the completion text.
+    QString steam_note;
+    if (!test_driven_export && add_to_steam && platform == TargetPlatform::Windows) {
+        steam_note = MaybeAddToSteam(
+            game_title, final_path + QDir::separator() + export_name + QStringLiteral(".exe"),
+            !uses_aot    ? tr("suyu Dynarmic JIT")
+            : is_hybrid ? tr("suyu Hybrid JIT + AOT")
+                        : tr("suyu static AOT"),
+            steam_replace, steam_wikipedia);
     }
 
     export_button->setEnabled(true);
@@ -4240,35 +4747,32 @@ void GameExportDialog::OnExport() {
                 .arg(last_fallback_modules.size())
                 .arg(last_fallback_modules.join(QStringLiteral("\n  ")));
     }
-    if (add_to_steam && platform == TargetPlatform::Windows) {
-        fallback_note += MaybeAddToSteam(
-            game_title, final_path + QDir::separator() + export_name + QStringLiteral(".exe"),
-            !uses_aot ? tr("Dynarmic JIT") : is_hybrid ? tr("Hybrid") : tr("suyu static"),
-            steam_replace);
-    }
+    fallback_note += steam_note;
 
     if (!uses_aot) {
         QMessageBox::information(
             this, tr("JIT Baseline Export Complete"),
-            tr("The Dynarmic JIT (Baseline) package was exported to:\n%1\n\n"
-               "Run %2.exe and compare it with the suyu static (Experimental) export of the "
+            tr("The suyu Dynarmic JIT (Baseline) package was exported to:\n%1\n\n"
+               "Run %2.exe and compare it with the suyu static AOT (Experimental) export of the "
                "same game.")
                     .arg(final_path, export_name) +
                 fallback_note);
     } else if (is_hybrid) {
         QMessageBox::information(
             this, tr("Hybrid Export Complete"),
-            tr("The Hybrid AOT + JIT package was exported to:\n%1\n\n"
-               "Recommended for best performance. It runs static code first and falls back to "
-               "Dynarmic for uncovered code.")
+            tr("The suyu Hybrid JIT + AOT package was exported to:\n%1\n\n"
+               "It runs recompiled code first and falls back to the Dynarmic JIT for uncovered "
+               "code. Performance varies by game; compare it with the suyu Dynarmic JIT "
+               "export.")
                     .arg(final_path) +
                 fallback_note);
     } else if (WantsCompiledOutput()) {
         QMessageBox::information(
-            this, tr("suyu static (Experimental) Export Complete"),
+            this, tr("suyu static AOT (Experimental) Export Complete"),
             tr("Game exported and compiled to a standalone executable at:\n%1\n\n"
                "This experimental build disables JIT fallback and can load or run more slowly. "
-               "Use Hybrid AOT + JIT for best performance.\n\n"
+               "Performance varies by game; compare it with the suyu Hybrid JIT + AOT and suyu "
+               "Dynarmic JIT exports.\n\n"
                "The package contains:\n"
                "- %2.exe — the recompiled game, statically linked with suyu's HLE/GPU backend "
                "(no separate DLLs, no emulator installation required)\n"
