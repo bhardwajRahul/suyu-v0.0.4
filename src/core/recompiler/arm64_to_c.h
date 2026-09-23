@@ -5533,10 +5533,11 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     }
     cm << ")\n\n"
        << "# Generated block bodies are huge flat switch/if chains translated\n"
-       << "# straight from machine code - there's no loop nesting or hot path for\n"
-       << "# -O2 to meaningfully improve, just a lot of blocks for it to chew\n"
-       << "# through. Compiling them at -O1 cuts single-TU compile time sharply\n"
-       << "# on large modules with no measurable runtime cost.\n"
+       << "# straight from machine code. They were compiled at -O1 on the belief\n"
+       << "# that -O2 gains nothing here; measured on MK8D, -O2 (/O2 with MSVC)\n"
+       << "# races ~13% faster on x64 Windows and ~11% on arm64 macOS for ~25%\n"
+       << "# longer compiles. MSVC needs /bigobj at /O2: the units exceed the\n"
+       << "# default COFF section limit (C1128).\n"
        << "if(MSVC)\n"
        // /MP is what actually decides wall-clock time here. The Visual Studio
        // generator compiles the files of a single project strictly in
@@ -5552,7 +5553,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        // set) turns "unused local" into a hard build failure; the codegen
        // legitimately computes and drops _r on some flag-only paths, so
        // downgrade it back to a warning for generated sources specifically.
-       << "  set(_recomp_msvc_opts \"/O1\" \"/WX-\" \"/wd4127\" \"/wd4723\" \"/wd4102\" "
+       << "  set(_recomp_msvc_opts \"/O2\" \"/bigobj\" \"/WX-\" \"/wd4127\" \"/wd4723\" \"/wd4102\" "
           "\"/wd4101\" \"/wd4189\" \"/wd4456\" \"/wd4457\" \"/wd4459\")\n"
        << "  if(NOT CMAKE_GENERATOR MATCHES \"Ninja\")\n"
        // Bare /MP means "one compile per core", which is exactly the
@@ -5562,12 +5563,13 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "
           "\"${_recomp_msvc_opts}\")\n"
        << "else()\n"
-       // Overridable: -O1 suits a hybrid image, where the SIMD-heavy blocks stay
-       // on the JIT anyway, but a JIT-free image owns those blocks and GCC does
-       // not vectorise at all below -O2.
-       << "  set(RECOMP_OPT_FLAGS \"-O1 -foptimize-sibling-calls\" CACHE STRING\n"
+       // Overridable. -O2 by default: it measured ~11% faster than -O1 on arm64
+       // macOS, and GCC does not vectorise at all below -O2. The cache entry is
+       // versioned: a tree configured before the -O2 default keeps its cached -O1
+       // under the old name, and would otherwise never pick up the new default.
+       << "  set(RECOMP_OPT_FLAGS_V2 \"-O2 -foptimize-sibling-calls\" CACHE STRING\n"
           "      \"optimisation flags for the generated block bodies\")\n"
-       << "  separate_arguments(_recomp_opt NATIVE_COMMAND \"${RECOMP_OPT_FLAGS}\")\n"
+       << "  separate_arguments(_recomp_opt NATIVE_COMMAND \"${RECOMP_OPT_FLAGS_V2}\")\n"
        // Same reasoning as /WX- above: a host tree built with -Werror must not
        // fail on a shadowed local inside generated code.
        << "  list(APPEND _recomp_opt \"-Wno-error\")\n"
