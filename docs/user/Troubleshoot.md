@@ -49,7 +49,8 @@ The Android Studio emulator has no real GPU, so suyu runs at about 4–8 game fp
 This is expected and says nothing about a real phone.
 
 - Read the game's frame rate from the core's own "Game X.X FPS · N ms" readout
-  (core option **Show Game Performance**). RetroArch's own FPS counter also counts
+  (core option **Show Game Performance**). While shaders are being built, it shows
+  the shader count in place of the frame time. RetroArch's own FPS counter also counts
   repeated frames, so it reads higher.
 - Black margins around the picture come from the emulated phone's camera cutout, not
   from suyu: Android keeps RetroArch's window out of the cutout area. Let RetroArch

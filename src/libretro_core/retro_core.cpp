@@ -201,7 +201,18 @@ bool ReadShowPerfOption() {
              std::string(var.value) == "Off");
 }
 
-void ShowPerfMessage(const std::string& text) {
+void ShowPerfMessage(std::string text) {
+#ifdef __APPLE__
+    // RetroArch on macOS sizes the right-anchored status box about a quarter
+    // narrower than the text it draws, clipping the end of the readout at the
+    // window edge. Trailing spaces draw as nothing but widen the box; half the
+    // character count was enough in every form on RetroArch 1.22.2.
+    std::size_t code_points = 0;
+    for (const unsigned char c : text) {
+        code_points += (c & 0xC0) != 0x80;
+    }
+    text.append((code_points + 1) / 2, ' ');
+#endif
     // Refreshed every second; the duration overlaps the next update so it never
     // blinks, and a status message replaces the previous one instead of queueing.
     if (g_message_ext) {
@@ -476,23 +487,22 @@ RETRO_API void retro_run() {
                     const auto finite = [](double value) {
                         return std::isfinite(value) && value >= 0.0 ? value : 0.0;
                     };
-                    // Not "speed": with multicore on (the default) guest time is the host wall
-                    // clock, so emulation_speed is ~100% however slowly the game runs. The
-                    // average host time between guest frames is the honest measure.
+                    // RetroArch's status box is narrow, so the readout carries one detail after
+                    // the frame rate: the shaders being built while there are any, since that is
+                    // what a stutter needs explained; else, with multicore on (the default), the
+                    // frame time.
+                    // Speed is shown only in single-core mode: with multicore, guest time is
+                    // the host wall clock, so emulation_speed reads ~100% however slow it runs.
                     std::string text = fmt::format("Game {:.1f} FPS", finite(stats.average_game_fps));
-                    if (std::isfinite(stats.system_fps) && stats.system_fps > 0.0) {
-                        text += fmt::format(" · {:.1f} ms", finite(stats.frametime) * 1000.0);
-                    }
-                    if (!Settings::values.use_multi_core.GetValue()) {
-                        text += fmt::format(" · speed {:.0f}%",
-                                            finite(stats.emulation_speed) * 100.0);
-                    }
                     if (const int building = g_system->GPU().ShaderNotify().ShadersBuilding();
                         building > 0) {
-                        text += fmt::format(" · Building {} shader{}", building,
-                                            building == 1 ? "" : "s");
+                        text += fmt::format(" · {} shader{}", building, building == 1 ? "" : "s");
+                    } else if (!Settings::values.use_multi_core.GetValue()) {
+                        text += fmt::format(" · {:.0f}%", finite(stats.emulation_speed) * 100.0);
+                    } else if (std::isfinite(stats.system_fps) && stats.system_fps > 0.0) {
+                        text += fmt::format(" · {:.1f} ms", finite(stats.frametime) * 1000.0);
                     }
-                    ShowPerfMessage(text);
+                    ShowPerfMessage(std::move(text));
                 }
             }
             g_perf_last_sample = now;
