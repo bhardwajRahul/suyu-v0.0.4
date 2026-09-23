@@ -429,6 +429,11 @@ struct System::Impl {
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        // Closing the nvdrv sessions unmaps their buffers from device memory, so the GPU
+        // thread must be done with queued command lists before the services go away.
+        if (gpu_core) {
+            gpu_core->ShutdownThread();
+        }
         kernel.CloseServices();
         kernel.ShutdownCores();
         services.reset();
