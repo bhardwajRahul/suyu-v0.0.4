@@ -56,6 +56,16 @@ struct NativeStatusSnapshot {
     bool jit_available{};
     bool strict_requested{};
     std::uint64_t jit_transitions{};
+    // The configured CPU backend is Dynarmic, which is what runs the game when
+    // no recompiled image is registered (a JIT baseline package).
+    bool dynarmic_backend{};
+    // In multicore mode guest time follows the host clock, so the emulation speed reads ~100%
+    // whatever the frame rate; it only means something in single-core mode.
+    bool speed_meaningful{};
+
+    // Filled in by the window's status refresh alone: ShaderNotify's reporting
+    // bookkeeping is not synchronised, so exactly one thread may query it.
+    int shaders_building{};
 
     bool applet_running{};
     std::string applet_name;
@@ -69,11 +79,11 @@ inline const char* NativeBackendName(NativeBackendClass kind) {
     case NativeBackendClass::Pending:
         return "PENDING";
     case NativeBackendClass::StrictAot:
-        return "AOT STRICT";
+        return "suyu static AOT";
     case NativeBackendClass::HybridAot:
-        return "HYBRID AOT";
+        return "suyu Hybrid JIT + AOT";
     case NativeBackendClass::DynarmicJit:
-        return "JIT";
+        return "suyu Dynarmic JIT";
     case NativeBackendClass::Nce:
         return "NCE";
     default:
@@ -86,7 +96,7 @@ inline NativeBackendClass ClassifyGameBackend(const NativeStatusSnapshot& s) {
         return NativeBackendClass::Pending;
     }
     if (!s.recomp_registered) {
-        return NativeBackendClass::Unknown;
+        return s.dynarmic_backend ? NativeBackendClass::DynarmicJit : NativeBackendClass::Unknown;
     }
     if (!s.backend_active || s.static_blocks == 0) {
         return NativeBackendClass::Pending;
@@ -102,9 +112,6 @@ inline std::string GameBackendQualifier(const NativeStatusSnapshot& s) {
     if (kind == NativeBackendClass::StrictAot) {
         return s.jit_available ? " (JIT-capable)" : " (no-JIT build)";
     }
-    if (kind == NativeBackendClass::HybridAot) {
-        return " (JIT fallback allowed)";
-    }
     return {};
 }
 
@@ -115,23 +122,35 @@ inline std::string FormatNativeTitle(const NativeStatusSnapshot& s) {
         out += " ";
         out += s.display_version;
     }
-    out += " | Game: ";
+    out += " | ";
     out += NativeBackendName(ClassifyGameBackend(s));
     out += GameBackendQualifier(s);
 
     if (!s.perf_available) {
-        out += " | FPS: -- | speed: --";
+        out += s.speed_meaningful ? " | FPS: -- | speed: --" : " | FPS: --";
     } else {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), " | %.1f FPS | %.0f%%", s.average_game_fps,
-                      s.emulation_speed * 100.0);
+        std::snprintf(buf, sizeof(buf), " | %.1f FPS (%.1f ms)", s.average_game_fps,
+                      s.frametime_ms);
         out += buf;
+        if (s.speed_meaningful) {
+            std::snprintf(buf, sizeof(buf), " | %.0f%%", s.emulation_speed * 100.0);
+            out += buf;
+        }
     }
 
-    char jit[96];
-    std::snprintf(jit, sizeof(jit), " | JIT transitions: %llu",
-                  static_cast<unsigned long long>(s.jit_transitions));
-    out += jit;
+    // Shown only while it is happening, so a stutter can be matched to it.
+    if (s.shaders_building > 0) {
+        out += " | Building " + std::to_string(s.shaders_building) +
+               (s.shaders_building == 1 ? " shader" : " shaders");
+    }
+
+    if (s.recomp_registered) {
+        char jit[96];
+        std::snprintf(jit, sizeof(jit), " | JIT transitions: %llu",
+                      static_cast<unsigned long long>(s.jit_transitions));
+        out += jit;
+    }
     out += " | F12 Controls";
     return out;
 }
@@ -140,7 +159,7 @@ inline std::string FormatNativeTitle(const NativeStatusSnapshot& s) {
 /// While benchmarking owns the counters, it calls with false and the benchmark
 /// sampler publishes performance independently.
 NativeStatusSnapshot SampleNativeStatus(Core::System& system, bool consume_perf);
-void SetNativeLaunchName(std::string name, bool explicit_name);
+void SetNativeLaunchName(std::string name);
 void SetNativeLaunchVersion(std::string version);
 void StoreNativePerfStats(const Core::PerfStatsResults& results);
 

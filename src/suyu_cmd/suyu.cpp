@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -19,6 +21,8 @@
 
 #include <fmt/ostream.h>
 #include <stb_image_write.h>
+#include <SDL3/SDL_messagebox.h>
+#include <SDL3/SDL_misc.h>
 
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
@@ -79,6 +83,10 @@
 #include <getopt.h>
 #ifndef _MSC_VER
 #include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <climits>
+#include <mach-o/dyld.h>
 #endif
 
 #ifdef _WIN32
@@ -257,6 +265,7 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
 /// True once native recompiled CPU modules are registered — the running
 /// process is a standalone game export, not the suyu dev frontend.
 bool g_native_export_mode = false;
+bool g_export_package = false;
 SdlConfig* g_sdl_config = nullptr;
 
 void SaveNativeControls() {
@@ -641,6 +650,175 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
     return 0;
 }
 
+// The exporting suyu records its own executable in the package, so a problem
+// it can fix is offered as a button. Empty when nothing was recorded (a Source
+// export built elsewhere) or when that suyu is no longer there.
+// Each line is one way to find it, first match wins: a path relative to the
+// record, then an absolute one that may start with an %ENVIRONMENT% variable.
+static std::filesystem::path RecordedSuyuExecutable(const std::filesystem::path& user_root) {
+    std::ifstream in(user_root / "config" / "suyu-install.txt");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        std::filesystem::path exe;
+        const auto close = line.starts_with('%') ? line.find('%', 1) : std::string::npos;
+        if (close != std::string::npos) {
+            const std::string name = line.substr(1, close - 1);
+#ifdef _WIN32
+            const wchar_t* value = _wgetenv(Common::UTF8ToUTF16W(name).c_str());
+            if (value == nullptr) {
+                continue;
+            }
+            exe = std::filesystem::path{std::wstring(value) +
+                                        Common::UTF8ToUTF16W(line.substr(close + 1))};
+#else
+            const char* value = std::getenv(name.c_str());
+            if (value == nullptr) {
+                continue;
+            }
+            exe = std::filesystem::path{std::string(value) + line.substr(close + 1)};
+#endif
+        } else {
+            exe = std::filesystem::path{Common::FS::ToU8String(line)};
+        }
+        if (exe.empty()) {
+            continue;
+        }
+        if (exe.is_relative()) {
+            exe = (user_root / "config" / exe).lexically_normal();
+        }
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(exe, ec)) {
+            return exe;
+        }
+    }
+    return {};
+}
+
+// The installed suyu's NAND: <root>/nand, unless its own settings moved it
+// (Data Storage in qt-config.ini). Keys have no such setting. Like suyu's own
+// reader, any non-empty value counts, whatever its "\default" flag says.
+static std::filesystem::path InstalledNandDirectory(const std::filesystem::path& installed_root,
+                                                    const std::filesystem::path& config_dir) {
+    std::ifstream in(config_dir / "qt-config.ini");
+    std::string line;
+    bool in_section = false;
+    std::string value;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (!line.empty() && line.front() == '[') {
+            in_section = line == "[Data%20Storage]" || line == "[Data Storage]";
+            continue;
+        }
+        if (!in_section) {
+            continue;
+        }
+        if (line.starts_with("nand_directory=")) {
+            value = line.substr(line.find('=') + 1);
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+                value = value.substr(1, value.size() - 2);
+            }
+        }
+    }
+    if (value.empty()) {
+        return installed_root / "nand";
+    }
+    const std::filesystem::path nand{Common::FS::ToU8String(value)};
+    return nand.is_relative() ? installed_root / nand : nand;
+}
+
+// An exported package is double-clicked by a player with no console and no
+// settings UI, so a missing prerequisite is explained in a message box rather
+// than left to fail inside the loader. SDL needs no SDL_Init for this box.
+// Returns true only when the player chose to continue, which is offered for
+// firmware alone: only some screens need it, while nothing runs without keys.
+static bool ReportExportProblem(const char* title, const std::string& message,
+                                const std::filesystem::path& folder, bool allow_continue,
+                                const std::filesystem::path& suyu_exe, const std::string& flag,
+                                const char* install_label) {
+    LOG_CRITICAL(Frontend, "{}: {}", title, message);
+    // Automation has nobody to answer the box; the log carries the message instead.
+    if (std::getenv("SUYU_CMD_CAPTURE_HEADLESS") != nullptr) {
+        return allow_continue;
+    }
+    enum Choice : int { Quit, OpenFolder, Continue, InstallInSuyu };
+    std::vector<SDL_MessageBoxButtonData> buttons;
+    if (!suyu_exe.empty()) {
+        buttons.push_back({SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, InstallInSuyu, install_label});
+    }
+    buttons.push_back({static_cast<SDL_MessageBoxButtonFlags>(
+                           suyu_exe.empty() ? SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT : 0),
+                       OpenFolder, "Open folder"});
+    if (allow_continue) {
+        buttons.push_back({0, Continue, "Continue anyway"});
+    }
+    buttons.push_back({SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, Quit, "Quit"});
+    const SDL_MessageBoxData box{
+        (allow_continue ? SDL_MESSAGEBOX_WARNING : SDL_MESSAGEBOX_ERROR) |
+            SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT,
+        nullptr,
+        title,
+        message.c_str(),
+        static_cast<int>(buttons.size()),
+        buttons.data(),
+        nullptr};
+    int chosen = Quit;
+    if (!SDL_ShowMessageBox(&box, &chosen)) {
+        return false;
+    }
+    switch (chosen) {
+    case InstallInSuyu: {
+        // Detached: suyu keeps running after this game exits.
+#ifdef _WIN32
+        const std::wstring args(flag.begin(), flag.end());
+        ShellExecuteW(nullptr, L"open", suyu_exe.wstring().c_str(), args.c_str(),
+                      suyu_exe.parent_path().wstring().c_str(), SW_SHOWNORMAL);
+#else
+        if (fork() == 0) {
+            setsid();
+            execl(suyu_exe.c_str(), suyu_exe.c_str(), flag.c_str(), static_cast<char*>(nullptr));
+            _exit(127);
+        }
+#endif
+        return false;
+    }
+    case OpenFolder: {
+        // Created first, so there is somewhere to put the missing files.
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+#ifdef _WIN32
+        ShellExecuteW(nullptr, L"open", folder.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+        // SDL hands a file URL to `open` on macOS and to `xdg-open` elsewhere.
+        std::string url = "file://";
+        for (const unsigned char c : folder.string()) {
+            if (std::isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
+                url += static_cast<char>(c);
+            } else {
+                url += fmt::format("%{:02X}", c);
+            }
+        }
+        SDL_OpenURL(url.c_str());
+#endif
+        return false;
+    }
+    case Continue:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool HasEntries(const std::filesystem::path& dir) {
+    std::error_code ec;
+    return std::filesystem::is_directory(dir, ec) &&
+           std::filesystem::directory_iterator(dir, ec) != std::filesystem::directory_iterator();
+}
+
 int main(int argc, char** argv) {
 #ifdef SUYU_CMD_STATIC_RECOMP_STRICT
 #ifdef _WIN32
@@ -674,67 +852,108 @@ int main(int argc, char** argv) {
     // KeysDir under <exe>/user/keys instead, so prod.keys/title.keys are
     // never bundled with a distributed export.
     // Must run before Log::Initialize(), which opens a file under LogDir.
-#ifdef SUYU_CMD_STATIC_RECOMP
+    // A JIT baseline package is a plain copy of this executable rather than a
+    // static build, so an export is also recognised at runtime by the README
+    // the exporter writes beside every package launcher. Without that, the
+    // user/ folder the data bundling step creates still switches on the FS
+    // layer's auto-detection, which then looks for keys in the empty user/keys.
     // The export carries no system firmware; it reads the installed one, like its keys.
+    // Both stay empty when this executable is not an exported package.
     std::filesystem::path installed_nand;
+    std::filesystem::path export_user_root;
     {
         namespace FS = Common::FS;
-        // Captured before the portable overrides below take effect: keys
-        // belong to the user's installed suyu rather than to the export,
-        // so this is where they still are once the rest has been
-        // repointed into the export's own user directory.
-        const std::filesystem::path installed_keys =
-            FS::GetSuyuPath(FS::SuyuPath::KeysDir);
-        [[maybe_unused]] const std::filesystem::path installed_nand_default =
-            FS::GetSuyuPath(FS::SuyuPath::NANDDir);
 #ifdef _WIN32
         wchar_t exe_w[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
-        const std::filesystem::path user_root =
-            std::filesystem::path(exe_w).parent_path() / L"user";
+        const std::filesystem::path exe_dir = std::filesystem::path(exe_w).parent_path();
+#elif defined(__APPLE__)
+        // argv[0] has no directory when started through PATH, which would make
+        // the checks below look in the working directory instead.
+        char exe_buf[PATH_MAX]{};
+        std::uint32_t exe_size = sizeof(exe_buf);
+        const std::filesystem::path exe_dir = _NSGetExecutablePath(exe_buf, &exe_size) == 0
+                                                  ? std::filesystem::path(exe_buf).parent_path()
+                                                  : std::filesystem::path{};
 #else
-        const std::filesystem::path user_root =
-            std::filesystem::path(argv[0]).parent_path() / "user";
+        std::error_code exe_ec;
+        const std::filesystem::path exe_dir =
+            std::filesystem::canonical("/proc/self/exe", exe_ec).parent_path();
 #endif
-        std::filesystem::create_directories(user_root);
-        // SetSuyuPath (path_util.cpp) fails with "is not a directory" if the
-        // path doesn't exist yet - most of these get created lazily by
-        // whatever subsystem first writes into them, but LoadDir/TASDir are
-        // read from (mod scan, TAS script lookup) before anything writes to
-        // them, so create every subdir up front instead of relying on that.
-        for (const char* sub : {"config", "cache", "cache/shader", "log", "nand", "sdmc", "dump",
-                                 "load", "screenshots", "play_time", "crash_dumps", "amiibo", "tas",
-                                 "icons", "themes"}) {
-            std::filesystem::create_directories(user_root / sub);
+        const std::filesystem::path user_root = exe_dir / "user";
+#ifdef SUYU_CMD_STATIC_RECOMP
+        // Never a "user" folder relative to wherever this was started from.
+        if (exe_dir.empty()) {
+            std::fprintf(stderr, "Cannot locate this executable's folder for its user data\n");
+            return EXIT_FAILURE;
         }
-        FS::SetSuyuPath(FS::SuyuPath::EdenDir, user_root);
-        FS::SetSuyuPath(FS::SuyuPath::ConfigDir, user_root / "config");
-        FS::SetSuyuPath(FS::SuyuPath::CacheDir, user_root / "cache");
-        FS::SetSuyuPath(FS::SuyuPath::ShaderDir, user_root / "cache" / "shader");
-        FS::SetSuyuPath(FS::SuyuPath::LogDir, user_root / "log");
-        FS::SetSuyuPath(FS::SuyuPath::NANDDir, user_root / "nand");
-        FS::SetSuyuPath(FS::SuyuPath::SaveDir, user_root / "nand");
-        FS::SetSuyuPath(FS::SuyuPath::SDMCDir, user_root / "sdmc");
-        FS::SetSuyuPath(FS::SuyuPath::DumpDir, user_root / "dump");
-        FS::SetSuyuPath(FS::SuyuPath::LoadDir, user_root / "load");
-        FS::SetSuyuPath(FS::SuyuPath::ScreenshotsDir, user_root / "screenshots");
-        FS::SetSuyuPath(FS::SuyuPath::PlayTimeDir, user_root / "play_time");
-        FS::SetSuyuPath(FS::SuyuPath::CrashDumpsDir, user_root / "crash_dumps");
-        FS::SetSuyuPath(FS::SuyuPath::AmiiboDir, user_root / "amiibo");
-        FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
-        FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
-        FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
-#ifdef _WIN32
-        FS::SetSuyuPath(FS::SuyuPath::KeysDir, FS::GetAppDataRoamingDirectory() / "suyu" / "keys");
-        installed_nand = FS::GetAppDataRoamingDirectory() / "suyu" / "nand";
+        constexpr bool portable_export = true;
 #else
-        // No roaming-appdata equivalent here, and the default already
-        // points at the installed location on these platforms.
-        FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_keys);
-        installed_nand = installed_nand_default;
+        std::error_code readme_ec;
+        const bool portable_export =
+            !exe_dir.empty() &&
+            std::filesystem::is_regular_file(exe_dir / "README_NATIVE_EXPORT.txt", readme_ec);
 #endif
+        if (portable_export) {
+            std::filesystem::create_directories(user_root);
+            // SetSuyuPath (path_util.cpp) fails with "is not a directory" if the
+            // path doesn't exist yet - most of these get created lazily by
+            // whatever subsystem first writes into them, but LoadDir/TASDir are
+            // read from (mod scan, TAS script lookup) before anything writes to
+            // them, so create every subdir up front instead of relying on that.
+            for (const char* sub : {"config", "cache", "cache/shader", "log", "nand", "sdmc", "dump",
+                                     "load", "screenshots", "play_time", "crash_dumps", "amiibo", "tas",
+                                     "icons", "themes"}) {
+                std::filesystem::create_directories(user_root / sub);
+            }
+            FS::SetSuyuPath(FS::SuyuPath::EdenDir, user_root);
+            FS::SetSuyuPath(FS::SuyuPath::ConfigDir, user_root / "config");
+            FS::SetSuyuPath(FS::SuyuPath::CacheDir, user_root / "cache");
+            FS::SetSuyuPath(FS::SuyuPath::ShaderDir, user_root / "cache" / "shader");
+            FS::SetSuyuPath(FS::SuyuPath::LogDir, user_root / "log");
+            FS::SetSuyuPath(FS::SuyuPath::NANDDir, user_root / "nand");
+            FS::SetSuyuPath(FS::SuyuPath::SaveDir, user_root / "nand");
+            FS::SetSuyuPath(FS::SuyuPath::SDMCDir, user_root / "sdmc");
+            FS::SetSuyuPath(FS::SuyuPath::DumpDir, user_root / "dump");
+            FS::SetSuyuPath(FS::SuyuPath::LoadDir, user_root / "load");
+            FS::SetSuyuPath(FS::SuyuPath::ScreenshotsDir, user_root / "screenshots");
+            FS::SetSuyuPath(FS::SuyuPath::PlayTimeDir, user_root / "play_time");
+            FS::SetSuyuPath(FS::SuyuPath::CrashDumpsDir, user_root / "crash_dumps");
+            FS::SetSuyuPath(FS::SuyuPath::AmiiboDir, user_root / "amiibo");
+            FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
+            FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
+            FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
+            // Named outright rather than read back from the FS layer, which
+            // may already have derived its defaults from this user/ folder.
+            // The suyu that made the export decides where that is: a portable
+            // install keeps its data in a user/ folder beside its executable,
+            // as path_util does for it; otherwise it is the usual location.
+            const std::filesystem::path recorded_suyu = RecordedSuyuExecutable(user_root);
+            std::error_code portable_ec;
+            std::filesystem::path installed_root;
+            std::filesystem::path installed_config;
+            if (!recorded_suyu.empty() &&
+                std::filesystem::is_directory(recorded_suyu.parent_path() / "user", portable_ec)) {
+                installed_root = recorded_suyu.parent_path() / "user";
+                installed_config = installed_root / "config";
+            } else {
+#ifdef _WIN32
+                installed_root = FS::GetAppDataRoamingDirectory() / "suyu";
+                installed_config = installed_root / "config";
+#else
+                installed_root = FS::GetDataDirectory("XDG_DATA_HOME") / "suyu";
+                installed_config = FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
+#endif
+            }
+            // SetSuyuPath ignores a folder that does not exist, which would
+            // leave keys pointing into this package; suyu creates it anyway.
+            std::filesystem::create_directories(installed_root / "keys", portable_ec);
+            FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_root / "keys");
+            installed_nand = InstalledNandDirectory(installed_root, installed_config);
+            export_user_root = user_root;
+            g_export_package = true;
+        }
     }
-#endif
 
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
@@ -995,7 +1214,7 @@ int main(int argc, char** argv) {
                                  "script0-1.txt";
         std::error_code tas_error;
         const auto script_size = std::filesystem::file_size(script_path, tas_error);
-        LOG_INFO(Frontend, "TAS script path={} size={} valid={}", script_path.string(),
+        LOG_INFO(Frontend, "TAS script path={} size={} valid={}", Common::FS::PathToUTF8String(script_path),
                  tas_error ? 0 : script_size, !tas_error && script_size > 0);
         if (tas_error || script_size == 0) {
             LOG_ERROR(Frontend, "TAS playback requires a nonempty script0-1.txt");
@@ -1217,10 +1436,51 @@ int main(int argc, char** argv) {
         std::filesystem::create_directories(local_mods, ec);
         if (std::filesystem::is_directory(local_mods)) {
             Common::FS::SetSuyuPath(Common::FS::SuyuPath::LoadDir, local_mods);
-            LOG_INFO(Frontend, "Using local mod directory: {}", local_mods.string());
+            LOG_INFO(Frontend, "Using local mod directory: {}",
+                     Common::FS::PathToUTF8String(local_mods));
         }
         LOG_INFO(Frontend, "Keys directory (never bundled): {}",
                  Common::FS::GetSuyuPathString(Common::FS::SuyuPath::KeysDir));
+    }
+
+    // An export reads keys and firmware from the installed suyu only, so check
+    // for them before the loader needs them. Existence checks only: the loader
+    // still reports keys that are present but unusable, handled further down.
+    const std::filesystem::path suyu_exe =
+        installed_nand.empty() ? std::filesystem::path{} : RecordedSuyuExecutable(export_user_root);
+    if (!installed_nand.empty()) {
+        const auto keys_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
+        std::error_code keys_ec;
+        // The same two names KeyManager loads production keys from. There is no
+        // running on without them, even from extracted exefs/main with no
+        // firmware: loading still decrypts, and fails inside the AES layer.
+        if (!std::filesystem::is_regular_file(keys_dir / "prod.keys", keys_ec) &&
+            !std::filesystem::is_regular_file(keys_dir / "prod.keys_autogenerated", keys_ec)) {
+            ReportExportProblem(
+                "Missing keys",
+                fmt::format("Missing keys: prod.keys was not found in {}.\n\nInstall your keys "
+                            "in suyu (Tools > Install Decryption Keys), then start the game "
+                            "again. Copying prod.keys into that folder works just as well.",
+                            Common::FS::PathToUTF8String(keys_dir)),
+                keys_dir, false, suyu_exe, "-install-keys", "Install keys in suyu");
+            return 2;
+        }
+        // Same rule as the filesystem fallback: this package's own NAND wins,
+        // otherwise the installed one is read.
+        const auto registered = std::filesystem::path("system") / "Contents" / "registered";
+        if (!HasEntries(export_user_root / "nand" / registered) &&
+            !HasEntries(installed_nand / registered)) {
+            const auto firmware_dir = installed_nand / registered;
+            const auto message = fmt::format(
+                "Missing firmware: no system firmware was found in {}.\n\nInstall firmware in "
+                "suyu (Tools > Install Firmware), then start the game again.\n\nYou can "
+                "continue anyway, but Mii screens and some menus may fail.",
+                Common::FS::PathToUTF8String(firmware_dir));
+            if (!ReportExportProblem("Missing firmware", message, firmware_dir, true, suyu_exe,
+                                     "-install-firmware", "Install firmware in suyu")) {
+                return 2;
+            }
+        }
     }
 
     LOG_INFO(Frontend, "suyu-cmd: Initializing system...");
@@ -1229,9 +1489,9 @@ int main(int argc, char** argv) {
     SuyuCli::ExplicitUpdateProvider explicit_provider;
     Core::System system{};
     system.Initialize();
-#ifdef SUYU_CMD_STATIC_RECOMP
-    system.GetFileSystemController().SetSystemContentFallback(installed_nand);
-#endif
+    if (!installed_nand.empty()) {
+        system.GetFileSystemController().SetSystemContentFallback(installed_nand);
+    }
     LOG_INFO(Frontend, "suyu-cmd: System initialized.");
     if (explicit_content_base) {
         system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
@@ -1349,14 +1609,21 @@ int main(int argc, char** argv) {
     LOG_INFO(Frontend, "suyu-cmd: Calling system.Load for '{}'...", filepath);
     // A deconstructed ROM may have no control metadata for GetGameName.
     // Preserve a reusable name from the chosen launch path for the status UI.
-    std::filesystem::path launch_path{filepath};
-    const auto launch_stem = launch_path.stem().string();
-    const std::string fallback_name =
+    // UTF-8 both ways: path::string() throws on Windows for names outside the ANSI code
+    // page, and a Japanese title is exactly that.
+    const std::filesystem::path launch_path{Common::FS::ToU8String(filepath)};
+    const auto launch_stem = Common::FS::PathToUTF8String(launch_path.stem());
+    std::string fallback_name =
         (launch_stem == "main" && launch_path.parent_path().filename() == "exefs")
-            ? launch_path.parent_path().parent_path().filename().string()
+            ? Common::FS::PathToUTF8String(launch_path.parent_path().parent_path().filename())
             : launch_stem;
-    SuyuCmd::SetNativeLaunchName(app_name_override.value_or(fallback_name),
-                                 app_name_override.has_value());
+    // An export's folder is "<game> - <backend>"; the window title names the backend itself.
+    for (const std::string_view suffix : {" - Dynarmic JIT", " - Hybrid AOT + JIT"}) {
+        if (fallback_name.ends_with(suffix) && fallback_name.size() > suffix.size()) {
+            fallback_name.resize(fallback_name.size() - suffix.size());
+        }
+    }
+    SuyuCmd::SetNativeLaunchName(app_name_override.value_or(fallback_name));
     const Core::SystemResultStatus load_result{system.Load(*emu_window, filepath, load_parameters)};
     LOG_INFO(Frontend, "suyu-cmd: system.Load returned: {}", static_cast<int>(load_result));
 
@@ -1380,6 +1647,36 @@ int main(int argc, char** argv) {
             static_cast<u32>(Core::SystemResultStatus::ErrorLoader)) {
             const u16 loader_id = static_cast<u16>(Core::SystemResultStatus::ErrorLoader);
             const u16 error_id = static_cast<u16>(load_result) - loader_id;
+            // Keys that exist but do not fit this game or firmware surface
+            // here; an export names the keys folder instead of carrying on.
+            using Loader::ResultStatus;
+            switch (static_cast<ResultStatus>(error_id)) {
+            case ResultStatus::ErrorMissingProductionKeyFile:
+            case ResultStatus::ErrorMissingHeaderKey:
+            case ResultStatus::ErrorIncorrectHeaderKey:
+            case ResultStatus::ErrorMissingTitlekey:
+            case ResultStatus::ErrorMissingTitlekek:
+            case ResultStatus::ErrorInvalidRightsID:
+            case ResultStatus::ErrorMissingKeyAreaKey:
+            case ResultStatus::ErrorIncorrectKeyAreaKey:
+            case ResultStatus::ErrorIncorrectTitlekeyOrTitlekek:
+                if (!installed_nand.empty()) {
+                    const auto keys_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
+                    ReportExportProblem(
+                        "Keys problem",
+                        fmt::format("The game could not be decrypted with the keys in {} ({}).\n\n"
+                                    "Install current keys in suyu (Tools > Install Decryption "
+                                    "Keys), then start the game again. Copying prod.keys and "
+                                    "title.keys into that folder works just as well.",
+                                    Common::FS::PathToUTF8String(keys_dir),
+                                    static_cast<ResultStatus>(error_id)),
+                        keys_dir, false, suyu_exe, "-install-keys", "Install keys in suyu");
+                    return 2;
+                }
+                break;
+            default:
+                break;
+            }
             LOG_CRITICAL(Frontend,
                          "While attempting to load the ROM requested, an error occurred. Please "
                          "refer to the suyu wiki for more information or the suyu discord for "
@@ -1412,8 +1709,10 @@ int main(int argc, char** argv) {
     // title, so the disk shader cache is the difference between a long black
     // screen on every single run and one slow first run. Keep it for exports
     // and keep the old blanket disable for the plain dev frontend, where the
-    // startup instability it works around was originally seen.
-    if (!g_native_export_mode && Settings::values.use_disk_shader_cache.GetValue()) {
+    // startup instability it works around was originally seen. A JIT baseline
+    // package runs no recompiled code, so it counts as an export by its layout.
+    if (!g_native_export_mode && installed_nand.empty() &&
+        Settings::values.use_disk_shader_cache.GetValue()) {
         LOG_WARNING(Frontend,
                     "suyu-cmd: disabling disk shader cache for this run to avoid known startup instability");
         Settings::values.use_disk_shader_cache.SetValue(false);

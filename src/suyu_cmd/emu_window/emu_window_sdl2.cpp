@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
+#include <set>
+#include <string>
+#include <vector>
 #include <SDL3/SDL.h>
 // SDL3 removed these constants; define compat shims
 static constexpr Uint8 SDL_PRESSED = 1;
@@ -21,14 +25,65 @@ static constexpr Uint8 SDL_RELEASED = 0;
 #include "input_common/main.h"
 #include "common/param_package.h"
 #include "common/settings_input.h"
+#include "suyu_cmd/controller_assign.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2.h"
 #include "suyu_cmd/native_status.h"
 #include "suyu_cmd/sdl_config.h"
 #include "suyu_cmd/suyu_icon.h"
+#include "video_core/gpu.h"
+#include "video_core/shader_notify.h"
 
 namespace {
 constexpr u64 kStatusRefreshMs = 750;
+constexpr u64 kControlsSaveMs = 2000;
 constexpr Sint32 kEventWaitSliceMs = 250;
+
+// The controllers among the input devices: gamepads SDL recognises and whatever suyu's own
+// Joy-Con / Pro Controller driver lists. SDL also lists wheels, flight sticks and virtual or
+// RGB devices as joysticks, and none of those should take a player. The input backend names
+// an SDL device by its GUID with the name checksum cleared. @p sdl_gamepads, when given, gets
+// how many gamepads SDL itself sees.
+std::vector<Common::ParamPackage> ControllerPads(const std::vector<Common::ParamPackage>& devices,
+                                                 std::size_t* sdl_gamepads = nullptr) {
+    std::set<std::string> gamepad_guids;
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    for (int i = 0; i < count; ++i) {
+        SDL_GUID guid = SDL_GetJoystickGUIDForID(ids[i]);
+        guid.data[2] = guid.data[3] = 0;
+        char text[33]{};
+        SDL_GUIDToString(guid, text, sizeof(text));
+        gamepad_guids.insert(text);
+    }
+    SDL_free(ids);
+    if (sdl_gamepads) {
+        *sdl_gamepads = gamepad_guids.size();
+    }
+    std::vector<Common::ParamPackage> pads;
+    for (const auto& device : devices) {
+        const std::string engine = device.Get("engine", "");
+        if ((engine == "sdl" && gamepad_guids.contains(device.Get("guid", ""))) ||
+            engine == "joycon") {
+            pads.push_back(device);
+        }
+    }
+    return pads;
+}
+
+// The input backend's own default mapping for a controller, as the settings screen's
+// auto-map writes it; for gamepads it includes Home and, where the pad has one, Capture.
+void MapDefault(InputCommon::InputSubsystem& input, const Common::ParamPackage& pad,
+                Settings::PlayerInput& player) {
+    for (const auto& [button, param] : input.GetButtonMappingForDevice(pad)) {
+        player.buttons[button] = param.Serialize();
+    }
+    for (const auto& [analog, param] : input.GetAnalogMappingForDevice(pad)) {
+        player.analogs[analog] = param.Serialize();
+    }
+    for (const auto& [motion, param] : input.GetMotionMappingForDevice(pad)) {
+        player.motions[motion] = param.Serialize();
+    }
+}
 } // namespace
 
 #ifdef _WIN32
@@ -65,6 +120,8 @@ constexpr int kIdRescanPads = 1010;
 constexpr int kIdBindList = 1011;
 constexpr int kIdBindOne = 1012;
 constexpr int kIdClearOne = 1013;
+constexpr int kIdCombineJoycons = 1014;
+constexpr int kIdSplitJoycons = 1015;
 constexpr UINT_PTR kTimer = 1;
 
 std::filesystem::path DevExeDir() {
@@ -90,8 +147,58 @@ struct DevPanelState {
     HWND mods{};
     HWND devices{};
     HWND binds{};
+    HWND combine{};
+    HWND split{};
     std::vector<Common::ParamPackage> device_list;
 };
+
+// Combine shows while a pair's halves are on two players, Split while a pair is on one.
+void DevRefreshJoyconButtons(DevPanelState& st) {
+    if (st.input == nullptr) {
+        return;
+    }
+    const auto pads = ControllerPads(st.input->GetInputDevices());
+    auto& players = Settings::values.players.GetValue();
+    ShowWindow(st.combine,
+               SuyuCmd::CombineJoycons(players, pads, SdlConfig::default_buttons, {}) ? SW_SHOW
+                                                                                    : SW_HIDE);
+    ShowWindow(st.split,
+               SuyuCmd::SplitJoycons(players, pads, SdlConfig::default_buttons, {}) ? SW_SHOW
+                                                                                  : SW_HIDE);
+}
+
+void DevJoyconAction(DevPanelState& st, bool combine) {
+    if (st.input == nullptr) {
+        return;
+    }
+    const auto pads = ControllerPads(st.input->GetInputDevices());
+    auto& players = Settings::values.players.GetValue();
+    const auto map_pad = [&st](const Common::ParamPackage& pad, Settings::PlayerInput& player) {
+        MapDefault(*st.input, pad, player);
+    };
+    const auto slot =
+        combine ? SuyuCmd::CombineJoycons(players, pads, SdlConfig::default_buttons, map_pad)
+                : SuyuCmd::SplitJoycons(players, pads, SdlConfig::default_buttons, map_pad);
+    if (!slot) {
+        MessageBoxW(nullptr, L"No Joy-Cons to change right now.", L"Controls",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    // The player's own choice from here on: auto-assign leaves the controls alone.
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
+    }
+    if (st.system != nullptr) {
+        st.system->HIDCore().ReloadInputDevices();
+    }
+    SaveNativeControls();
+    const std::wstring text =
+        combine ? L"Joy-Cons combined into Player " + std::to_wstring(*slot + 1) + L"."
+                : L"Joy-Cons split: the left one is Player " + std::to_wstring(*slot + 1) +
+                      L", the right one the next player.";
+    MessageBoxW(nullptr, text.c_str(), L"Controls", MB_OK | MB_ICONINFORMATION);
+    DevRefreshJoyconButtons(st);
+}
 
 // Per-button remapping. Auto-map covers the common case; this covers the rest -
 // pick the entry, press the input you want, done. Same "press what you want"
@@ -139,6 +246,10 @@ void DevBindSelected(DevPanelState& st, bool clear) {
             player.buttons[sel].clear();
         }
         DevRefreshBinds(st);
+        // A choice made here is the player's own; auto-assign leaves it alone.
+        if (g_export_package) {
+            SdlConfig::auto_assign_controllers = false;
+        }
         SaveNativeControls();
         if (st.system != nullptr) {
             st.system->HIDCore().ReloadInputDevices();
@@ -180,6 +291,9 @@ void DevBindSelected(DevPanelState& st, bool clear) {
     player.connected = true;
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
+    }
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
     }
     SaveNativeControls();
     DevRefreshBinds(st);
@@ -275,6 +389,9 @@ void DevApplyPadMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
+    }
     SaveNativeControls();
     MessageBoxW(nullptr, L"Controller mapped to Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
@@ -306,6 +423,9 @@ void DevApplyKeyboardMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
+    }
     SaveNativeControls();
     MessageBoxW(nullptr, L"Keyboard controls restored for Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
@@ -328,9 +448,13 @@ std::wstring DevStatusText(Core::System& system) {
     wchar_t fps_line[160];
     if (!have_snapshot || !snap.perf_available) {
         swprintf(fps_line, std::size(fps_line), L"FPS:          (no sample yet)");
-    } else {
+    } else if (snap.speed_meaningful) {
         swprintf(fps_line, std::size(fps_line), L"FPS:          %.1f   Speed: %.0f%%   CPU work: %.2f ms",
                  snap.average_game_fps, snap.emulation_speed * 100.0, snap.frametime_ms);
+    } else {
+        // Multicore: guest time follows the host clock, so the speed would always read 100%.
+        swprintf(fps_line, std::size(fps_line), L"FPS:          %.1f   CPU work: %.2f ms",
+                 snap.average_game_fps, snap.frametime_ms);
     }
 
     wchar_t applet_line[192];
@@ -401,6 +525,7 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SuyuCmd::StoreNativeStatusSnapshot(
                 SuyuCmd::SampleNativeStatus(*st->system, !benchmark_owns_stats));
             SetWindowTextW(st->status, DevStatusText(*st->system).c_str());
+            DevRefreshJoyconButtons(*st);
         }
         return 0;
     case WM_COMMAND:
@@ -442,6 +567,13 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case kIdClearOne:
             if (st != nullptr) {
                 DevBindSelected(*st, true);
+            }
+            return 0;
+        case kIdCombineJoycons:
+        case kIdSplitJoycons:
+            if (st != nullptr) {
+                DevJoyconAction(*st, LOWORD(wp) == kIdCombineJoycons);
+                DevRefreshBinds(*st);
             }
             return 0;
         case kIdBindList:
@@ -545,6 +677,14 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
                     28, hwnd, reinterpret_cast<HMENU>(kIdBindOne), inst, nullptr);
     CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 528, 464, 172,
                     28, hwnd, reinterpret_cast<HMENU>(kIdClearOne), inst, nullptr);
+    // Shown only when they apply; see DevRefreshJoyconButtons.
+    state.combine = CreateWindowExW(0, L"BUTTON", L"Combine Joy-Cons into one player",
+                                    WS_CHILD | BS_PUSHBUTTON | BS_MULTILINE, 528, 508, 172, 40,
+                                    hwnd, reinterpret_cast<HMENU>(kIdCombineJoycons), inst,
+                                    nullptr);
+    state.split = CreateWindowExW(0, L"BUTTON", L"Split Joy-Cons into two players",
+                                  WS_CHILD | BS_PUSHBUTTON | BS_MULTILINE, 528, 556, 172, 40, hwnd,
+                                  reinterpret_cast<HMENU>(kIdSplitJoycons), inst, nullptr);
     const auto button = [&](const wchar_t* text, int x, int id) {
         CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, 640, 160, 28,
                         hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), inst, nullptr);
@@ -568,6 +708,7 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
     DevRefreshMods(state.mods);
     DevRefreshDevices(state);
     DevRefreshBinds(state);
+    DevRefreshJoyconButtons(state);
     SetTimer(hwnd, kTimer, 500, nullptr);
     ShowWindow(hwnd, SW_SHOW);
 
@@ -598,6 +739,10 @@ EmuWindow_SDL2::EmuWindow_SDL2(InputCommon::InputSubsystem* input_subsystem_, Co
 }
 
 EmuWindow_SDL2::~EmuWindow_SDL2() {
+    // An assignment made in the last couple of seconds is still waiting to be written.
+    if (controls_save_pending) {
+        SaveNativeControls();
+    }
     system.HIDCore().UnloadInputDevices();
     input_subsystem->Shutdown();
     SDL_Quit();
@@ -863,6 +1008,11 @@ void EmuWindow_SDL2::WaitEvent() {
     case SDL_EVENT_QUIT:
         is_open = false;
         break;
+    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        gamepad_check_pending = true;
+        gamepad_retries = kGamepadRetries;
+        break;
     default:
         break;
     }
@@ -875,14 +1025,92 @@ void EmuWindow_SDL2::WaitEvent() {
 }
 
 void EmuWindow_SDL2::RefreshWindowStatus() {
+    // Same tick as the title: cheap, and a controller plugged in mid-game is
+    // picked up within a second.
+    if (gamepad_check_pending) {
+        AutoAssignControllers();
+    }
+    if (controls_save_pending && SDL_GetTicks() >= last_controls_save + kControlsSaveMs) {
+        controls_save_pending = false;
+        last_controls_save = SDL_GetTicks();
+        SaveNativeControls();
+    }
+
     const bool benchmark_owns_stats = std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
     const auto snap = SuyuCmd::SampleNativeStatus(system, !benchmark_owns_stats);
     SuyuCmd::StoreNativeStatusSnapshot(snap);
 
     SuyuCmd::NativeStatusSnapshot display{};
     SuyuCmd::TryGetNativeStatusSnapshot(display);
+    if (display.game_running) {
+        display.shaders_building = system.GPU().ShaderNotify().ShadersBuilding();
+    }
     const std::string title = SuyuCmd::FormatNativeTitle(display);
     SDL_SetWindowTitle(render_window, title.c_str());
+}
+
+// An export has no input settings screen in front of it, so a player who plugs
+// in controllers expects them to just work: see SuyuCmd::AssignControllers for
+// which pad gets which player. Only a standalone export does this - a plain
+// suyu-cmd run keeps the player's own configuration - and controls picked in
+// the F12 panel switch it off for good (auto_assign_controllers).
+void EmuWindow_SDL2::AutoAssignControllers() {
+    gamepad_check_pending = false;
+    // A TAS replay drives the players itself; their mappings stay as configured.
+    if (!g_export_package || !SdlConfig::auto_assign_controllers ||
+        Settings::values.tas_enable.GetValue()) {
+        return;
+    }
+    const auto devices = input_subsystem->GetInputDevices();
+    std::size_t sdl_gamepads = 0;
+    const auto pads = ControllerPads(devices, &sdl_gamepads);
+    const auto sdl_listed = static_cast<std::size_t>(
+        std::count_if(pads.begin(), pads.end(),
+                      [](const auto& pad) { return pad.Get("engine", "") == "sdl"; }));
+    // SDL can list a gamepad a moment before the input backend registers it,
+    // so look again for a few ticks. Only a few: gamepads the backend leaves to
+    // another driver (Joy-Cons under suyu's own driver) never show up here.
+    if (gamepad_retries > 0 && sdl_listed < sdl_gamepads) {
+        --gamepad_retries;
+        gamepad_check_pending = true;
+    }
+
+    auto bindings = SuyuCmd::ParsePadBindings(SdlConfig::auto_assigned_pads);
+    // GetValue() hands back a reference to the live array, so the mappings are
+    // written straight into the setting.
+    auto& players = Settings::values.players.GetValue();
+    const auto map_pad = [this](const Common::ParamPackage& pad, Settings::PlayerInput& player) {
+        MapDefault(*input_subsystem, pad, player);
+        LOG_INFO(Frontend, "Assigned {}", pad.Get("display", std::string{"a controller"}));
+    };
+    // The layout SdlConfig gives a player with nothing configured.
+    const auto restore_keyboard = [](Settings::PlayerInput& player) {
+        for (std::size_t i = 0; i < player.buttons.size(); ++i) {
+            player.buttons[i] = InputCommon::GenerateKeyboardParam(SdlConfig::default_buttons[i]);
+        }
+        for (std::size_t i = 0; i < player.analogs.size(); ++i) {
+            const auto& keys = SdlConfig::default_analogs[i];
+            player.analogs[i] = InputCommon::GenerateAnalogParamFromKeys(
+                keys[0], keys[1], keys[2], keys[3], SdlConfig::default_stick_mod[i], 0.5f);
+        }
+        for (std::size_t i = 0; i < player.motions.size(); ++i) {
+            player.motions[i] = InputCommon::GenerateKeyboardParam(SdlConfig::default_motions[i]);
+        }
+        LOG_INFO(Frontend, "No controller left: Player 1 uses the keyboard");
+    };
+    if (!SuyuCmd::AssignControllers(players, devices, pads, bindings, pads_seen,
+                                    SdlConfig::default_buttons, map_pad, restore_keyboard)) {
+        return;
+    }
+    SdlConfig::auto_assigned_pads = SuyuCmd::SerializePadBindings(bindings);
+    for (const auto& binding : bindings) {
+        LOG_INFO(Frontend, "Player {}: pad {} port {}, {}", binding.player + 1, binding.guid,
+                 binding.port, players[binding.player].connected ? "connected" : "disconnected");
+    }
+    // The game sees the change now; the file is written at most every couple
+    // of seconds, so a pad that keeps dropping out does not rewrite it each time.
+    system.HIDCore().ReloadInputDevices();
+    controls_save_pending = true;
 }
 
 // Credits to Samantas5855 and others for this function.

@@ -23,6 +23,7 @@ if (SUYU_CMD OR YUZU_CMD)
         emu_window/emu_window_sdl2_vk.cpp
         emu_window/emu_window_sdl2_vk.h
         precompiled_headers.h
+        controller_assign.h
         native_status.cpp
         native_status.h
         sdl_config.cpp

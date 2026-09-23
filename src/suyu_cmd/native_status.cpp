@@ -23,7 +23,6 @@ std::mutex g_snapshot_mutex;
 NativeStatusSnapshot g_snapshot;
 bool g_have_snapshot = false;
 std::string g_launch_name;
-bool g_launch_name_explicit = false;
 std::string g_launch_version;
 constexpr u64 kPerfSampleExpiryMs = 3000;
 
@@ -115,9 +114,8 @@ NativeStatusSnapshot SampleNativeStatus(Core::System& system, bool consume_perf)
     (void)system.GetGameName(s.game_name);
     if (s.game_name.empty()) {
         std::scoped_lock lock{g_snapshot_mutex};
-        s.game_name = g_launch_name.empty() ? "Unknown title"
-                                           : (g_launch_name_explicit ? g_launch_name
-                                                                     : "Launch: " + g_launch_name);
+        // An extracted ExeFS carries no title, so the name the launch path gives stands in.
+        s.game_name = g_launch_name.empty() ? "Unknown title" : g_launch_name;
     }
     s.display_version = ReadDisplayVersion();
     {
@@ -134,6 +132,8 @@ NativeStatusSnapshot SampleNativeStatus(Core::System& system, bool consume_perf)
     s.strict_requested = live.strict_mode;
     s.jit_transitions = live.jit_transitions;
     s.recomp_registered = Core::GetRecompLookup() != nullptr;
+    s.dynarmic_backend = Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Dynarmic;
+    s.speed_meaningful = !Settings::values.use_multi_core.GetValue();
 
     if (consume_perf) {
         AssignPerf(s, system.GetAndResetPerfStats());
@@ -160,10 +160,9 @@ void StoreNativeStatusSnapshot(const NativeStatusSnapshot& snapshot) {
     g_have_snapshot = true;
 }
 
-void SetNativeLaunchName(std::string name, bool explicit_name) {
+void SetNativeLaunchName(std::string name) {
     std::scoped_lock lock{g_snapshot_mutex};
     g_launch_name = std::move(name);
-    g_launch_name_explicit = explicit_name;
 }
 
 void SetNativeLaunchVersion(std::string version) {
