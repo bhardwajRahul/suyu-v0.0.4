@@ -3846,6 +3846,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
                 "swresample-5.dll", "swscale-8.dll",
                 "dxcompiler.dll", "dxil.dll",
                 "libcrypto-3-x64.dll", "libssl-3-x64.dll",
+                "discord-rpc.dll",
                 // fallback names used by some builds
                 "libcrypto.dll", "libssl.dll",
             };

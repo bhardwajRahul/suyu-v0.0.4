@@ -70,6 +70,10 @@
 #include "suyu_cmd/emu_window/emu_window_sdl2_vk.h"
 #include "video_core/renderer_base.h"
 
+#ifdef USE_DISCORD_PRESENCE
+#include <discord_rpc.h>
+#endif
+
 #ifdef _WIN32
 // windows.h needs to be included before shellapi.h
 #include <windows.h>
@@ -1683,8 +1687,57 @@ int main(int argc, char** argv) {
                          "additional help.\n\nError Code: {:04X}-{:04X}\nError Description: {}",
                          loader_id, error_id, static_cast<Loader::ResultStatus>(error_id));
         }
-        break;
+        return -1;
     }
+
+#ifdef USE_DISCORD_PRESENCE
+    // Both suyu-cmd and the renamed executable shipped by a game export run
+    // through this path, including when Steam starts the exported shortcut.
+    std::string discord_title;
+    system.GetAppLoader().ReadTitle(discord_title);
+    if (discord_title.empty()) {
+        // Extracted ExeFS exports may not carry the control data used for a
+        // title. Their executable is already named after the game by the exporter.
+#ifdef _WIN32
+        wchar_t discord_exe_path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, discord_exe_path, MAX_PATH);
+        discord_title = Common::UTF16ToUTF8(std::filesystem::path(discord_exe_path).stem().wstring());
+#else
+        discord_title = std::filesystem::path(argv[0]).stem().string();
+#endif
+        if (discord_title == "suyu-cmd" || discord_title == "suyu-cmd-static") {
+            discord_title = std::filesystem::path(filepath).stem().string();
+        }
+    }
+    const auto limit_discord_text = [](std::string& value) {
+        if (value.size() <= 128) {
+            return;
+        }
+        size_t length = 128;
+        while (length > 0 && (static_cast<unsigned char>(value[length]) & 0xC0) == 0x80) {
+            --length;
+        }
+        value.resize(length);
+    };
+    limit_discord_text(discord_title);
+    DiscordEventHandlers discord_handlers{};
+    // Share the Suyu application ID used by the Qt frontend.
+    Discord_Initialize("1221314350216646828", &discord_handlers, 0, nullptr);
+    DiscordRichPresence discord_presence{};
+    discord_presence.details = "Playing a Nintendo Switch game";
+    std::string discord_state = discord_title;
+    discord_presence.state = discord_state.c_str();
+    discord_presence.largeImageKey = "suyu_logo";
+    discord_presence.largeImageText = discord_title.c_str();
+    discord_presence.startTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count();
+    Discord_UpdatePresence(&discord_presence);
+    SCOPE_EXIT {
+        Discord_ClearPresence();
+        Discord_Shutdown();
+    };
+#endif
 
     if (use_multiplayer) {
         if (auto member = system.GetRoomNetwork().GetRoomMember().lock()) {
@@ -1794,7 +1847,23 @@ int main(int argc, char** argv) {
     const auto capture_interval = capture_seconds("SUYU_CMD_CAPTURE_INTERVAL_SEC", 60);
     unsigned capture_index = 0;
     while (emu_window->IsOpen()) {
+        // The wait is bounded (see EmuWindow_SDL2::WaitEvent), so this loop also
+        // runs with no input, which keeps a NetPlay join or leave current in Discord.
         emu_window->WaitEvent();
+#ifdef USE_DISCORD_PRESENCE
+        std::string next_state = discord_title;
+        if (const auto member = system.GetRoomNetwork().GetRoomMember().lock();
+            member && member->IsConnected()) {
+            const auto room_name = member->GetRoomInformation().name;
+            next_state = room_name.empty() ? "In a NetPlay room" : "NetPlay: " + room_name;
+        }
+        limit_discord_text(next_state);
+        if (next_state != discord_state) {
+            discord_state = std::move(next_state);
+            discord_presence.state = discord_state.c_str();
+            Discord_UpdatePresence(&discord_presence);
+        }
+#endif
         if (capture_dir.empty() || system.Renderer().IsScreenshotPending() ||
             std::chrono::steady_clock::now() - capture_start < next_capture) {
             continue;

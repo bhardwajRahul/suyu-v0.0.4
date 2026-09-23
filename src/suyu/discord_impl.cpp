@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2018 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -15,6 +16,8 @@
 #include "common/string_util.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
+#include "network/room_member.h"
+#include "network/network.h"
 #include "suyu/discord_impl.h"
 #include "suyu/uisettings.h"
 
@@ -66,18 +69,32 @@ void DiscordImpl::UpdateGameStatus(bool use_default) {
     const std::string default_text = "suyu is an emulator for the Nintendo Switch";
     const std::string default_image = "suyu_logo";
     const std::string url = use_default ? default_image : game_url;
-    s64 start_time = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
     DiscordRichPresence presence{};
+
+    std::string room_state;
+    if (const auto member = system.GetRoomNetwork().GetRoomMember().lock();
+        member && member->IsConnected()) {
+        const auto room_name = member->GetRoomInformation().name;
+        room_state = room_name.empty() ? "In a NetPlay room" : "NetPlay: " + room_name;
+        // Discord limits activity strings to 128 bytes. Leave room for the
+        // prefix and avoid publishing the room's address or password.
+        if (room_state.size() > 128) {
+            size_t length = 128;
+            while (length > 0 &&
+                   (static_cast<unsigned char>(room_state[length]) & 0xC0) == 0x80) {
+                --length;
+            }
+            room_state.resize(length);
+        }
+    }
 
     presence.largeImageKey = url.c_str();
     presence.largeImageText = game_title.c_str();
     presence.smallImageKey = default_image.c_str();
     presence.smallImageText = default_text.c_str();
-    presence.state = game_title.c_str();
+    presence.state = room_state.empty() ? game_title.c_str() : room_state.c_str();
     presence.details = "Currently in game";
-    presence.startTimestamp = start_time;
+    presence.startTimestamp = game_start_timestamp;
     Discord_UpdatePresence(&presence);
 }
 
@@ -86,7 +103,20 @@ void DiscordImpl::Update() {
     const std::string default_image = "suyu_logo";
 
     if (system.IsPoweredOn()) {
-        system.GetAppLoader().ReadTitle(game_title);
+        std::string loaded_title;
+        system.GetAppLoader().ReadTitle(loaded_title);
+        if (loaded_title.empty()) {
+            loaded_title = "Nintendo Switch game";
+        }
+        if (loaded_title == game_title) {
+            UpdateGameStatus(!game_image_available);
+            return;
+        }
+        game_title = std::move(loaded_title);
+        game_image_available = false;
+        game_start_timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
 
         // Used to format Icon URL for suyu website game compatibility page
         std::string icon_name = GetGameString(game_title);
@@ -100,10 +130,13 @@ void DiscordImpl::Update() {
         QEventLoop request_event_loop;
         QObject::connect(reply, &QNetworkReply::finished, &request_event_loop, &QEventLoop::quit);
         request_event_loop.exec();
-        UpdateGameStatus(reply->error());
+        game_image_available = reply->error() == QNetworkReply::NoError;
+        UpdateGameStatus(!game_image_available);
         return;
     }
 
+    game_title.clear();
+    game_start_timestamp = 0;
     s64 start_time = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();

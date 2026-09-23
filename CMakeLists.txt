@@ -257,7 +257,7 @@ if (SUYU_ANDROID_LIBRETRO)
 endif()
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 
-cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" OFF "ENABLE_QT" OFF)
+cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" ON "NOT ANDROID" OFF)
 
 option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")
 

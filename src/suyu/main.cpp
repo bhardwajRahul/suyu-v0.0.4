@@ -1228,6 +1228,10 @@ void GMainWindow::InitializeWidgets() {
     multiplayer_state = new MultiplayerState(this, game_list->GetModel(), ui->action_Leave_Room,
                                              ui->action_Show_Room, *system);
     multiplayer_state->setVisible(false);
+    connect(multiplayer_state, &MultiplayerState::NetworkStateChanged, this,
+            [this] { discord_rpc->Update(); });
+    connect(multiplayer_state, &MultiplayerState::RoomInformationChanged, this,
+            [this] { discord_rpc->Update(); });
 
     // Create status bar
     message_label = new QLabel();

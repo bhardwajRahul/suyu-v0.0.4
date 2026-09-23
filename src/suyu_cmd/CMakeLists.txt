@@ -160,6 +160,10 @@ if (SUYU_CMD OR YUZU_CMD)
     create_resource("../../dist/suyu.bmp" "suyu_cmd/suyu_icon.h" "suyu_icon")
 
     foreach(_t ${SUYU_CMD_TARGETS})
+        if (USE_DISCORD_PRESENCE)
+            target_link_libraries(${_t} PRIVATE DiscordRPC::discord-rpc)
+            target_compile_definitions(${_t} PRIVATE USE_DISCORD_PRESENCE)
+        endif()
         if (APPLE)
             target_sources(${_t} PRIVATE
                 emu_window/emu_window_sdl2_mtl.cpp

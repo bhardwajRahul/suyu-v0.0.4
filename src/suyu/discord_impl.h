@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "suyu/discord.h"
 
 namespace Core {
@@ -25,6 +27,8 @@ private:
 
     std::string game_url{};
     std::string game_title{};
+    bool game_image_available = false;
+    std::int64_t game_start_timestamp = 0;
 
     Core::System& system;
 };
