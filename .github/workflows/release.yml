@@ -508,6 +508,21 @@ jobs:
         run: |
           NAME="suyu-${GITHUB_REF_NAME:-manual}-source"
           git archive --format=tar --prefix="${NAME}/" HEAD > "${NAME}.tar"
+          # A source archive has no .git, so the version module reads these
+          # files instead; without them a build from it calls itself 1.0.0.
+          meta="$(mktemp -d)"
+          git rev-parse HEAD > "$meta/GIT-COMMIT"
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+            printf '%s\n' "$GITHUB_REF_NAME" > "$meta/GIT-TAG"
+            printf '%s\n' "$GITHUB_REF_NAME" > "$meta/GIT-REFSPEC"
+            printf '%s\n' "$GITHUB_REF_NAME" > "$meta/GIT-RELEASE"
+          else
+            git describe --tags --abbrev=0 > "$meta/GIT-TAG"
+            printf '%s\n' "${GITHUB_REF_NAME:-HEAD}" > "$meta/GIT-REFSPEC"
+          fi
+          tar --append --file="${NAME}.tar" -C "$meta" --transform "s,^,${NAME}/," \
+            $(cd "$meta" && ls)
+          rm -rf "$meta"
           while IFS= read -r path; do
             test -n "$path" || continue
             subarchive="$(mktemp --suffix=.tar)"
