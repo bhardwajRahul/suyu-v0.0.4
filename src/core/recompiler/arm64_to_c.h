@@ -681,6 +681,71 @@ else {
     return s;
 }
 
+// FRECPS/FRSQRTS S/D, evaluated exactly before one rounding: 2 - a*b, or
+// (3 - a*b)/2 for FRSQRTS (`half`). Inputs are the raw operand bits _aa and
+// _bb; the result bits are left in _v, which this text declares. A fixed
+// multiword product lattice covers every finite input exponent. This
+// deliberately favors correctness over speed; no host fma or intermediate
+// halve can introduce double rounding. Baseline FP modes only: exception/
+// access trap delivery and FEAT_AFP remain unsupported. The line breaks match
+// what put() emits, so the scalar text is unchanged by sharing it.
+inline std::string EmitFPStepValue(bool dbl, bool half) {
+    std::string s = std::string("const unsigned _f=")+(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+
+            ",_count="+(dbl?"67":"9")+";const int _base="+
+            std::to_string((dbl?-2148:-298)-(half?1:0))+";"
+            "const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
+            (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
+            (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
+            // FPNeg precedes NaN processing in the architectural pseudocode.
+            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
+            "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
+            "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
+            "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+            "if(_an||_bn) {int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+            "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs) {c->fpsr|=1;}"
+            "if(c->fpcr&(1ULL<<25)) {_v=_exp|_quiet;}}"
+            "else if(((_a&_exp)==_exp&&!(_b&~_sign))||((_b&_exp)==_exp&&!(_a&~_sign)))"
+            "_v="+(dbl?(half?"0x3ff8000000000000ULL":"0x4000000000000000ULL"):
+                         (half?"0x3fc00000ULL":"0x40000000ULL"))+";"
+            "else if((_a&_exp)==_exp||(_b&_exp)==_exp)_v=_exp|((_a^_b)&_sign);"
+            "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
+            "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
+            "uint64_t _p["+std::string(dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};"
+            "uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;"
+            "uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);"
+            "uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;"
+            "unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;"
+            "_p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);"
+            "if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);"
+            "unsigned _bit="+std::string(dbl?"2149":"299")+";_c[_bit/64]|=1ULL<<(_bit%64);\n    ";
+    if(half)s+="--_bit;_c[_bit/64]|=1ULL<<(_bit%64);\n    ";
+    s+="unsigned _negative=0;"
+            "if((_a^_b)&_sign) {int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k)"
+            "{if(_p[_k]!=_c[_k]) {_compare=_p[_k]>_c[_k]?1:-1;break;}}"
+            "_negative=_compare>0;uint64_t _borrow=0;for(unsigned _k=0;_k<_count;++_k)"
+            "{uint64_t _left=_negative?_p[_k]:_c[_k],_right=_negative?_c[_k]:_p[_k];"
+            "uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);"
+            "_p[_k]=_diff-_borrow;_borrow=_next;}}"
+            "else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k)"
+            "{uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];"
+            "uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}"
+            "int _top=recomp_fp_top_bit(_p,_count);"
+            "if(_top<0)_v=_mode==2?_sign:0;else {int _e=_top+_base,_emin=1-(int)_bias;"
+            "if(_e<_emin&&(c->fpcr&(1ULL<<24))) {c->fpsr|=8;_v=_negative?_sign:0;}"
+            "else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;"
+            "unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;"
+            "uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);"
+            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);"
+            "unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);"
+            "unsigned _lost=_roundbit|_sticky;if(_lost) {c->fpsr|=16;if(_e<_emin)c->fpsr|=8;"
+            "if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}"
+            "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
+            "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
+            "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
+            "if(_negative)_v|=_sign;}}}";
+    return s;
+}
+
 inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
     if (unhandled) {
         *unhandled = false;
@@ -2070,31 +2135,24 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     }
 
     // FRECPS: the Newton-Raphson step for reciprocal estimation, 2 - n*m.
-    // Bit 23 selects FRSQRTS, whose step is (3 - n*m)/2.
+    // Bit 23 selects FRSQRTS, whose step is (3 - n*m)/2. Both are fused: one
+    // rounding of the exact value, per lane through the scalar forms' exact
+    // body. Host arithmetic would round the product first unless the compiler
+    // happened to contract it, and gives NaN for inf*0 where the step is 2 or
+    // 1.5; it also never raised FPSR flags.
     if ((i & 0xBF20FC00) == 0x0E20FC00) {
         const u32 Q = (i >> 30) & 1;
         const bool rsqrt = ((i >> 23) & 1) != 0;
         const bool dbl = ((i >> 22) & 1) != 0;
         const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
-        const char* ct = dbl ? "double" : "float";
-        const int fsz = dbl ? 8 : 4;
-        const int bytes = Q ? 16 : 8;
-        const int lanes = bytes / fsz;
         if (!(dbl && !Q)) {
-            std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "],_b[" +
-                            std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
-            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
-            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=";
-            if (rsqrt) {
-                s += "((" + std::string(ct) + ")3.0-_a[_i]*_b[_i])*(" + std::string(ct) + ")0.5; ";
-            } else {
-                s += "(" + std::string(ct) + ")2.0-_a[_i]*_b[_i]; ";
-            }
-            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                 "][1]=0; ";
-            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-            put(s);
+            const std::string ct = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+            const unsigned lanes = (Q ? 16 : 8) / (dbl ? 8 : 4);
+            put("{ " + ct + " _n[" + count + "],_m[" + count + "],_r[" + count +
+                "]={0};memcpy(_n,c->vreg[" + std::to_string(rn) + "],16);memcpy(_m,c->vreg[" +
+                std::to_string(rm) + "],16);for(unsigned _l=0;_l<" + std::to_string(lanes) +
+                ";++_l){uint64_t _aa=_n[_l],_bb=_m[_l];" + EmitFPStepValue(dbl, rsqrt) + "_r[_l]=(" +
+                ct + ")_v;}memcpy(c->vreg[" + std::to_string(rd) + "],_r,16);}");
             return true;
         }
     }
@@ -3250,69 +3308,13 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     }
 
     // Scalar FRECPS/FRSQRTS S/D, evaluated exactly before one rounding.
-    // A fixed multiword product lattice covers every finite input exponent.
-    // This deliberately favors correctness over speed; no host fma or
-    // intermediate halve can introduce double rounding. Baseline FP modes
-    // only: exception/access trap delivery and FEAT_AFP remain unsupported.
     if ((i & 0xFF20FC00) == 0x5E20FC00) {
         const bool dbl=(i&0x00400000)!=0,half=(i&0x00800000)!=0;
         const unsigned rd=i&31,rn=(i>>5)&31,rm=(i>>16)&31;
         const std::string ct=dbl?"uint64_t":"uint32_t",sz=dbl?"8":"4";
         put("{ "+ct+" _aa,_bb;memcpy(&_aa,c->vreg["+std::to_string(rn)+"],"+sz+
             ");memcpy(&_bb,c->vreg["+std::to_string(rm)+"],"+sz+
-            ");const unsigned _f="+(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+
-            ",_count="+(dbl?"67":"9")+";const int _base="+
-            std::to_string((dbl?-2148:-298)-(half?1:0))+";"
-            "const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
-            (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
-            (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
-            // FPNeg precedes NaN processing in the architectural pseudocode.
-            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
-            "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
-            "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
-            "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-            "if(_an||_bn) {int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-            "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs) {c->fpsr|=1;}"
-            "if(c->fpcr&(1ULL<<25)) {_v=_exp|_quiet;}}"
-            "else if(((_a&_exp)==_exp&&!(_b&~_sign))||((_b&_exp)==_exp&&!(_a&~_sign)))"
-            "_v="+(dbl?(half?"0x3ff8000000000000ULL":"0x4000000000000000ULL"):
-                         (half?"0x3fc00000ULL":"0x40000000ULL"))+";"
-            "else if((_a&_exp)==_exp||(_b&_exp)==_exp)_v=_exp|((_a^_b)&_sign);"
-            "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
-            "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
-            "uint64_t _p["+std::string(dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};"
-            "uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;"
-            "uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);"
-            "uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;"
-            "unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;"
-            "_p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);"
-            "if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);"
-            "unsigned _bit="+std::string(dbl?"2149":"299")+";_c[_bit/64]|=1ULL<<(_bit%64);");
-        if(half)put("--_bit;_c[_bit/64]|=1ULL<<(_bit%64);");
-        put("unsigned _negative=0;"
-            "if((_a^_b)&_sign) {int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k)"
-            "{if(_p[_k]!=_c[_k]) {_compare=_p[_k]>_c[_k]?1:-1;break;}}"
-            "_negative=_compare>0;uint64_t _borrow=0;for(unsigned _k=0;_k<_count;++_k)"
-            "{uint64_t _left=_negative?_p[_k]:_c[_k],_right=_negative?_c[_k]:_p[_k];"
-            "uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);"
-            "_p[_k]=_diff-_borrow;_borrow=_next;}}"
-            "else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k)"
-            "{uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];"
-            "uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}"
-            "int _top=recomp_fp_top_bit(_p,_count);"
-            "if(_top<0)_v=_mode==2?_sign:0;else {int _e=_top+_base,_emin=1-(int)_bias;"
-            "if(_e<_emin&&(c->fpcr&(1ULL<<24))) {c->fpsr|=8;_v=_negative?_sign:0;}"
-            "else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;"
-            "unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;"
-            "uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);"
-            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);"
-            "unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);"
-            "unsigned _lost=_roundbit|_sticky;if(_lost) {c->fpsr|=16;if(_e<_emin)c->fpsr|=8;"
-            "if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}"
-            "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
-            "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
-            "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
-            "if(_negative)_v|=_sign;}}}c->vreg["+std::to_string(rd)+"][0]=_v;c->vreg["+
+            ");"+EmitFPStepValue(dbl,half)+"c->vreg["+std::to_string(rd)+"][0]=_v;c->vreg["+
             std::to_string(rd)+"][1]=0;}");
         return true;
     }
