@@ -55,6 +55,23 @@ void SetRecompLongSlices(bool enabled);
 void SetRecompCodeGuardReady(bool ready);
 bool IsRecompCodeGuardReady();
 
+/// ABI 6 (FM1): the arguments the loader passes to each module's
+/// recomp_image_fastmem_v1. They describe this host's page table and its view
+/// of the generated context; a module that was compiled against anything else
+/// answers 0 and the bundle is refused.
+struct RecompFastmemLayout {
+    u32 page_bits;
+    u32 stride_log2;
+    u64 pointer_mask;
+    u32 off_table;
+    u32 off_limit;
+};
+RecompFastmemLayout GetRecompFastmemLayout();
+/// True only after every loaded module is ABI 6 and passed the handshake above.
+/// SUYU_RECOMP_FASTMEM=0 still keeps the fast path off at run time.
+void SetRecompFastmemReady(bool ready);
+bool IsRecompFastmemReady();
+
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by
 /// the static pass are module-relative - the loader picks the real base at run

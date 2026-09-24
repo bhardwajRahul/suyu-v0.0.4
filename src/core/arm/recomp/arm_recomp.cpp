@@ -341,6 +341,13 @@ constexpr int kHaltUnhandled = 2;
 constexpr int kHaltBreakpoint = 3;
 constexpr int kHaltIcIvau = 4;
 std::atomic<bool> g_code_guard_ready{false};
+// ABI 6 (FM1). Set by the loader once every module passed the handshake, before
+// any guest thread runs. SUYU_RECOMP_FASTMEM=0 keeps the fast path off anyway.
+std::atomic<bool> g_fastmem_ready{false};
+const bool kFastmemDisabled = [] {
+    const char* e = std::getenv("SUYU_RECOMP_FASTMEM");
+    return e && *e == '0';
+}();
 std::atomic<u64> g_forced_cutoff_pc{0};
 std::atomic<u64> g_forced_cutoff_blocks{0};
 
@@ -655,6 +662,7 @@ std::array<u64, 4> GetRecompCurrentPcs() {
 void SetRecompLookup(RecompLookupFn lookup) {
     std::scoped_lock lock{g_process_init_lock};
     g_code_guard_ready.store(false, std::memory_order_release);
+    g_fastmem_ready.store(false, std::memory_order_release);
     g_recomp_lookup.store(lookup, std::memory_order_release);
 }
 
@@ -668,6 +676,24 @@ void SetRecompCodeGuardReady(bool ready) {
 
 bool IsRecompCodeGuardReady() {
     return g_code_guard_ready.load(std::memory_order_acquire);
+}
+
+RecompFastmemLayout GetRecompFastmemLayout() {
+    return RecompFastmemLayout{
+        static_cast<u32>(Memory::YUZU_PAGEBITS),
+        5, // log2(sizeof(Common::PageTable::PageEntryData)), pinned above
+        static_cast<u64>(~uintptr_t{0} << Common::PageTable::ATTRIBUTE_BITS),
+        static_cast<u32>(offsetof(GuestContextView, fm_table)),
+        static_cast<u32>(offsetof(GuestContextView, fm_limit)),
+    };
+}
+
+void SetRecompFastmemReady(bool ready) {
+    g_fastmem_ready.store(ready, std::memory_order_release);
+}
+
+bool IsRecompFastmemReady() {
+    return g_fastmem_ready.load(std::memory_order_acquire);
 }
 
 void SetRecompBaseSetter(RecompBaseFn setter) {
@@ -822,6 +848,21 @@ struct ArmRecomp::Impl {
         if (kSlowPathAbove != 0 && kSlowPathAbove < bridge.address_space_max &&
             TotalStaticBlocks() >= kSlowPathAfterBlocks) {
             bridge.address_space_max = kSlowPathAbove;
+        }
+        // ABI 6 (FM1). The generated helpers read the table with its layout
+        // folded in as constants, so enable them only for a table that has that
+        // layout. The limit is the ABI 5 walk's own limit (after any diagnostic
+        // lowering above) rounded down to a page, so the fast path serves a
+        // subset of what that walk serves and declines everything else to it.
+        ctx.fm_table = nullptr;
+        ctx.fm_limit = 0;
+        if (!kFastmemDisabled && g_fastmem_ready.load(std::memory_order_acquire) &&
+            bridge.page_entries != nullptr && bridge.page_bits == Memory::YUZU_PAGEBITS &&
+            bridge.page_entry_stride == sizeof(Common::PageTable::PageEntryData) &&
+            bridge.pointer_mask == GetRecompFastmemLayout().pointer_mask &&
+            bridge.address_space_max <= (u64{1} << 39)) {
+            ctx.fm_table = static_cast<const u8*>(bridge.page_entries);
+            ctx.fm_limit = bridge.address_space_max & ~u64{0xfff};
         }
     }
 
@@ -1585,9 +1626,13 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
 
     impl->RefreshPageTable();
     if (first_run) {
-        LOG_INFO(Core_ARM, "ArmRecomp page table ready: entries={} stride={} page_bits={} max={:#x}",
+        LOG_INFO(Core_ARM,
+                 "ArmRecomp page table ready: entries={} stride={} page_bits={} max={:#x} "
+                 "fastmem={} (limit {:#x}{})",
                  impl->bridge.page_entries != nullptr, impl->bridge.page_entry_stride,
-                 impl->bridge.page_bits, impl->bridge.address_space_max);
+                 impl->bridge.page_bits, impl->bridge.address_space_max,
+                 impl->ctx.fm_limit != 0, impl->ctx.fm_limit,
+                 kFastmemDisabled ? ", disabled by SUYU_RECOMP_FASTMEM=0" : "");
     }
 
     // Registering every loaded image's base with the host dispatcher is a
