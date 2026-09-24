@@ -119,7 +119,9 @@ def check_outputs(abi5, abi6, fpx):
 def check_ggfpx(abi6gg, ggfpx):
     # FM1+GG1+FPX1 together: both features negotiated on top of the same FM1
     # base, neither one disabling the other. Structural only, like GG1 alone.
-    check_differences(abi6gg, ggfpx, GG1_CHANGED | FPX_CHANGED, "GG1+FPX1")
+    # GG1 is already on in both trees, so only FPX1's own delta should show,
+    # exactly as it does going from plain FM1 to FM1+FPX1 (FPX_CHANGED).
+    check_differences(abi6gg, ggfpx, FPX_CHANGED, "GG1+FPX1")
     for module in (ggfpx, ggfpx / "second"):
         header = (module / "recomp_runtime.h").read_text()
         export = (module / "recomp_export.c").read_text()

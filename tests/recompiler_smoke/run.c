@@ -361,8 +361,16 @@ int main(int argc, char** argv) {
     {
         uint64_t lo = 0, end = 0;
         const uint64_t* base = NULL;
+        /* This tree may also carry FPX1 (the "ggfpx" variant). GG1's own
+           handshake sequence below does not depend on it, so the expected
+           feature set just includes FPX1 when it is built in. */
+#ifdef RECOMP_FEATURE_FPX1
+        CHECK(recomp_image_features() ==
+              (RECOMP_FEATURE_FASTMEM_PT1 | RECOMP_FEATURE_GUARD_GEN1 | RECOMP_FEATURE_FPX1));
+#else
         CHECK(recomp_image_features() ==
               (RECOMP_FEATURE_FASTMEM_PT1 | RECOMP_FEATURE_GUARD_GEN1));
+#endif
         CHECK(recomp_image_fastmem_v1(12, 5, ~(uint64_t)3, 872, 880) == 0);
         CHECK(recomp_image_guard_gen_v1(0, &lo, &end, &base) == NULL);
         CHECK(recomp_image_guard_gen_v1(1, &lo, &end, &base) == NULL);

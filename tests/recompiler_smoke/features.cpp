@@ -35,8 +35,11 @@ int main() {
     CHECK(F::Unsupported(features, 0) == features);
     CHECK(F::Unsupported(features, F::FastmemPT1) == (features & ~F::FastmemPT1));
     if (features & F::GuardGen1) {
-        // The host before GG1 (FM1 only) refuses a generation-guard image.
-        CHECK(F::Unsupported(features, F::FastmemPT1) == F::GuardGen1);
+        // The host before GG1 (FM1 only) refuses a generation-guard image;
+        // this tree may also carry FPX1 (the "ggfpx" variant), which is an
+        // independent bit refused the same way.
+        CHECK(F::Unsupported(features, F::FastmemPT1) == (features & ~F::FastmemPT1));
+        CHECK(F::Unsupported(features, F::FastmemPT1) & F::GuardGen1);
     }
     std::printf("PASS features 0x%x\n", features);
     return 0;
