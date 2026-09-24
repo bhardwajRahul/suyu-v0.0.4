@@ -2504,6 +2504,78 @@ static bool LastBuildStep(const QString& text, int& done, int& total) {
     return found;
 }
 
+#ifdef _WIN32
+// clang-cl for the generated modules of a Windows Build export. On MK8D the
+// same generated C races ~45% faster built with clang-cl /O2 than with MSVC
+// /O2, and clang-cl's objects link into the MSVC-built host with link.exe as
+// they are. Search order: SUYU_CLANG_CL (final when set, even if it names a
+// missing file, so an A/B can hide an installed LLVM), the LLVM installer's
+// default location, Visual Studio's "C++ Clang tools for Windows", then PATH.
+static QString FindClangCl(QString& searched) {
+    const QString from_env = qEnvironmentVariable("SUYU_CLANG_CL").trimmed();
+    if (!from_env.isEmpty()) {
+        searched = QStringLiteral("SUYU_CLANG_CL=") + from_env;
+        return QFileInfo(from_env).isFile() ? QDir::fromNativeSeparators(from_env) : QString{};
+    }
+    QStringList candidates{
+        QDir::fromNativeSeparators(qEnvironmentVariable("ProgramFiles", QStringLiteral("C:/Program Files"))) +
+        QStringLiteral("/LLVM/bin/clang-cl.exe")};
+    for (const auto& root : VisualStudioInstallRoots()) {
+        candidates.append(root + QStringLiteral("/VC/Tools/Llvm/x64/bin/clang-cl.exe"));
+    }
+    searched = candidates.join(QStringLiteral(", ")) + QStringLiteral(", PATH");
+    for (const auto& c : candidates) {
+        if (QFileInfo(c).isFile()) {
+            return c;
+        }
+    }
+    return QDir::fromNativeSeparators(QStandardPaths::findExecutable(QStringLiteral("clang-cl")));
+}
+
+// Compiles a small C file with the export's own environment (vcvars64's INCLUDE
+// is what finds <stdint.h>), so a broken or non-x64 clang-cl is caught here
+// rather than partway through a module build.
+static bool ClangClSelfTest(const QString& clang, const QProcessEnvironment& env,
+                            const QString& dir, QString& version, QString& error) {
+    QDir(dir).removeRecursively();
+    QDir().mkpath(dir);
+    const QString src = dir + QStringLiteral("/selftest.c");
+    const QString obj = dir + QStringLiteral("/selftest.obj");
+    {
+        QFile f(src);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            error = QStringLiteral("cannot write ") + src;
+            return false;
+        }
+        f.write("#include <stdint.h>\n"
+                "uint64_t suyu_clang_selftest(uint64_t x) { return x * 3u + 1u; }\n");
+    }
+    QString out;
+    QProcess ver;
+    ver.setProcessEnvironment(env);
+    if (RunProcessDrained(ver, clang, {QStringLiteral("--version")}, &out) != 0) {
+        error = out.right(2000);
+        return false;
+    }
+    version = out.section(QLatin1Char('\n'), 0, 0).trimmed();
+    if (!out.contains(QStringLiteral("Target: x86_64"))) {
+        error = QStringLiteral("not an x86_64 compiler: ") + out.right(2000);
+        return false;
+    }
+    QProcess cc;
+    cc.setProcessEnvironment(env);
+    const int rc = RunProcessDrained(cc, clang,
+                                     {QStringLiteral("/nologo"), QStringLiteral("/c"),
+                                      QStringLiteral("/O2"), src, QStringLiteral("/Fo") + obj},
+                                     &out);
+    if (rc != 0 || !QFile::exists(obj)) {
+        error = QStringLiteral("test compile failed (rc=%1): ").arg(rc) + out.right(2000);
+        return false;
+    }
+    return true;
+}
+#endif
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -2556,6 +2628,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                            RecompileBackend backend,
                                            const QString& game_name) {
     const QString manifest_path = cache_dir + QDir::separator() + QStringLiteral("aot_manifest.json");
+    last_recomp_compiler.clear();
     const QString rom_path = rom_path_edit->text();
     const bool packaged_rom = QFileInfo(rom_path).isFile();
     const auto source_exefs = packaged_rom
@@ -3247,6 +3320,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         // The suyu tree needs a newer CMake than is typically first on PATH, so
         // reuse whichever one configured it.
         QString tree_cmake;
+        // The clang-cl module build reuses the tree's Ninja.
+        QString tree_generator;
+        QString tree_make_program;
         {
             QDir up(QCoreApplication::applicationDirPath());
             for (int level = 0; level < 5; ++level) {
@@ -3262,6 +3338,10 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                 source_tree = line.section(QLatin1Char('='), 1);
                             } else if (line.startsWith(QStringLiteral("CMAKE_COMMAND:"))) {
                                 tree_cmake = line.section(QLatin1Char('='), 1);
+                            } else if (line.startsWith(QStringLiteral("CMAKE_GENERATOR:"))) {
+                                tree_generator = line.section(QLatin1Char('='), 1);
+                            } else if (line.startsWith(QStringLiteral("CMAKE_MAKE_PROGRAM:"))) {
+                                tree_make_program = line.section(QLatin1Char('='), 1);
                             }
                         }
                     }
@@ -3349,21 +3429,230 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
 #endif
             }
 
+            // Preferred: compile the modules with clang-cl as their own CMake
+            // project (src/suyu_cmd/recomp_modules; one project has one C
+            // compiler) and link the libraries into suyu-cmd-static with
+            // MSVC's link.exe. Any failure on the way falls back to the MSVC
+            // path below, which compiles the modules inside this tree.
+            // SUYU_RECOMP_COMPILER=msvc skips clang-cl, for A/B comparisons.
+            bool clang_linked = false;
+#ifdef _WIN32
+            {
+                const auto fallback = [&](const QString& why) {
+                    LOG_WARNING(Frontend,
+                                "Recompiled modules: not using clang-cl ({}); compiling them "
+                                "with MSVC instead",
+                                why.toStdString());
+                };
+                const QString forced =
+                    qEnvironmentVariable("SUYU_RECOMP_COMPILER").trimmed().toLower();
+                QString searched;
+                const QString clang =
+                    forced == QStringLiteral("msvc") ? QString{} : FindClangCl(searched);
+                const QString clang_dir = build_tree + QStringLiteral("/recomp_clang");
+                const QString modules_src = source_tree + QStringLiteral("/src/suyu_cmd/recomp_modules");
+                QString ninja = tree_generator == QStringLiteral("Ninja") ? tree_make_program
+                                                                           : QString{};
+                if (!QFileInfo(ninja).isFile()) {
+                    ninja.clear();
+                    for (const auto& root : VisualStudioInstallRoots()) {
+                        const QString n = root + QStringLiteral("/Common7/IDE/CommonExtensions/"
+                                                                "Microsoft/CMake/Ninja/ninja.exe");
+                        if (QFileInfo(n).isFile()) {
+                            ninja = n;
+                            break;
+                        }
+                    }
+                    if (ninja.isEmpty()) {
+                        ninja = QStandardPaths::findExecutable(QStringLiteral("ninja"));
+                    }
+                }
+                QString clang_version;
+                QString error;
+                if (forced == QStringLiteral("msvc")) {
+                    fallback(QStringLiteral("SUYU_RECOMP_COMPILER=msvc"));
+                } else if (clang.isEmpty()) {
+                    fallback(QStringLiteral("clang-cl not found; searched ") + searched);
+                } else if (!QFileInfo(modules_src + QStringLiteral("/CMakeLists.txt")).isFile()) {
+                    fallback(QStringLiteral("this source tree has no src/suyu_cmd/recomp_modules"));
+                } else if (ninja.isEmpty()) {
+                    fallback(QStringLiteral("no ninja found"));
+                } else if (!ClangClSelfTest(clang, vs_env,
+                                            build_tree + QStringLiteral("/recomp_clang_selftest"),
+                                            clang_version, error)) {
+                    fallback(QStringLiteral("self-test of ") + clang + QStringLiteral(" failed: ") +
+                             error);
+                } else {
+                    LOG_INFO(Frontend, "Recompiled modules: compiling with clang-cl {} ({})",
+                             clang_version.toStdString(), clang.toStdString());
+                    QString log;
+                    QString clang_cmake;
+                    // Fresh every export: the sources are new anyway, and no
+                    // library of an earlier export may be linked by mistake.
+                    QDir(clang_dir).removeRecursively();
+                    for (const auto& candidate : cmake_candidates) {
+                        if (!QFile::exists(candidate)) {
+                            continue;
+                        }
+                        QProcess p;
+                        p.setProcessEnvironment(vs_env);
+                        if (RunProcessDrained(
+                                p, candidate,
+                                {QStringLiteral("-G"), QStringLiteral("Ninja"),
+                                 QStringLiteral("-S"), modules_src, QStringLiteral("-B"),
+                                 clang_dir, QStringLiteral("-DCMAKE_BUILD_TYPE=Release"),
+                                 QStringLiteral("-DCMAKE_C_COMPILER=") + clang,
+                                 QStringLiteral("-DCMAKE_MAKE_PROGRAM=") +
+                                     QDir::fromNativeSeparators(ninja),
+                                 QStringLiteral("-DSUYU_CMD_RECOMP_DIR=") +
+                                     QDir::fromNativeSeparators(recomp_root),
+                                 QStringLiteral("-DSUYU_RECOMP_MODULES=") +
+                                     recomp_module_dirs.join(QLatin1Char(';'))},
+                                &log) == 0) {
+                            clang_cmake = candidate;
+                            break;
+                        }
+                        LOG_WARNING(Frontend, "clang-cl module project: {} failed to configure:\n{}",
+                                    candidate.toStdString(), log.right(3000).toStdString());
+                    }
+                    bool ok = !clang_cmake.isEmpty();
+                    if (!ok) {
+                        fallback(QStringLiteral("the module project did not configure"));
+                    }
+                    u64 compile_total = 0;
+                    for (const QString& m : recomp_module_dirs) {
+                        compile_total += module_code_bytes[m];
+                    }
+                    u64 compiled_bytes = 0;
+                    for (const QString& m : recomp_module_dirs) {
+                        if (!ok) {
+                            break;
+                        }
+                        const u64 module_bytes = module_code_bytes[m];
+                        const auto report = [&](int done, int total) {
+                            const double within =
+                                total > 0 ? static_cast<double>(done) / total : 0.0;
+                            ReportStage(ExportStage::Compile,
+                                        compile_total ? (compiled_bytes + within * module_bytes) /
+                                                            static_cast<double>(compile_total)
+                                                      : 0.0,
+                                        total > 0 ? tr("Compiling %1/%2 files (%3, clang-cl)")
+                                                        .arg(done)
+                                                        .arg(total)
+                                                        .arg(m)
+                                                  : tr("Compiling %1 (clang-cl)...").arg(m));
+                        };
+                        report(0, 0);
+                        QProcess p;
+                        p.setProcessEnvironment(vs_env);
+                        const int rc = RunProcessDrained(
+                            p, clang_cmake,
+                            {QStringLiteral("--build"), clang_dir, QStringLiteral("--target"),
+                             QStringLiteral("recomp_static_") + m, QStringLiteral("--parallel"),
+                             QStringLiteral("2")},
+                            &log, [&](const QString& text) {
+                                int done = 0;
+                                int total = 0;
+                                if (LastBuildStep(text, done, total)) {
+                                    report(done, total);
+                                }
+                            });
+                        compiled_bytes += module_bytes;
+                        if (rc != 0) {
+                            LOG_ERROR(Frontend, "clang-cl failed to compile module {}:\n{}",
+                                      m.toStdString(), log.right(4000).toStdString());
+                            fallback(QStringLiteral("module ") + m +
+                                     QStringLiteral(" did not compile"));
+                            ok = false;
+                        }
+                    }
+                    if (ok) {
+                        QProcess p;
+                        p.setProcessEnvironment(vs_env);
+                        if (RunProcessDrained(
+                                p, clang_cmake,
+                                {QStringLiteral("-S"), source_tree, QStringLiteral("-B"),
+                                 build_tree,
+                                 QStringLiteral("-DSUYU_CMD_RECOMP_DIR=") +
+                                     QDir::fromNativeSeparators(recomp_root),
+                                 QStringLiteral("-DSUYU_RECOMP_HYBRID=") +
+                                     (is_hybrid ? QStringLiteral("ON") : QStringLiteral("OFF")),
+                                 QStringLiteral("-DSUYU_CMD_RECOMP_PREBUILT_DIR=") + clang_dir +
+                                     QStringLiteral("/lib")},
+                                &log) != 0) {
+                            LOG_ERROR(Frontend, "cmake could not configure the static launcher "
+                                                "for the clang-cl modules:\n{}",
+                                      log.right(4000).toStdString());
+                            fallback(QStringLiteral("the launcher did not configure"));
+                            ok = false;
+                        }
+                    }
+                    if (ok) {
+                        ReportStage(ExportStage::Compile, 1.0);
+                        ReportStage(ExportStage::Link, 0.0,
+                                    tr("Linking the single-file executable..."));
+                        QProcess p;
+                        p.setProcessEnvironment(vs_env);
+                        if (RunProcessDrained(
+                                p, clang_cmake,
+                                {QStringLiteral("--build"), build_tree, QStringLiteral("--target"),
+                                 QStringLiteral("suyu-cmd-static"), QStringLiteral("--config"),
+                                 QStringLiteral("Release"), QStringLiteral("--parallel"),
+                                 QStringLiteral("2")},
+                                &log, [&](const QString& text) {
+                                    int done = 0;
+                                    int total = 0;
+                                    if (LastBuildStep(text, done, total)) {
+                                        ReportStage(ExportStage::Link,
+                                                    static_cast<double>(done) /
+                                                        std::max(total, 1),
+                                                    tr("Linking the single-file executable "
+                                                       "(%1/%2)")
+                                                        .arg(done)
+                                                        .arg(total));
+                                    }
+                                }) == 0) {
+                            ReportStage(ExportStage::Link, 1.0);
+                            clang_linked = true;
+                            last_recomp_compiler =
+                                QStringLiteral("clang-cl (%1, %2) /O2")
+                                    .arg(clang_version, QDir::toNativeSeparators(clang));
+                            LOG_INFO(Frontend,
+                                     "Recompiled modules compiled with {} and linked with MSVC "
+                                     "link.exe",
+                                     last_recomp_compiler.toStdString());
+                        } else {
+                            LOG_ERROR(Frontend,
+                                      "suyu-cmd-static failed to link the clang-cl modules:\n{}",
+                                      log.right(4000).toStdString());
+                            fallback(QStringLiteral("the launcher did not link"));
+                        }
+                    }
+                }
+            }
+#endif
+
             QString cmake_exe;
             int conf_rc = -1;
             QProcess conf;
             conf.setProcessEnvironment(vs_env);
             for (const auto& candidate : cmake_candidates) {
+                if (clang_linked) {
+                    break;
+                }
                 if (!QFile::exists(candidate)) {
                     continue;
                 }
+                // An empty SUYU_CMD_RECOMP_PREBUILT_DIR undoes a clang-cl
+                // attempt, so this tree compiles the modules itself.
                 conf_rc = RunProcessDrained(
                     conf, candidate,
                     {QStringLiteral("-S"), source_tree, QStringLiteral("-B"), build_tree,
                      QStringLiteral("-DSUYU_CMD_RECOMP_DIR=") +
                          QDir::fromNativeSeparators(recomp_root),
                      QStringLiteral("-DSUYU_RECOMP_HYBRID=") +
-                         (is_hybrid ? QStringLiteral("ON") : QStringLiteral("OFF"))},
+                         (is_hybrid ? QStringLiteral("ON") : QStringLiteral("OFF")),
+                     QStringLiteral("-DSUYU_CMD_RECOMP_PREBUILT_DIR=")},
                     &conf_log);
                 if (conf_rc == 0) {
                     cmake_exe = candidate;
@@ -3473,7 +3762,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                          QStringLiteral("-DSUYU_CMD_RECOMP_DIR=") +
                              QDir::fromNativeSeparators(recomp_root),
                          QStringLiteral("-DSUYU_RECOMP_HYBRID=") +
-                             (is_hybrid ? QStringLiteral("ON") : QStringLiteral("OFF"))},
+                             (is_hybrid ? QStringLiteral("ON") : QStringLiteral("OFF")),
+                         QStringLiteral("-DSUYU_CMD_RECOMP_PREBUILT_DIR=")},
                         &reconf_log);
                     if (conf_rc != 0) {
                         LOG_ERROR(Frontend,
@@ -3484,7 +3774,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 }
             }
 
-            int link_rc = -1;
+            int link_rc = clang_linked ? 0 : -1;
             if (conf_rc == 0) {
                 QProcess bld;
                 bld.setProcessEnvironment(vs_env);
@@ -3511,8 +3801,14 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 if (link_rc != 0) {
                     LOG_ERROR(Frontend, "suyu-cmd-static failed to link:\n{}",
                               link_log.right(4000).toStdString());
+                } else {
+                    last_recomp_compiler =
+                        QStringLiteral("MSVC cl.exe %1 /O2 /bigobj")
+                            .arg(vs_env.value(QStringLiteral("VCToolsVersion")));
+                    LOG_INFO(Frontend, "Recompiled modules compiled with {}",
+                             last_recomp_compiler.toStdString());
                 }
-            } else {
+            } else if (!clang_linked) {
                 LOG_ERROR(Frontend, "cmake could not configure the static launcher:\n{}",
                           conf_log.right(4000).toStdString());
             }
@@ -3682,6 +3978,12 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         out << "  \"recompiled_project\": \"recompiled/<module>/ (buildable C, cross-platform CMake; "
                "generated units in <module>/src, build output in <module>/build)\",\n";
         out << "  \"native_build_scripts\": [\"recompiled/build_native_windows.cmd\", \"recompiled/build_native_unix.sh\"],\n";
+        if (!last_recomp_compiler.isEmpty()) {
+            // Through QJsonArray for the escaping; the path has backslashes.
+            const QString quoted = QString::fromUtf8(
+                QJsonDocument(QJsonArray{last_recomp_compiler}).toJson(QJsonDocument::Compact));
+            out << "  \"recomp_compiler\": " << quoted.mid(1, quoted.size() - 2) << ",\n";
+        }
         out << "  \"requires_runtime_codegen\": false,\n";
         out << "  \"modules\": [\n";
         for (size_t i = 0; i < module_results.size(); ++i) {
@@ -4006,6 +4308,12 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         // folder. Delete it; a repeat export just recompiles it rather than
         // reusing this cache.
         if (has_static_launcher || !uses_aot) {
+            // The manifest is small and records how this exe was built
+            // (e.g. recomp_compiler), so it stays with the package.
+            if (has_static_launcher) {
+                CopyFileReplacingExisting(cache_dir + QStringLiteral("/aot_manifest.json"),
+                                          pkg_dir + QStringLiteral("/aot_manifest.json"));
+            }
             QDir(cache_dir).removeRecursively();
         } else {
             QDir(pkg_dir + QStringLiteral("/aot_cache/launcher")).removeRecursively();
@@ -4036,6 +4344,9 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             out << "This is the game itself, statically recompiled to x86 machine code and\n";
             out << "linked into " << package_name << ".exe alongside suyu's HLE/GPU/audio backend\n";
             out << "- no emulator install and no separate DLLs for the game code.\n\n";
+            if (!last_recomp_compiler.isEmpty()) {
+                out << "Game code compiled with: " << last_recomp_compiler << "\n\n";
+            }
             out << "What runs native vs emulated:\n";
             out << "- Native  : AOT CPU code, translated ahead of time to C and compiled into\n";
             out << "            this exe. This portion needs no instruction decoding at runtime.\n";
@@ -4058,7 +4369,10 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             out << "- " << package_name
                 << ".exe : the game (recompiled code + HLE/GPU backend, one file)\n";
             out << "- launch.bat      : one-click launcher\n";
-            out << "- exefs/          : the game's own executables and data, extracted once at\n";
+            if (has_static_launcher) {
+                out << "- aot_manifest.json : how the game code was recompiled and compiled\n";
+            }
+            out << "- exefs/        : the game's own executables and data, extracted once at\n";
             out << "                    export time so no ROM is needed to run (keys and firmware\n";
             out << "                    are read from the installed suyu, never from this folder)\n";
             out << "- *.dll           : runtime libraries (FFmpeg, Vulkan, OpenSSL)\n";

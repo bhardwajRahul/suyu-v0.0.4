@@ -179,6 +179,11 @@ private:
     /// partially-degraded package cannot look like a clean one.
     QStringList last_fallback_modules;
 
+    /// Compiler that built the last export's recompiled modules into the
+    /// single-file launcher (clang-cl or MSVC), or empty when nothing was
+    /// compiled. Written to the export log, aot_manifest.json and the README.
+    QString last_recomp_compiler;
+
     /// AOT export: scan ARM code and serialize translated compiler artifacts.
     /// Returns path to the generated cache directory, or empty string on failure.
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,

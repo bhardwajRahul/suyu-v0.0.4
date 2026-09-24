@@ -96,6 +96,19 @@ if (SUYU_CMD OR YUZU_CMD)
         string(REPLACE "@LBRACKET@" "[[]" _recomp_dir_escaped "${_recomp_dir_escaped}")
         file(GLOB _recomp_children RELATIVE "${SUYU_CMD_RECOMP_DIR}"
              "${_recomp_dir_escaped}/*")
+        # SUYU_CMD_RECOMP_PREBUILT_DIR: the modules were already compiled by
+        # recomp_modules/ (the Windows Build export does that with clang-cl,
+        # since one CMake project has one C compiler). Link its libraries
+        # instead of compiling the generated sources in this tree.
+        if (SUYU_CMD_RECOMP_PREBUILT_DIR)
+            set(_recomp_runtime_lib "${SUYU_CMD_RECOMP_PREBUILT_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}recomp_runtime_shared${CMAKE_STATIC_LIBRARY_SUFFIX}")
+            if (NOT EXISTS "${_recomp_runtime_lib}")
+                message(FATAL_ERROR "SUYU_CMD_RECOMP_PREBUILT_DIR has no ${_recomp_runtime_lib}")
+            endif()
+            add_library(recomp_runtime_shared STATIC IMPORTED)
+            set_target_properties(recomp_runtime_shared PROPERTIES
+                IMPORTED_LOCATION "${_recomp_runtime_lib}")
+        endif()
         foreach(_m ${_recomp_children})
             if (EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/CMakeLists.txt" AND
                 EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_export.c")
@@ -129,6 +142,18 @@ if (SUYU_CMD OR YUZU_CMD)
                 if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h")
                     message(FATAL_ERROR "Generated module '${_m}' has no runtime header")
                 endif()
+                if (SUYU_CMD_RECOMP_PREBUILT_DIR)
+                    set(_recomp_lib "${SUYU_CMD_RECOMP_PREBUILT_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}recomp_static_${_m}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+                    if (NOT EXISTS "${_recomp_lib}")
+                        message(FATAL_ERROR "SUYU_CMD_RECOMP_PREBUILT_DIR has no ${_recomp_lib}")
+                    endif()
+                    add_library(recomp_static_${_m} STATIC IMPORTED)
+                    set_target_properties(recomp_static_${_m} PROPERTIES
+                        IMPORTED_LOCATION "${_recomp_lib}"
+                        INTERFACE_LINK_LIBRARIES recomp_runtime_shared)
+                    list(APPEND _recomp_libs "recomp_static_${_m}")
+                    continue()
+                endif()
                 add_subdirectory("${SUYU_CMD_RECOMP_DIR}/${_m}"
                                  "${CMAKE_CURRENT_BINARY_DIR}/recomp/${_m}")
                 # The generated CMakeLists renames each module's exported
@@ -136,6 +161,7 @@ if (SUYU_CMD OR YUZU_CMD)
                 # its list predates these three and every module defines
                 # them, so linking more than one fails on duplicates.
                 # Rename them the same way until the emitter does.
+                # (recomp_modules/CMakeLists.txt repeats this.)
                 target_compile_definitions(recomp_static_${_m} PRIVATE
                     recomp_image_index=recomp_image_index_${_m}
                     _recomp_index_view=_recomp_index_view_${_m}
