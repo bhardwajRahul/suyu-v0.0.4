@@ -3002,72 +3002,35 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 rn = (i >> 5) & 31, rd = i & 31;
         if (ftype == 0 || ftype == 1) {
             const bool dbl = (ftype == 1);
-            const char* ct = dbl ? "double" : "float";
             const int fsz = dbl ? 8 : 4;
             const std::string zero_d = "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
                                        std::to_string(rd) + "][1]=0; ";
 
-            // SCVTF / UCVTF: integer register -> FP register.
+            // SCVTF / UCVTF: integer register -> FP register, rounded in the
+            // guest FPCR mode with IXC, as the fixed-point forms with no
+            // fraction bits.
             if (rmode == 0 && (opcode == 2 || opcode == 3)) {
-                const std::string src = sf ? (opcode == 2 ? "(int64_t)" + Xz(rn)
-                                                          : "(uint64_t)" + Xz(rn))
-                                           : (opcode == 2 ? "(int32_t)" + Xz(rn)
-                                                          : "(uint32_t)" + Xz(rn));
-                put("{ " + std::string(ct) + " _r = (" + ct + ")(" + src + "); " + zero_d +
-                    "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," +
-                    std::to_string(fsz) + "); }");
+                put("{ uint64_t _r=recomp_fixed_to_fp(" + Xz(rn) + "," + std::to_string(fsz * 8) +
+                    "," + (sf ? "64" : "32") + ",0," + (opcode == 2 ? "1" : "0") +
+                    ",c->fpcr,&c->fpsr); " + zero_d + "c->vreg[" + std::to_string(rd) + "][0]=_r; }");
                 return true;
             }
 
             // FCVT{N,P,M,Z}{S,U} and FCVTA{S,U}: FP register -> integer register.
             // rmode names the rounding mode; FCVTA{S,U} is the odd one out,
             // encoded as opcode 4/5 with rmode 0 and rounding halfway cases away
-            // from zero.
+            // from zero. Round, then saturate (NaN gives 0), in integer fields:
+            // a bare C cast is undefined out of range, and host rounding
+            // follows the host FP mode. IOC/IXC/IDC as the architecture.
             const bool cvt_away = (rmode == 0 && (opcode == 4 || opcode == 5));
-            if ((opcode == 0 || opcode == 1 || cvt_away) && rd != 31) {
+            if (opcode == 0 || opcode == 1 || cvt_away) {
                 const bool is_signed = cvt_away ? (opcode == 4) : (opcode == 0);
-                const char* rnd = nullptr;
-                if (cvt_away) {
-                    rnd = dbl ? "round" : "roundf";
-                } else if (rmode == 0) {
-                    rnd = dbl ? "nearbyint" : "nearbyintf";
-                } else if (rmode == 1) {
-                    rnd = dbl ? "ceil" : "ceilf";
-                } else if (rmode == 2) {
-                    rnd = dbl ? "floor" : "floorf";
-                }
-                // rmode 3 needs no call: the cast below already truncates.
-                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
-                                    : (is_signed ? "int32_t" : "uint32_t");
-                std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
-                                std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
-                // Round before saturating, the order the architecture specifies.
-                if (rnd) s += std::string("_a = ") + rnd + "(_a); ";
-                // FCVTZS/FCVTZU saturate: NaN gives 0, and anything outside the
-                // destination's range clamps to that range's min or max. A bare
-                // C cast is undefined for exactly those inputs, and on x86 it
-                // compiles to cvttss2si, which answers "integer indefinite"
-                // (INT_MIN / LLONG_MIN) for NaN, +inf and -inf alike. Float-heavy
-                // game code converts out-of-range values constantly - clamped
-                // indices, hashes, fixed-point - so the wrong answer here is a
-                // steady drip of corruption rather than an immediate fault.
-                const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
-                                          : (is_signed ? "-2147483648.0" : "0.0");
-                const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
-                                                       : "18446744073709551615.0")
-                                          : (is_signed ? "2147483647.0" : "4294967295.0");
-                const char* sat_lo = sf ? (is_signed ? "0x8000000000000000ULL" : "0ULL")
-                                        : (is_signed ? "0xFFFFFFFF80000000ULL" : "0ULL");
-                const char* sat_hi = sf ? (is_signed ? "0x7FFFFFFFFFFFFFFFULL"
-                                                     : "0xFFFFFFFFFFFFFFFFULL")
-                                        : (is_signed ? "0x7FFFFFFFULL" : "0xFFFFFFFFULL");
-                s += "uint64_t _r; if (_a != _a) _r = 0ULL; ";
-                s += std::string("else if (!(_a > (") + ct + ")" + lo_bound + ")) _r = " + sat_lo + "; ";
-                s += std::string("else if (!(_a < (") + ct + ")" + hi_bound + ")) _r = " + sat_hi + "; ";
-                s += "else _r = (uint64_t)(" + std::string(it) + ")_a; ";
-                if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
-                s += "c->x[" + std::to_string(rd) + "] = _r; }";
-                put(s);
+                const std::string call = "recomp_fp_to_int(c->vreg[" + std::to_string(rn) + "][0]&" +
+                    (dbl ? "UINT64_MAX" : "UINT64_C(0xffffffff)") + "," + std::to_string(fsz * 8) + "," +
+                    (sf ? "64" : "32") + "," + (is_signed ? "1" : "0") + "," +
+                    std::to_string(cvt_away ? 4u : rmode) + ",c->fpcr,&c->fpsr)";
+                // Rd=31 is WZR/XZR; the conversion's exceptions still happen.
+                put(rd == 31 ? "(void)" + call + ";" : "c->x[" + std::to_string(rd) + "]=" + call + ";");
                 return true;
             }
 
@@ -4056,21 +4019,17 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 return true;
             }
             if (opcode == 0x1D && (i & (1U << 23)) == 0) {
-                const char* ct = dbl ? "double" : "float";
+                // SCVTF/UCVTF per lane, rounded in the guest FPCR mode with IXC.
                 const int fsz = dbl ? 8 : 4;
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
                 const int lanes = bytes / fsz;
-                const std::string ity = std::string(U ? "uint" : "int") +
-                                        std::to_string(fsz * 8) + "_t";
-                std::string s = "{ " + ity + " _a[" + std::to_string(lanes) + "]; " +
-                                std::string(ct) + " _r[" + std::to_string(lanes) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" +
-                     std::string(ct) + ")_a[_i]; ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-                put(s);
+                const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+                const std::string w = std::to_string(fsz * 8);
+                put("{ " + uty + " _a[" + count + "],_r[" + count + "]={0}; memcpy(_a,c->vreg[" +
+                    std::to_string(rn) + "],16); for(int _i=0;_i<" + std::to_string(lanes) +
+                    ";_i++) _r[_i]=(" + uty + ")recomp_fixed_to_fp(_a[_i]," + w + "," + w + ",0," +
+                    (U ? "0" : "1") + ",c->fpcr,&c->fpsr); memcpy(c->vreg[" + std::to_string(rd) +
+                    "],_r,16); }");
                 return true;
             }
             // FABS/FNEG share opcode 0x0F; U selects negation. Opcode 0x0E
@@ -4122,43 +4081,20 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
             }
 
-            // FCVTZS / FCVTZU, vector. Round toward zero and saturate, the same
-            // contract as the scalar forms further up.
+            // FCVTZS / FCVTZU (bit 23 set) and FCVTMS / FCVTMU (bit 23 clear),
+            // vector and scalar: round toward zero or minus infinity, then
+            // saturate, the same contract as the general-register forms.
             if (opcode == 0x1B) {
-                const char* ct = dbl ? "double" : "float";
                 const int fsz = dbl ? 8 : 4;
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
                 const int lanes = bytes / fsz;
-                const std::string ity =
-                    (U ? std::string("uint") : std::string("int")) + std::to_string(fsz * 8) + "_t";
-                const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
-                const char* lo_bound = dbl ? (U ? "0.0" : "-9223372036854775808.0")
-                                           : (U ? "0.0" : "-2147483648.0");
-                const char* hi_bound = dbl ? (U ? "18446744073709551615.0"
-                                                : "9223372036854775807.0")
-                                           : (U ? "4294967295.0" : "2147483647.0");
-                const char* sat_lo = dbl ? (U ? "0ULL" : "0x8000000000000000ULL")
-                                         : (U ? "0ULL" : "0xFFFFFFFF80000000ULL");
-                const char* sat_hi = dbl ? (U ? "0xFFFFFFFFFFFFFFFFULL"
-                                              : "0x7FFFFFFFFFFFFFFFULL")
-                                         : (U ? "0xFFFFFFFFULL" : "0x7FFFFFFFULL");
-                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "]; " +
-                                uty + " _r[" + std::to_string(lanes) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
-                     "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ " + std::string(ct) +
-                     " _v=_a[_i]; ";
-                s += "if(_v!=_v) _r[_i]=(" + uty + ")0; ";
-                s += std::string("else if(!(_v > (") + ct + ")" + lo_bound + ")) _r[_i]=(" + uty +
-                     ")" + sat_lo + "; ";
-                s += std::string("else if(!(_v < (") + ct + ")" + hi_bound + ")) _r[_i]=(" + uty +
-                     ")" + sat_hi + "; ";
-                s += "else _r[_i]=(" + uty + ")(" + ity + ")_v; } ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) +
-                     "); }";
-                put(s);
+                const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+                const std::string w = std::to_string(fsz * 8);
+                put("{ " + uty + " _a[" + count + "],_r[" + count + "]={0}; memcpy(_a,c->vreg[" +
+                    std::to_string(rn) + "],16); for(int _i=0;_i<" + std::to_string(lanes) +
+                    ";_i++) _r[_i]=(" + uty + ")recomp_fp_to_int(_a[_i]," + w + "," + w + "," +
+                    (U ? "0" : "1") + "," + ((i & (1U << 23)) ? "3" : "2") +
+                    ",c->fpcr,&c->fpsr); memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
                 return true;
             }
 
@@ -6108,6 +6044,70 @@ static RECOMP_INLINE uint64_t recomp_fp_to_fixed(uint64_t bits, unsigned fp_bits
         } else {
             magnitude = mantissa >> discarded;
             inexact = (mantissa & ((UINT64_C(1) << discarded) - 1)) != 0;
+        }
+        if (magnitude > limit) invalid = 1;
+    }
+    if (negative && !is_signed && magnitude != 0) invalid = 1;
+    if (invalid) {
+        *fpsr |= UINT64_C(1);
+        return saturated;
+    }
+    if (inexact) *fpsr |= UINT64_C(16);
+    return (negative ? UINT64_C(0) - magnitude : magnitude) & integer_mask;
+}
+
+/* Convert a binary32/64 value to a signed/unsigned integer in the given
+   rounding mode (0 nearest-even, 1 toward +inf, 2 toward -inf, 3 toward zero,
+   4 nearest-away), as FCVT{N,P,M,Z,A}{S,U}: round, then saturate. IOC takes
+   precedence over IXC; FZ flushes a subnormal input to zero with IDC. */
+static RECOMP_INLINE uint64_t recomp_fp_to_int(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned is_signed, unsigned rmode,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const uint64_t exponent_mask = fp_bits == 64 ? 2047u : 255u;
+    const unsigned negative = (unsigned)((bits >> (fp_bits - 1)) & 1);
+    const unsigned exponent = (unsigned)((bits >> fraction_bits) & exponent_mask);
+    uint64_t mantissa = bits & fraction_mask;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t sign_bit = UINT64_C(1) << (int_bits - 1);
+    const uint64_t limit = is_signed ? sign_bit - (negative ? 0u : 1u) : integer_mask;
+    const uint64_t saturated = negative ? (is_signed ? sign_bit : 0) : limit;
+    uint64_t magnitude = 0;
+    unsigned inexact = 0, invalid = 0;
+    int shift;
+    if (exponent == exponent_mask) {
+        *fpsr |= UINT64_C(1); /* NaNs and infinities: invalid operation. */
+        return mantissa ? 0 : saturated;
+    }
+    if (exponent == 0) {
+        if (!mantissa) return 0; /* Both signed zeros. */
+        if (fpcr & (UINT64_C(1) << 24)) {
+            *fpsr |= UINT64_C(128); /* FZ: input-denormal, not inexact. */
+            return 0;
+        }
+    } else {
+        mantissa |= UINT64_C(1) << fraction_bits;
+    }
+    shift = (int)(exponent ? exponent : 1u) - (int)bias - (int)fraction_bits;
+    if (shift >= 0) {
+        if (shift >= 64 || mantissa > (limit >> (unsigned)shift)) invalid = 1;
+        else magnitude = mantissa << (unsigned)shift;
+    } else {
+        const unsigned discarded = (unsigned)(-shift);
+        uint64_t remainder = mantissa, half = 0; /* half 0: below one half */
+        if (discarded < 64) {
+            magnitude = mantissa >> discarded;
+            remainder = mantissa & ((UINT64_C(1) << discarded) - 1);
+            half = UINT64_C(1) << (discarded - 1);
+        }
+        inexact = remainder != 0;
+        if (inexact &&
+            ((rmode == 0 && half && (remainder > half || (remainder == half && (magnitude & 1)))) ||
+             (rmode == 4 && half && remainder >= half) || (rmode == 1 && !negative) ||
+             (rmode == 2 && negative))) {
+            ++magnitude;
         }
         if (magnitude > limit) invalid = 1;
     }
