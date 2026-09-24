@@ -325,6 +325,10 @@ inline bool EmitGuardGen() {
 // anything else runs the unchanged exact body. Off by default, and while it is
 // off the emitted text is byte-identical to what it would be without it.
 inline bool g_emit_fpx = false;
+// Instrumentation only, never timed: with g_emit_fpx, the exact body runs
+// after every fast path too, and recomp_fpx_shadow compares the two.
+inline bool g_emit_fpx_shadow = false;
+
 // Strict static exports have no fallback to carry deliberately gated forms.
 inline bool TranslateAllForExport(bool strict_static, bool explicitly_requested) {
     return strict_static || explicitly_requested;
@@ -474,11 +478,27 @@ inline std::string FpxArgs(const char* op) {
 inline std::string EmitFPNativeValue(bool dbl, const char* op) {
     if (!g_emit_fpx) return {};
     const std::string call = std::string("recomp_fpx_") + op + (dbl ? "64(" : "32(") + FpxArgs(op);
+    if (g_emit_fpx_shadow) {
+        return "do{uint64_t _fxv=0,_fxs=c->fpsr;int _fxg=RECOMP_FPX_OPEN(c),_fxk=_fxg&&" + call +
+               ",&_fxv);";
+    }
     return "do{if(RECOMP_FPX_OPEN(c)&&RECOMP_LIKELY(" + call +
            ",&_v))){RECOMP_FPX_PROBE(1);break;}RECOMP_FPX_PROBE(2);";
 }
-inline std::string EmitFPNativeSuffix(bool /*dbl*/, const char* /*op*/) {
+inline std::string EmitFPNativeSuffix(bool dbl, const char* op) {
     if (!g_emit_fpx) return {};
+    if (g_emit_fpx_shadow) {
+        static const char* const kinds[] = {"add", "sub", "mul", "div", "fma", "recps", "rsqrts", "sqrt"};
+        unsigned kind = 0;
+        while (kind < 8 && std::strcmp(kinds[kind], op)) ++kind;
+        const std::string args = FpxArgs(op);
+        const std::string first = args.substr(0, args.find(','));
+        const std::string second = args.find(',') == std::string::npos
+            ? std::string("0") : args.substr(args.find(',') + 1, args.find(',', args.find(',') + 1) -
+                                                                   args.find(',') - 1);
+        return "recomp_fpx_shadow(" + std::to_string(kind * 2 + (dbl ? 1 : 0)) +
+               "u,_fxg,_fxk,_fxv,_v,_fxs,c->fpsr," + first + "," + second + ");}while(0);";
+    }
     return "}while(0);";
 }
 
@@ -5808,8 +5828,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
               "                                        uint64_t inhibit_bit){\n"
               "  if(off_fpcr!=offsetof(GuestContext,fpcr) || off_fpsr!=offsetof(GuestContext,fpsr) ||\n"
               "     inhibit_bit!=RECOMP_FPX_INHIBIT) return 0;\n"
-              "  return 0x100u | (unsigned)RECOMP_FPX_HOST;\n"
-              "}\n";
+              "  return 0x100u | (unsigned)RECOMP_FPX_HOST"
+           << (g_emit_fpx_shadow ? " | 0x200u; /* the shadow instrumentation build */\n" : ";\n")
+           << "}\n";
     }
     ex << "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
           "/* Run a bounded sequence while control flow stays inside this module.\n"
@@ -6605,7 +6626,98 @@ static RECOMP_INLINE int recomp_fpx_sqrt64(uint64_t a, uint64_t* v) {
 )RT";
 }
 
-inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false, bool fpx = false) {
+// Instrumentation only (g_emit_fpx_shadow): the runtime half of the shadow
+// build. Per kind (op*2 + double) it counts calls, open gates, kept fast
+// results and mismatches against the exact body, which runs anyway; the first
+// 100 mismatches are logged with their operands. Counts are per thread and
+// folded into the totals every 2^20 calls; mismatches are counted at once.
+// SUYU_RECOMP_FPX_SHADOW_LOG names the log (stderr otherwise); the totals are
+// rewritten to it + ".sum" as they grow and at exit.
+inline const char* FpxShadowC() {
+    return R"RT(
+/* FPX1 shadow instrumentation (never timed). */
+#include <stdio.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_FPX_TLS __declspec(thread)
+#define RECOMP_FPX_ADD(p, v) _InterlockedExchangeAdd64((volatile long long*)(p), (long long)(v))
+#define RECOMP_FPX_OR(p, v) _InterlockedOr64((volatile long long*)(p), (long long)(v))
+#else
+#define RECOMP_FPX_TLS _Thread_local
+#define RECOMP_FPX_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
+#define RECOMP_FPX_OR(p, v) __atomic_fetch_or((p), (v), __ATOMIC_RELAXED)
+#endif
+static uint64_t g_recomp_fpx_sh[16][4];     /* calls, gate open, kept, mismatches */
+static uint64_t g_recomp_fpx_sh_fpsr, g_recomp_fpx_sh_folds;
+static RECOMP_FPX_TLS uint64_t t_recomp_fpx_sh[16][3];
+static RECOMP_FPX_TLS uint64_t t_recomp_fpx_sh_n, t_recomp_fpx_sh_or;
+static void recomp_fpx_shadow_dump(void) {
+  static const char* const names[8] = {"add","sub","mul","div","fma","recps","rsqrts","sqrt"};
+  const char* path = getenv("SUYU_RECOMP_FPX_SHADOW_LOG");
+  char sum[1024];
+  FILE* f = stderr;
+  if (path && *path) {
+    snprintf(sum, sizeof sum, "%s.sum", path);
+    f = fopen(sum, "w");
+    if (!f) return;
+  }
+  fprintf(f, "kind calls gate_open kept mismatches\n");
+  for (unsigned k = 0; k < 16; ++k)
+    fprintf(f, "%s%u %llu %llu %llu %llu\n", names[k / 2], k & 1 ? 64u : 32u,
+            (unsigned long long)g_recomp_fpx_sh[k][0], (unsigned long long)g_recomp_fpx_sh[k][1],
+            (unsigned long long)g_recomp_fpx_sh[k][2], (unsigned long long)g_recomp_fpx_sh[k][3]);
+  fprintf(f, "fpsr_seen 0x%llx\n", (unsigned long long)g_recomp_fpx_sh_fpsr);
+  if (f != stderr) fclose(f);
+}
+static void recomp_fpx_shadow_fold_counts(void) {
+  for (unsigned k = 0; k < 16; ++k)
+    for (unsigned j = 0; j < 3; ++j) {
+      RECOMP_FPX_ADD(&g_recomp_fpx_sh[k][j], t_recomp_fpx_sh[k][j]);
+      t_recomp_fpx_sh[k][j] = 0;
+    }
+  RECOMP_FPX_OR(&g_recomp_fpx_sh_fpsr, t_recomp_fpx_sh_or);
+}
+/* At exit, on the exiting thread: its own unfolded counts, then the totals. */
+static void recomp_fpx_shadow_exit(void) {
+  recomp_fpx_shadow_fold_counts();
+  recomp_fpx_shadow_dump();
+}
+static void recomp_fpx_shadow_fold(void) {
+  static int registered;
+  recomp_fpx_shadow_fold_counts();
+  if (!registered) { registered = 1; atexit(recomp_fpx_shadow_exit); }
+  if ((RECOMP_FPX_ADD(&g_recomp_fpx_sh_folds, 1) & 63) == 0) recomp_fpx_shadow_dump();
+}
+void recomp_fpx_shadow(unsigned kind, int gate, int kept, uint64_t fast, uint64_t exact,
+                       uint64_t fpsr_before, uint64_t fpsr_after, uint64_t a, uint64_t b) {
+  kind &= 15;
+  ++t_recomp_fpx_sh[kind][0];
+  t_recomp_fpx_sh[kind][1] += gate != 0;
+  t_recomp_fpx_sh[kind][2] += kept != 0;
+  if (kept && (fast != exact || fpsr_before != fpsr_after)) {
+    const uint64_t n = RECOMP_FPX_ADD(&g_recomp_fpx_sh[kind][3], 1);
+    if (n < 100) {
+      const char* path = getenv("SUYU_RECOMP_FPX_SHADOW_LOG");
+      FILE* f = path && *path ? fopen(path, "a") : stderr;
+      if (f) {
+        fprintf(f, "MISMATCH kind=%u a=%016llx b=%016llx fast=%016llx exact=%016llx fpsr %llx->%llx\n",
+                kind, (unsigned long long)a, (unsigned long long)b, (unsigned long long)fast,
+                (unsigned long long)exact, (unsigned long long)fpsr_before,
+                (unsigned long long)fpsr_after);
+        if (f != stderr) fclose(f);
+      }
+    }
+    recomp_fpx_shadow_dump();
+  }
+  t_recomp_fpx_sh_or |= fpsr_after & 0x9f;
+  /* The first call registers the exit report; then every 2^20th folds. */
+  if (!(t_recomp_fpx_sh_n++ & 0xfffff)) recomp_fpx_shadow_fold();
+}
+)RT";
+}
+
+// `fpx`: 0 off, 1 FPX1, 2 FPX1 with the shadow instrumentation.
+inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false, int fpx = 0) {
     std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
@@ -6852,7 +6964,12 @@ int  recomp_load_segments(GuestContext* c, const char* data_dir);
         // After GuestContext, before the include guard closes.
         static constexpr std::string_view guard_end = "#endif\n";
         const size_t at = text.rfind(guard_end);
-        text.insert(at, std::string(FpxH()) + FpxH64());
+        text.insert(at, std::string(FpxH()) + FpxH64() +
+                            (fpx == 2 ? "/* FPX1 shadow instrumentation build (never timed). */\n"
+                                        "void recomp_fpx_shadow(unsigned kind, int gate, int kept, uint64_t fast,\n"
+                                        "    uint64_t exact, uint64_t fpsr_before, uint64_t fpsr_after,\n"
+                                        "    uint64_t a, uint64_t b);\n"
+                                      : ""));
     }
     if (fastmem && guard_gen) {
         static constexpr std::string_view anchor = "void recomp_ic_ivau(GuestContext*,uint64_t,int);\n";
@@ -6863,15 +6980,17 @@ int  recomp_load_segments(GuestContext* c, const char* data_dir);
 
 // One cached text per variant: the first caller must not fix the variant for
 // the whole process.
+inline int FpxVariant() {
+    return g_emit_fpx ? (g_emit_fpx_shadow ? 2 : 1) : 0;
+}
 inline const char* RuntimeH() {
-    static const std::string abi5 = BuildRuntimeH(false, false, false);
-    static const std::string fastmem = BuildRuntimeH(true, false, false);
-    static const std::string guard_gen = BuildRuntimeH(true, true, false);
-    static const std::string fpx = BuildRuntimeH(true, false, true);
-    static const std::string guard_gen_fpx = BuildRuntimeH(true, true, true);
-    if (!g_emit_fastmem) return abi5.c_str();
-    if (EmitGuardGen()) return (g_emit_fpx ? guard_gen_fpx : guard_gen).c_str();
-    return (g_emit_fpx ? fpx : fastmem).c_str();
+    // [fastmem][guard_gen][fpx variant: 0 off, 1 FPX1, 2 FPX1+shadow].
+    static const std::string texts[2][2][3] = {
+        {{BuildRuntimeH(false, false, 0), BuildRuntimeH(false, false, 1), BuildRuntimeH(false, false, 2)},
+         {BuildRuntimeH(false, true, 0), BuildRuntimeH(false, true, 1), BuildRuntimeH(false, true, 2)}},
+        {{BuildRuntimeH(true, false, 0), BuildRuntimeH(true, false, 1), BuildRuntimeH(true, false, 2)},
+         {BuildRuntimeH(true, true, 0), BuildRuntimeH(true, true, 1), BuildRuntimeH(true, true, 2)}}};
+    return texts[g_emit_fastmem ? 1 : 0][EmitGuardGen() ? 1 : 0][FpxVariant()].c_str();
 }
 
 inline const char* EstimateRuntimeC() {
@@ -7769,6 +7888,13 @@ inline const char* RuntimeC() {
     static const std::string abi5 = BuildRuntimeC(false);
     static const std::string fastmem = BuildRuntimeC(true);
     static const std::string guard_gen = BuildRuntimeC(true, true);
+    static const std::string abi5_shadow = abi5 + FpxShadowC();
+    static const std::string fastmem_shadow = fastmem + FpxShadowC();
+    static const std::string guard_gen_shadow = guard_gen + FpxShadowC();
+    if (FpxVariant() == 2) {
+        return (EmitGuardGen() ? guard_gen_shadow : g_emit_fastmem ? fastmem_shadow : abi5_shadow)
+            .c_str();
+    }
     return (EmitGuardGen() ? guard_gen : g_emit_fastmem ? fastmem : abi5).c_str();
 }
 

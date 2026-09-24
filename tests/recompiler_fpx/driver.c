@@ -15,6 +15,7 @@
           driver control NAME [options]  nokeep | nomid | mxcsr: must find mismatches
           driver env   [options]      poisoned host FP mode repaired by the host shim
           driver inhibit [options]    the host kill switch (fpcr bit 32) turns FPX1 off
+          driver shadow [options]     the shadow instrumentation build against soft
    options: --cases N (L1 cases per word per FPCR), --legs 1234, --seed S,
             --shard I/N, --l4-step K, --word 0xXXXXXXXX, --adv N (L3 cases) */
 #include "rt_soft.h"
@@ -34,6 +35,7 @@ extern const FpxOpFn g_ops_soft[];
 extern const FpxOpFn g_ops_fpx[];
 extern const FpxOpFn g_ops_nokeep[];
 extern const FpxOpFn g_ops_nomid[];
+extern const FpxOpFn g_ops_shadow[];
 /* RECOMP_FPX_PROBE in ops_fpx.c: [1] fast path kept, [2] fell through. */
 unsigned long long g_fpx_probe[3];
 #endif
@@ -46,14 +48,14 @@ typedef uint64_t (*FpxHwFn)(const uint64_t*, uint64_t*, uint64_t);
 extern const FpxHwFn g_hw[];
 #endif
 
-enum { I_SOFT, I_FPX, I_NOKEEP, I_NOMID, I_HW, I_COUNT };
-static const char* const kImplNames[I_COUNT] = {"soft", "fpx", "nokeep", "nomid", "hw"};
+enum { I_SOFT, I_FPX, I_NOKEEP, I_NOMID, I_SHADOW, I_HW, I_COUNT };
+static const char* const kImplNames[I_COUNT] = {"soft", "fpx", "nokeep", "nomid", "shadow", "hw"};
 
 static int ImplAvailable(int impl) {
     switch (impl) {
     case I_SOFT: return 1;
 #ifdef FPX_HAVE_FPX
-    case I_FPX: case I_NOKEEP: case I_NOMID: return 1;
+    case I_FPX: case I_NOKEEP: case I_NOMID: case I_SHADOW: return 1;
 #endif
 #ifdef FPX_HAVE_HW
     case I_HW: return 1;
@@ -86,6 +88,7 @@ static void Run(int impl, unsigned op, const In* in, uint64_t fpcr, uint64_t fs0
     if (impl == I_FPX) fn = g_ops_fpx[op];
     if (impl == I_NOKEEP) fn = g_ops_nokeep[op];
     if (impl == I_NOMID) fn = g_ops_nomid[op];
+    if (impl == I_SHADOW) fn = g_ops_shadow[op];
 #endif
     memcpy(c->vreg[0], &in->w[0], 64);
     c->x[0] = in->w[8];
@@ -786,6 +789,13 @@ int main(int argc, char** argv) {
         /* The verdict needs every shard's count; run.py adds them up. */
         printf("CONTROL %s: %llu mismatches\n", name, bad);
         return 0;
+    }
+    if (!strcmp(mode, "shadow")) {
+        /* Shadow results are the exact body's by construction; its own
+           comparison goes to SUYU_RECOMP_FPX_SHADOW_LOG(.sum) at exit. */
+        ParseOpts(argc, argv, 2, &o);
+        const int c[] = {I_SHADOW};
+        return Diff(&o, I_SOFT, c, 1, 0, 0, 0) ? 1 : 0;
     }
     if (!strcmp(mode, "inhibit")) {
         /* With bit 32 of fpcr set every op must take the exact body: same

@@ -118,5 +118,15 @@ int main(int argc, char** argv) {
         !Ops(dir, "nokeep", "rt_nokeep.h") || !Ops(dir, "nomid", "rt_nomid.h")) {
         return 1;
     }
+    // The shadow instrumentation build: exact results always, with the fast
+    // path compared behind them (recomp_fpx_shadow, from the runtime C).
+    suyu::recomp::g_emit_fpx_shadow = true;
+    if (!Write(dir / "rt_shadow.h", suyu::recomp::RuntimeH()) ||
+        !Write(dir / "shadow_rt.c",
+               "#include \"rt_shadow.h\"\n#include <stdlib.h>\n" +
+                   std::string(suyu::recomp::FpxShadowC())) ||
+        !Ops(dir, "shadow", "rt_shadow.h")) {
+        return 1;
+    }
     return 0;
 }

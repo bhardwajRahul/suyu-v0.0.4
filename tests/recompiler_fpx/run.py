@@ -109,6 +109,20 @@ def main():
             print("".join(line + "\n" for line in result.stdout.splitlines()
                           if line.startswith("INHIBIT")), end="")
             status |= result.returncode != 0
+            # The shadow instrumentation: exact results, and its own count of
+            # fast-path mismatches must be 0 with fast-path hits recorded.
+            shadow_log = logs / "shadow.log"
+            env = dict(os.environ, SUYU_RECOMP_FPX_SHADOW_LOG=str(shadow_log))
+            result = subprocess.run([str(driver), "shadow", "--legs", "13", *common], check=False,
+                                    capture_output=True, text=True, env=env, **low_priority())
+            summary = Path(str(shadow_log) + ".sum")
+            rows = [line.split() for line in summary.read_text().splitlines()[1:]
+                    if line and not line.startswith("fpsr")] if summary.is_file() else []
+            kept = sum(int(row[3]) for row in rows)
+            shadow_bad = sum(int(row[4]) for row in rows)
+            print(f"SHADOW exact-result mismatches {'none' if result.returncode == 0 else 'FOUND'}, "
+                  f"fast results kept {kept}, fast-vs-exact mismatches {shadow_bad}")
+            status |= result.returncode != 0 or not rows or kept == 0 or shadow_bad != 0
             # L6(d): the same poisoning, repaired by the host's own check first.
             result = subprocess.run([str(driver), "env", "--legs", "13", *common], check=False,
                                     capture_output=True, text=True, **low_priority())
