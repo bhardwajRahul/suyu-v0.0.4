@@ -463,10 +463,12 @@ inline std::string Xsp(u32 r) {
 // natively and answers 0 unless the result is provably exact (see the FPX1
 // block of the runtime header); the exact body is the fallback. The prefix
 // opens a do{ ... }while(0) whose break skips the exact body, and
-// EmitFPNativeSuffix closes it. `op` names the helper: add, sub, mul, div
-// or fma.
+// EmitFPNativeSuffix closes it. `op` names the helper: add, sub, mul, div,
+// fma, recps, rsqrts (raw inputs _aa/_bb) or sqrt (input _a).
 inline std::string FpxArgs(const char* op) {
     if (!std::strcmp(op, "fma")) return "_a,_b,_z";
+    if (!std::strcmp(op, "recps") || !std::strcmp(op, "rsqrts")) return "_aa,_bb";
+    if (!std::strcmp(op, "sqrt")) return "_a";
     return "_a,_b";
 }
 inline std::string EmitFPNativeValue(bool dbl, const char* op) {
@@ -721,7 +723,8 @@ inline std::string EmitFPStepValue(bool dbl, bool half) {
             (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
             (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
             // FPNeg precedes NaN processing in the architectural pseudocode.
-            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
+            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;"+EmitFPNativeValue(dbl,half?"rsqrts":"recps")+
+            "unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
             "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
             "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
             "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
@@ -766,7 +769,7 @@ inline std::string EmitFPStepValue(bool dbl, bool half) {
             "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
             "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
             "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
-            "if(_negative)_v|=_sign;}}}";
+            "if(_negative)_v|=_sign;}}}"+EmitFPNativeSuffix(dbl,half?"rsqrts":"recps");
     return s;
 }
 
@@ -3404,7 +3407,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 "],16); memcpy(_m,c->vreg[" + std::to_string(rm) + "],16);");
             put("for(unsigned _lane=0;_lane<" + std::to_string(lanes) +
                 ";++_lane) { uint64_t _a=_n[_lane],_b=" +
-                std::string(sqrt_vec ? "0" : "_m[_lane]") + ",_v=0;"
+                std::string(sqrt_vec ? "0" : "_m[_lane]") + ",_v=0;" +
+                (sqrt_vec ? EmitFPNativeValue(dbl, "sqrt") : std::string()) +
                 " const unsigned _f=" + (dbl ? "52" : "23") + "; const uint64_t _hidden=1ULL<<_f,"
                 " _frac=_hidden-1,_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
                 ",_sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
@@ -3442,7 +3446,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             } else {
                 put("else " + EmitFPAddSubValue(dbl, true));
             }
-            put("_r[_lane]=(" + ct + ")(_v" + (sqrt_vec ? std::string("") : "&~_sign") +
+            put((sqrt_vec ? EmitFPNativeSuffix(dbl, "sqrt") : std::string()) +
+                "_r[_lane]=(" + ct + ")(_v" + (sqrt_vec ? std::string("") : "&~_sign") +
                 "); } memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
             return true;
         }
