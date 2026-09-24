@@ -6200,12 +6200,29 @@ inline const char* GuardGenH() {
 #else
 #error "GG1 needs 32-bit atomic loads, stores and fences"
 #endif
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_GG_COLD __attribute__((cold))
+#define RECOMP_GG_STATIC static inline
+#else
+#define RECOMP_GG_COLD
+#define RECOMP_GG_STATIC static __inline
+#endif
 extern uint32_t g_recomp_gg_word;
 extern uint32_t g_recomp_gg_seen[];
 void recomp_code_guard_gen(GuestContext*,uint64_t,const uint32_t*,uint32_t,int,uint32_t*,uint32_t);
-#define RECOMP_GG_GUARD(off,exp,n,idx) { uint32_t _g=RECOMP_GG_LOAD(g_recomp_gg_word); \
-  if(RECOMP_GG_LOAD(g_recomp_gg_seen[idx])!=_g) \
-    recomp_code_guard_gen(c,g_module_base+(off),exp,n,g_recomp_guard_host_v2,&g_recomp_gg_seen[idx],_g); }
+/* The miss path, one private copy per translation unit, so a block's call
+   carries four register arguments: the module-relative PC and the word count
+   travel packed as off | n << 40. The generation is loaded here, before
+   recomp_code_guard_gen's acquire fence; a value newer than the one the block
+   compared is equally valid to record. */
+RECOMP_GG_STATIC RECOMP_NOINLINE RECOMP_GG_COLD void recomp_gg_miss(GuestContext* c,uint32_t idx,
+    const uint32_t* exp,uint64_t off_n){
+  recomp_code_guard_gen(c,g_module_base+(off_n&UINT64_C(0xFFFFFFFFFF)),exp,(uint32_t)(off_n>>40),
+                        g_recomp_guard_host_v2,&g_recomp_gg_seen[idx],RECOMP_GG_LOAD(g_recomp_gg_word));
+}
+#define RECOMP_GG_GUARD(off,exp,n,idx) \
+  if(RECOMP_GG_LOAD(g_recomp_gg_seen[idx])!=RECOMP_GG_LOAD(g_recomp_gg_word)) \
+    recomp_gg_miss(c,idx,exp,((uint64_t)(n)<<40)|(off));
 )RT";
 }
 
