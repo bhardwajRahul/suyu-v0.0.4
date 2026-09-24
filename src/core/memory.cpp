@@ -22,6 +22,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/arm/recomp/recomp_guard_gen.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
@@ -62,6 +63,8 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+        // A new process: recompiled blocks re-verify (ABI 6 GG1).
+        Core::RecompGuardGen::OnPageTableSwap();
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -73,6 +76,13 @@ struct Memory::Impl {
                    GetInteger(target));
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
                  Common::PageType::Memory);
+        // ABI 6 GG1: a mapping over recompiled code, or of its physical pages
+        // anywhere else, ends that module's generation skipping.
+        if (Core::RecompGuardGen::Watching()) {
+            Core::RecompGuardGen::OnMap(page_table.entries.data(), GetInteger(base), size,
+                                        GetInteger(target),
+                                        True(perms & Common::MemoryPermission::Write));
+        }
 
         if (current_page_table->fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
@@ -85,6 +95,9 @@ struct Memory::Impl {
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
                  Common::PageType::Unmapped);
+        if (Core::RecompGuardGen::Watching()) {
+            Core::RecompGuardGen::OnUnmap(page_table.entries.data(), GetInteger(base), size);
+        }
 
         if (current_page_table->fastmem_arena) {
             host_buffer->Unmap(GetInteger(base), size, separate_heap);
@@ -95,6 +108,13 @@ struct Memory::Impl {
                        Common::MemoryPermission perms) {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
+
+        // Before the fastmem early-out: the recompiler needs every permission
+        // change on its code (ABI 6 GG1), fastmem arena or not.
+        if (Core::RecompGuardGen::Watching()) {
+            Core::RecompGuardGen::OnProtect(page_table.entries.data(), vaddr, size,
+                                            True(perms & Common::MemoryPermission::Write));
+        }
 
         if (!current_page_table->fastmem_arena) {
             return;

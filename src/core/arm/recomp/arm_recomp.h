@@ -8,8 +8,10 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "core/arm/arm_interface.h"
+#include "core/arm/recomp/recomp_guard_gen.h"
 
 namespace Kernel {
 class KProcess;
@@ -71,6 +73,13 @@ RecompFastmemLayout GetRecompFastmemLayout();
 /// SUYU_RECOMP_FASTMEM=0 still keeps the fast path off at run time.
 void SetRecompFastmemReady(bool ready);
 bool IsRecompFastmemReady();
+
+/// ABI 6 feature GG1 (generation code guard). The loader calls this after
+/// SetRecompLookup, with what each GG1 module's recomp_image_guard_gen_v1
+/// returned, and before the process is created. The guard only engages with
+/// guard-v2 negotiated and without SUYU_RECOMP_GUARD_GEN=0; otherwise every
+/// module verifies on every entry. Returns whether it engaged.
+bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules);
 
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by

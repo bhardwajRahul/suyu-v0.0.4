@@ -348,6 +348,11 @@ const bool kFastmemDisabled = [] {
     const char* e = std::getenv("SUYU_RECOMP_FASTMEM");
     return e && *e == '0';
 }();
+// ABI 6 GG1. SUYU_RECOMP_GUARD_GEN=0 keeps every module on the per-entry check.
+const bool kGuardGenDisabled = [] {
+    const char* e = std::getenv("SUYU_RECOMP_GUARD_GEN");
+    return e && *e == '0';
+}();
 std::atomic<u64> g_forced_cutoff_pc{0};
 std::atomic<u64> g_forced_cutoff_blocks{0};
 
@@ -617,6 +622,18 @@ void WriteRecompCoverageFile(const std::string& text) {
 // Diagnostics are sampled synchronously by the owning CPU interface.
 // No detached worker may retain a KProcess or walk a live thread list.
 void ReportRecompCoverage() {
+    if (const auto gg = RecompGuardGen::GetStats(); gg.modules != 0) {
+        using R = RecompGuardGen::Reason;
+        const auto n = [&gg](R r) { return gg.bumps[static_cast<unsigned>(r)]; };
+        LOG_INFO(Core_ARM,
+                 "recomp generation guard: enabled={} active={} generation={} modules={} "
+                 "sticky={} bumps: activate={} map={} unmap={} protect={} device={} "
+                 "invalidate={} invalidate_all={} new_table={} map_log={}{}",
+                 gg.enabled, gg.active, gg.generation, gg.modules, gg.sticky, n(R::Activate),
+                 n(R::Map), n(R::Unmap), n(R::Protect), n(R::DeviceMap), n(R::Invalidate),
+                 n(R::InvalidateAll), n(R::PageTableSwap), gg.map_log,
+                 gg.map_log_overflow ? " (overflowed)" : "");
+    }
     const std::string report = FormatRecompCoverage();
     if (report.empty()) {
         return;
@@ -663,6 +680,8 @@ void SetRecompLookup(RecompLookupFn lookup) {
     std::scoped_lock lock{g_process_init_lock};
     g_code_guard_ready.store(false, std::memory_order_release);
     g_fastmem_ready.store(false, std::memory_order_release);
+    // The previous bundle's images may be unloaded; drop them untouched.
+    RecompGuardGen::Forget();
     g_recomp_lookup.store(lookup, std::memory_order_release);
 }
 
@@ -694,6 +713,19 @@ void SetRecompFastmemReady(bool ready) {
 
 bool IsRecompFastmemReady() {
     return g_fastmem_ready.load(std::memory_order_acquire);
+}
+
+bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules) {
+    const bool enabled = !kGuardGenDisabled && !modules.empty() &&
+                         g_code_guard_ready.load(std::memory_order_acquire);
+    const size_t count = modules.size();
+    RecompGuardGen::SetModules(std::move(modules), enabled);
+    if (count != 0) {
+        LOG_INFO(Core_ARM, "Recompiled generation code guard: {} ({} module(s){})",
+                 enabled ? "negotiated" : "verify on every entry", count,
+                 kGuardGenDisabled ? ", disabled by SUYU_RECOMP_GUARD_GEN=0" : "");
+    }
+    return enabled;
 }
 
 void SetRecompBaseSetter(RecompBaseFn setter) {
@@ -864,6 +896,56 @@ struct ArmRecomp::Impl {
             ctx.fm_table = static_cast<const u8*>(bridge.page_entries);
             ctx.fm_limit = bridge.address_space_max & ~u64{0xfff};
         }
+    }
+
+    /// ABI 6 GG1 activation for `process`. A module may skip its per-entry check
+    /// only if every page of its guarded span is mapped without guest write
+    /// permission; the physical pages behind that span are handed over for the
+    /// alias check. See RecompGuardGen::Activate.
+    void ActivateGuardGen(Kernel::KProcess& process, u64 key) {
+        auto& page_table = process.GetPageTable();
+        const Common::PageTable& table = page_table.GetImpl();
+        const auto probe = [&](u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) {
+            const u64 end = va + size;
+            for (u64 addr = va & ~u64{Memory::YUZU_PAGEMASK}; addr < end;) {
+                Kernel::KMemoryInfo info{};
+                Kernel::Svc::PageInfo page_info{};
+                if (page_table.QueryInfo(&info, &page_info, addr) != ResultSuccess ||
+                    info.GetEndAddress() <= addr) {
+                    return false;
+                }
+                const auto user_write = static_cast<Kernel::KMemoryPermission>(
+                    Kernel::Svc::MemoryPermission::Write);
+                if (False(info.GetState() & Kernel::KMemoryState::FlagMapped) ||
+                    True(info.GetPermission() & user_write)) {
+                    return false;
+                }
+                addr = info.GetEndAddress();
+            }
+            for (u64 page = va & ~u64{Memory::YUZU_PAGEMASK}; page < end;
+                 page += Memory::YUZU_PAGESIZE) {
+                Common::PhysicalAddress pa{};
+                if (!table.GetPhysicalAddress(&pa, page) ||
+                    table.entries[page >> Memory::YUZU_PAGEBITS].ptr.Type() ==
+                        Common::PageType::Unmapped) {
+                    return false;
+                }
+                const u64 phys = GetInteger(pa);
+                if (!runs.empty() && runs.back().first + runs.back().second == phys) {
+                    runs.back().second += Memory::YUZU_PAGESIZE;
+                } else {
+                    runs.emplace_back(phys, Memory::YUZU_PAGESIZE);
+                }
+            }
+            return true;
+        };
+        RecompGuardGen::Activate(key, process.GetMemory().GetPageTableView().entries, probe);
+        const auto stats = RecompGuardGen::GetStats();
+        LOG_INFO(Core_ARM,
+                 "recomp generation guard: process {} active={} generation={}; {} of {} "
+                 "module(s) verify on every entry",
+                 process.GetProcessId(), stats.active, stats.generation, stats.sticky,
+                 stats.modules);
     }
 
     /// The same source DynarmicCallbacks64::GetCNTPCT uses, so a guest thread
@@ -1659,6 +1741,18 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         }
     }
 
+    // ABI 6 GG1: the first run of each process decides which modules may skip
+    // their per-entry check. Module bases are set by now (above, or by the
+    // explicit prepare callback), and no block of this process has run yet.
+    if (RecompGuardGen::Watching()) {
+        if (auto* process = thread->GetOwnerProcess()) {
+            const u64 key = process->GetProcessId() | (u64{1} << 63);
+            if (!RecompGuardGen::IsActive(key)) {
+                impl->ActivateGuardGen(*process, key);
+            }
+        }
+    }
+
     if (kRelaPolicy == "restore-on-main" && !g_rela_restored.load(std::memory_order_acquire) &&
         impl->PcInMainModule(impl->ctx.pc)) {
         // Ordering this relies on: rtld is the process entrypoint, and the NSO
@@ -2196,14 +2290,16 @@ void ArmRecomp::ClearInstructionCache() {
 #ifndef SUYU_NO_JIT
     if (impl->fallback) impl->fallback->ClearInstructionCache();
 #endif
-    // Generated ABI 5 blocks verify bytes on every entry.
+    // ABI 5 blocks verify bytes on every entry; GG1 blocks do once the
+    // generation moves.
+    RecompGuardGen::OnInvalidateAll();
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
 #ifndef SUYU_NO_JIT
     if (impl->fallback) impl->fallback->InvalidateCacheRange(addr, size);
 #endif
-    // Generated ABI 5 blocks verify bytes on every entry.
+    RecompGuardGen::OnInvalidate(addr, size);
 }
 
 void ArmRecomp::GetContext(Kernel::Svc::ThreadContext& ctx) const {
