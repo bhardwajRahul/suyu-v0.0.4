@@ -3657,19 +3657,25 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         return true;
     }
 
-    // Vector integral rounding, using integer IEEE-754 fields so guest rounding
-    // and subnormal modes do not depend on the host floating-point environment.
+    // Vector and scalar integral rounding (FRINT{N,P,M,Z,A,X,I}), using integer
+    // IEEE-754 fields so guest rounding and subnormal modes do not depend on
+    // the host floating-point environment.
     {
         const u32 key = i & 0xBFBFFC00;
+        const u32 sop = (i >> 15) & 0x3F;
+        const bool scalar = (i & 0xFFA07C00) == 0x1E204000 && ((sop >= 8 && sop <= 12) || sop == 14 || sop == 15);
         const bool rounding = key == 0x0E218800 || key == 0x0EA18800 ||
             key == 0x0E219800 || key == 0x0EA19800 || key == 0x2E218800 ||
             key == 0x2E219800 || key == 0x2EA19800;
         const bool dbl = (i & (1U << 22)) != 0, q = (i & (1U << 30)) != 0;
-        if (rounding && (!dbl || q)) {
+        if ((rounding && (!dbl || q)) || scalar) {
             const unsigned rd = i & 31, rn = (i >> 5) & 31;
-            const unsigned lanes = dbl ? 2 : 4, active = q ? lanes : lanes / 2;
+            const unsigned lanes = dbl ? 2 : 4, active = scalar ? 1 : q ? lanes : lanes / 2;
             const std::string ct = dbl ? "uint64_t" : "uint32_t";
-            const std::string mode = key == 0x0E218800 ? "0" : key == 0x0EA18800 ? "1" :
+            const bool exact_flag = scalar ? sop == 14 : key == 0x2E219800;  // FRINTX
+            const std::string mode = scalar
+                ? (sop <= 12 ? std::to_string(sop - 8) : std::string("((c->fpcr>>22)&3)"))
+                : key == 0x0E218800 ? "0" : key == 0x0EA18800 ? "1" :
                 key == 0x0E219800 ? "2" : key == 0x0EA19800 ? "3" :
                 key == 0x2E218800 ? "4" : "((c->fpcr>>22)&3)";
             put("{ " + ct + " _src[" + std::to_string(lanes) + "],_dst[" +
@@ -3698,7 +3704,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 " _up=_lost&&(_mode==0?(_lost>(_unit>>1)||(_lost==(_unit>>1)&&(_a&_unit))):"
                 " _mode==4?_lost>=(_unit>>1):_mode==1?!(_v&_sign):_mode==2?!!(_v&_sign):0);"
                 " _r=(_v&_sign)|((_a&~_mask)+(_up?_unit:0)); } }");
-            if (key == 0x2E219800) put("if(_r!=_v) c->fpsr|=16;");
+            if (exact_flag) put("if(_r!=_v) c->fpsr|=16;");
             put("} _dst[_j]=(" + ct + ")_r; } memcpy(c->vreg[" +
                 std::to_string(rd) + "],_dst,16); }");
             return true;
@@ -3825,7 +3831,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
             }
 
-            // One-source: FMOV/FABS/FNEG/FSQRT (opcode in bits 20..15 low bits).
+            // One-source: FMOV/FABS/FNEG (opcode in bits 20..15 low bits).
+            // FSQRT and FRINT* are decoded exactly above.
             if (((i >> 10) & 0x1F) == 0x10) {
                 const u32 opcode = (i >> 15) & 0x3F;
                 std::string expr;
@@ -3833,15 +3840,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 case 0: expr = "_a"; break;                             // FMOV
                 case 1: expr = dbl ? "fabs(_a)" : "fabsf(_a)"; break;   // FABS
                 case 2: expr = "-_a"; break;                            // FNEG
-                // FRINTN, FRINTX and FRINTI all round to nearest-even under the
-                // default FPCR, which is the only mode the exported code runs in.
-                case 8:
-                case 14:
-                case 15: expr = dbl ? "nearbyint(_a)" : "nearbyintf(_a)"; break;
-                case 9: expr = dbl ? "ceil(_a)" : "ceilf(_a)"; break;    // FRINTP
-                case 10: expr = dbl ? "floor(_a)" : "floorf(_a)"; break; // FRINTM
-                case 11: expr = dbl ? "trunc(_a)" : "truncf(_a)"; break; // FRINTZ
-                case 12: expr = dbl ? "round(_a)" : "roundf(_a)"; break; // FRINTA
                 default: break;
                 }
                 if (!expr.empty()) {
