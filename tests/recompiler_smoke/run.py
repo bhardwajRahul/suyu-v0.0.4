@@ -11,6 +11,9 @@ import tempfile
 # the fast-path emit option off. That output must stay byte-identical to ABI 5;
 # update this only for a deliberate ABI 5 emitter change, never for ABI 6 work.
 ABI5_GOLDEN = "47c1c658fd35fa91b9a0f92c72268ca8e6f8ed87f1b28a12f58ddaa9936a95ee"
+# The same for ABI 6 (FM1) with the generation guard option off, taken from the
+# e0dfeae093 emitter. GG1 work must never change it.
+ABI6_GOLDEN = "9a7689e833d7b364fd103d2b5c83729d6bb0acc8dc33afa10a86defedf80965f"
 
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}
@@ -44,6 +47,9 @@ def check_outputs(abi5, abi6):
     actual = tree_hash(abi5)
     if actual != ABI5_GOLDEN:
         raise RuntimeError(f"ABI 5 output changed: {actual} != {ABI5_GOLDEN}")
+    actual = tree_hash(abi6)
+    if actual != ABI6_GOLDEN:
+        raise RuntimeError(f"ABI 6 output changed: {actual} != {ABI6_GOLDEN}")
     files5 = sorted(p.relative_to(abi5) for p in abi5.rglob("*") if p.is_file())
     files6 = sorted(p.relative_to(abi6) for p in abi6.rglob("*") if p.is_file())
     if files5 != files6:
@@ -93,6 +99,7 @@ def main():
             generated[name].mkdir()
             env = dict(os.environ)
             env.pop("SUYU_RECOMP_AB_FASTMEM", None)
+            env.pop("SUYU_RECOMP_AB_GUARD_GEN", None)
             if fastmem:
                 env["SUYU_RECOMP_AB_FASTMEM"] = fastmem
             call([exporter, generated[name]], env=env)

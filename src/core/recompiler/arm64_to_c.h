@@ -308,6 +308,17 @@ inline bool g_translate_all = false;
 // tests/recompiler_smoke checks against a golden hash.
 inline bool g_emit_fastmem = false;
 
+// ABI 6 feature GG1: blocks re-run the code guard only when their module's
+// generation word has moved since they last passed it, instead of on every
+// entry. An extension of ABI 6, so it takes effect only together with
+// g_emit_fastmem. Off by default; while it is off the ABI 5 and ABI 6 texts are
+// byte-identical to what they were before it existed (golden hashes in
+// tests/recompiler_smoke).
+inline bool g_emit_guard_gen = false;
+inline bool EmitGuardGen() {
+    return g_emit_fastmem && g_emit_guard_gen;
+}
+
 // Strict static exports have no fallback to carry deliberately gated forms.
 inline bool TranslateAllForExport(bool strict_static, bool explicitly_requested) {
     return strict_static || explicitly_requested;
