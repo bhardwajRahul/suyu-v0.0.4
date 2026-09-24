@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/logging/log.h"
+#include "common/page_table.h"
 #include "common/string_util.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
@@ -73,6 +74,13 @@ struct GuestContextView {
     // heap bookkeeping this view does not model, so a field appended after that
     // point would be at a different offset on each side.
     int chain_budget;
+    // ABI 6 (FM1): the page table and a page-aligned limit below which the
+    // generated memory helpers may read the table directly. fm_limit 0 keeps
+    // them on the ABI 5 path. ABI 5 modules end their view at chain_budget and
+    // never read these.
+    u32 fm_reserved;
+    const u8* fm_table;
+    u64 fm_limit;
 };
 
 // Matches RecompHostMem in the generated runtime. The recompiled code calls
@@ -138,6 +146,14 @@ static_assert(offsetof(GuestContextView, pending_svc) == 304);
 static_assert(offsetof(GuestContextView, vreg) == 312);
 static_assert(offsetof(GuestContextView, tpidr_el0) == 824);
 static_assert(offsetof(GuestContextView, chain_budget) == 864);
+static_assert(offsetof(GuestContextView, fm_table) == 872);
+static_assert(offsetof(GuestContextView, fm_limit) == 880);
+// The FM1 helpers fold the page table layout in as constants
+// (RECOMP_FM_PAGE_BITS, RECOMP_FM_STRIDE_LOG2, RECOMP_FM_PTR_MASK). A change
+// here must fail the build, not misread the table.
+static_assert(sizeof(Common::PageTable::PageEntryData) == 32);
+static_assert(Common::PageTable::ATTRIBUTE_BITS == 2);
+static_assert(Memory::YUZU_PAGEBITS == 12);
 
 // Blocks a chain of direct calls may run before returning here. Only this side
 // sets it - the generated code just decrements - so the emitter does not need
