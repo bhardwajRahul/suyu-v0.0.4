@@ -1271,13 +1271,13 @@ void GameExportDialog::RefreshUpdateStatus() {
     }
     // Save data, shaders and per-game config are all keyed by title ID; the library may not
     // supply one (cartridge dumps, browsed files), so read it the same way the Update row does.
+    // Only disable them: the dialog can refresh before the game is known, and unticking
+    // here left save data, shaders and config out of every later export. The export
+    // itself skips portable data when there is no title ID.
     const bool allow_portable_data = SelectedProgramId() != 0;
     for (QCheckBox* box : {include_save_data_checkbox, include_shader_cache_checkbox,
                            include_custom_config_checkbox}) {
         box->setEnabled(allow_portable_data);
-        if (!allow_portable_data) {
-            box->setChecked(false);
-        }
     }
     QString version;
     QString source;
