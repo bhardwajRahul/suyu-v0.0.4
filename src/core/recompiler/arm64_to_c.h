@@ -3351,18 +3351,19 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         return true;
     }
 
-    // FSQRT vector and FABD vector/scalar, S/D. Integer significands make
-    // rounding independent of host FP modes. Baseline DN/FZ/RMode and FPSR
-    // flags are supported; FP access/exception traps and FEAT_AFP are not.
+    // FSQRT vector/scalar and FABD vector/scalar, S/D. Integer significands
+    // make rounding independent of host FP modes. Baseline DN/FZ/RMode and
+    // FPSR flags are supported; FP access/exception traps and FEAT_AFP are not.
     {
-        const bool sqrt_vec = (i & 0xBFBFFC00) == 0x2EA1F800;
+        const bool sqrt_scalar = (i & 0xFFBFFC00) == 0x1E21C000;
+        const bool sqrt_vec = (i & 0xBFBFFC00) == 0x2EA1F800 || sqrt_scalar;
         const bool abd_vec = (i & 0xBFA0FC00) == 0x2EA0D400;
         const bool abd_scalar = (i & 0xFFA0FC00) == 0x7EA0D400;
         const bool dbl = ((i >> 22) & 1) != 0;
         const bool q = ((i >> 30) & 1) != 0;
-        if (((sqrt_vec || abd_vec) && (!dbl || q)) || abd_scalar) {
+        if (((sqrt_vec || abd_vec) && (!dbl || q || sqrt_scalar)) || abd_scalar) {
             const unsigned rd = i & 31, rn = (i >> 5) & 31, rm = (i >> 16) & 31;
-            const unsigned lanes = abd_scalar ? 1 : (q ? 16 : 8) / (dbl ? 8 : 4);
+            const unsigned lanes = abd_scalar || sqrt_scalar ? 1 : (q ? 16 : 8) / (dbl ? 8 : 4);
             const std::string ct = dbl ? "uint64_t" : "uint32_t";
             put("{ " + ct + " _n[" + std::string(dbl ? "2" : "4") + "],_m[" +
                 (dbl ? "2" : "4") + "],_r[" + (dbl ? "2" : "4") +
@@ -3835,7 +3836,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 case 0: expr = "_a"; break;                             // FMOV
                 case 1: expr = dbl ? "fabs(_a)" : "fabsf(_a)"; break;   // FABS
                 case 2: expr = "-_a"; break;                            // FNEG
-                case 3: expr = dbl ? "sqrt(_a)" : "sqrtf(_a)"; break;   // FSQRT
                 // FRINTN, FRINTX and FRINTI all round to nearest-even under the
                 // default FPCR, which is the only mode the exported code runs in.
                 case 8:
