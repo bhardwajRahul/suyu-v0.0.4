@@ -6951,8 +6951,8 @@ namespace {
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
 constexpr unsigned CurrentRecompImageAbi = 5;
-// ABI 6 is ABI 5 plus the FM1 page-table fast path; exports produce it only
-// when SUYU_AOT_FASTMEM is set. A bundle is one ABI or the other, never mixed.
+// ABI 6 is ABI 5 plus the FM1 page-table fast path; exports produce it unless
+// SUYU_AOT_FASTMEM=0. A bundle is one ABI or the other, never mixed.
 constexpr unsigned FastmemRecompImageAbi = 6;
 
 // Off unless asked for: this sits on the dispatch path, which runs tens of

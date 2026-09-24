@@ -2657,22 +2657,26 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         backend == RecompileBackend::SuyuStatic,
         !qEnvironmentVariableIsEmpty("SUYU_AOT_TRANSLATE_ALL"));
     suyu::recomp::g_translate_all = translate_all;
-    // ABI 6 (FM1) page-table fast path for guest memory access. Off by default,
-    // which keeps exports byte-identical to ABI 5.
-    suyu::recomp::g_emit_fastmem = qEnvironmentVariable("SUYU_AOT_FASTMEM") == QStringLiteral("1");
-    // ABI 6 feature GG1, the generation code guard. An ABI 6 feature, so it
-    // needs SUYU_AOT_FASTMEM=1 as well; off by default.
-    suyu::recomp::g_emit_guard_gen =
-        qEnvironmentVariable("SUYU_AOT_GUARD_GEN") == QStringLiteral("1");
+    // ABI 6 is the default: the FM1 page-table fast path for guest memory, the
+    // GG1 generation code guard and FPX1 exact native FP. Together they more
+    // than doubled the MK8D race on Windows (clang-cl: 34.6 -> 56.3 fps) with
+    // identical results. Setting one to 0 leaves it out; SUYU_AOT_FASTMEM=0
+    // gives ABI 5 output, byte-identical to earlier releases.
+    const auto enabled = [](const char* name) {
+        return qEnvironmentVariable(name) != QStringLiteral("0");
+    };
+    suyu::recomp::g_emit_fastmem = enabled("SUYU_AOT_FASTMEM");
+    // GG1 and FPX1 are ABI 6 features, so they need FM1.
+    suyu::recomp::g_emit_guard_gen = enabled("SUYU_AOT_GUARD_GEN");
     if (suyu::recomp::g_emit_guard_gen && !suyu::recomp::g_emit_fastmem) {
-        LOG_WARNING(Frontend, "SUYU_AOT_GUARD_GEN=1 needs SUYU_AOT_FASTMEM=1; exporting without "
-                              "the generation code guard");
+        LOG_WARNING(Frontend, "The generation code guard needs SUYU_AOT_FASTMEM; exporting "
+                              "without it");
+        suyu::recomp::g_emit_guard_gen = false;
     }
-    // ABI 6 feature FPX1, exact native FP. Off by default; it needs FM1, since
-    // hosts accept ABI 6 images only with it.
-    suyu::recomp::g_emit_fpx = qEnvironmentVariable("SUYU_AOT_FPX") == QStringLiteral("1");
+    suyu::recomp::g_emit_fpx = enabled("SUYU_AOT_FPX");
     if (suyu::recomp::g_emit_fpx && !suyu::recomp::g_emit_fastmem) {
-        LOG_WARNING(Frontend, "SUYU_AOT_FPX=1 needs SUYU_AOT_FASTMEM=1; exporting without FPX1");
+        LOG_WARNING(Frontend, "Exact native FP (FPX1) needs SUYU_AOT_FASTMEM; exporting "
+                              "without it");
         suyu::recomp::g_emit_fpx = false;
     }
     // What the images will report from recomp_image_features(), recorded in the
