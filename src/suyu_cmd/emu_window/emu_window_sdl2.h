@@ -56,11 +56,16 @@ public:
     // Sets the window icon from suyu.bmp
     void SetWindowIcon();
 
-    /// Shows precompile progress in the title bar during the boot-time shader cache load
-    /// (see the LoadDiskResources call in suyu.cpp). That call blocks before the main loop
-    /// starts pumping events, so without this a long precompile looks like a frozen window
-    /// instead of visible progress. Throttled internally; safe to call for every pipeline.
-    void SetBuildProgressTitle(std::size_t built, std::size_t total);
+    /// Boot-time shader precompile progress (see LoadDiskResources in suyu.cpp): the title
+    /// bar everywhere, plus a progress bar window on Windows. Main thread only; the
+    /// precompile itself runs on another thread and only reports counts.
+    void ShowBuildProgress(std::size_t built, std::size_t total);
+    void HideBuildProgress();
+
+    /// Pumps window events while the main loop isn't running yet, so the window keeps
+    /// responding. Returns false once the player has asked to close the window; the
+    /// request stays queued for the main loop.
+    bool PumpEventsWhileLoading();
 
 protected:
     /// Called by WaitEvent when a key is pressed or released.
@@ -121,6 +126,10 @@ protected:
 
     /// Internal SDL2 render window
     SDL_Window* render_window{};
+
+    /// Boot shader precompile progress window (Windows HWND), or null.
+    void* build_progress_window{};
+    u64 last_build_title_ticks = 0;
 
     /// Keeps track of how often to update the title bar during gameplay
     u64 last_time = 0;

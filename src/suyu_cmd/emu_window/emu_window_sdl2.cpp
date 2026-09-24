@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cwchar>
 #include <set>
 #include <string>
 #include <vector>
@@ -1096,26 +1097,116 @@ void EmuWindow_SDL2::WaitEvent() {
     }
 }
 
-void EmuWindow_SDL2::SetBuildProgressTitle(std::size_t built, std::size_t total) {
-    static u64 last_update_ticks = 0;
-    const u64 now = SDL_GetTicks();
-    // Always show the first and last update; throttle the ones in between so thousands of
-    // pipelines don't turn into thousands of SetWindowTitle calls.
-    if (built != 0 && built != total && now < last_update_ticks + 100) {
-        return;
-    }
-    last_update_ticks = now;
+#ifdef _WIN32
+namespace {
+// What the progress window paints. Written and read on the main thread only.
+std::size_t g_build_progress_built = 0;
+std::size_t g_build_progress_total = 0;
 
-    char title[64];
-    if (total == 0) {
-        std::snprintf(title, sizeof(title), "Loading...");
-    } else {
-        std::snprintf(title, sizeof(title), "Building shaders %zu/%zu", built, total);
+LRESULT CALLBACK BuildProgressProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg != WM_PAINT) {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
-    SDL_SetWindowTitle(render_window, title);
-    // The precompile is a tight synchronous loop with no event pump of its own; pump here
-    // so Windows doesn't decide the window has stopped responding.
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT client;
+    GetClientRect(hwnd, &client);
+    FillRect(dc, &client, GetSysColorBrush(COLOR_WINDOW));
+
+    wchar_t text[96];
+    if (g_build_progress_total == 0) {
+        std::swprintf(text, std::size(text), L"Preparing shaders...");
+    } else {
+        std::swprintf(text, std::size(text), L"Preparing shaders: %zu of %zu",
+                      g_build_progress_built, g_build_progress_total);
+    }
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+    SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    RECT text_rect{16, 12, client.right - 16, 34};
+    DrawTextW(dc, text, -1, &text_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT bar{16, 42, client.right - 16, 62};
+    FrameRect(dc, &bar, GetSysColorBrush(COLOR_BTNSHADOW));
+    if (g_build_progress_total != 0) {
+        RECT fill = bar;
+        InflateRect(&fill, -2, -2);
+        const auto done = std::min(g_build_progress_built, g_build_progress_total);
+        fill.right = fill.left + static_cast<LONG>((fill.right - fill.left) * done /
+                                                   g_build_progress_total);
+        FillRect(dc, &fill, GetSysColorBrush(COLOR_HIGHLIGHT));
+    }
+    EndPaint(hwnd, &ps);
+    return 0;
+}
+} // namespace
+#endif
+
+void EmuWindow_SDL2::ShowBuildProgress(std::size_t built, std::size_t total) {
+    // Throttle the title; thousands of pipelines shouldn't mean thousands of title updates.
+    const u64 now = SDL_GetTicks();
+    if (built == 0 || built == total || now >= last_build_title_ticks + 100) {
+        last_build_title_ticks = now;
+        char title[64];
+        if (total == 0) {
+            std::snprintf(title, sizeof(title), "Preparing shaders...");
+        } else {
+            std::snprintf(title, sizeof(title), "Building shaders %zu/%zu", built, total);
+        }
+        SDL_SetWindowTitle(render_window, title);
+    }
+#ifdef _WIN32
+    g_build_progress_built = built;
+    g_build_progress_total = total;
+    if (!build_progress_window) {
+        static const wchar_t* const kClass = L"SuyuBuildProgress";
+        static const bool registered = [] {
+            WNDCLASSW wc{};
+            wc.lpfnWndProc = BuildProgressProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.hCursor = LoadCursorW(nullptr, IDC_WAIT);
+            wc.lpszClassName = kClass;
+            return RegisterClassW(&wc) != 0;
+        }();
+        if (!registered) {
+            return;
+        }
+        const auto owner = static_cast<HWND>(SDL_GetPointerProperty(
+            SDL_GetWindowProperties(render_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+        RECT owner_rect{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+        if (owner) {
+            GetWindowRect(owner, &owner_rect);
+        }
+        constexpr int width = 420;
+        constexpr int height = 78;
+        const int x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
+        const int y = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
+        // Owned by the game window, so it stays above it and closes with it.
+        build_progress_window =
+            CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"", WS_POPUP | WS_BORDER | WS_VISIBLE,
+                            x, y, width, height, owner, nullptr, GetModuleHandleW(nullptr),
+                            nullptr);
+    }
+    if (build_progress_window) {
+        InvalidateRect(static_cast<HWND>(build_progress_window), nullptr, FALSE);
+        UpdateWindow(static_cast<HWND>(build_progress_window));
+    }
+#endif
+}
+
+void EmuWindow_SDL2::HideBuildProgress() {
+#ifdef _WIN32
+    if (build_progress_window) {
+        DestroyWindow(static_cast<HWND>(build_progress_window));
+        build_progress_window = nullptr;
+    }
+#endif
+}
+
+bool EmuWindow_SDL2::PumpEventsWhileLoading() {
     SDL_PumpEvents();
+    // Leave the events queued: the main loop handles a close request as usual.
+    return !SDL_HasEvent(SDL_EVENT_QUIT) && !SDL_HasEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED);
 }
 
 void EmuWindow_SDL2::RefreshWindowStatus() {

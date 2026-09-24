@@ -16,6 +16,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
@@ -2061,14 +2062,44 @@ int main(int argc, char** argv) {
     }
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
+        // Build the cached shaders on their own thread, as the Qt frontend does from its
+        // emulation thread. The progress callback runs on the shader workers, so it only
+        // records counts; the window belongs to this thread, which keeps it responding and
+        // draws the progress. Closing the window stops the precompile.
+        std::atomic<std::size_t> built{0};
+        std::atomic<std::size_t> total{0};
+        std::atomic<bool> finished{false};
+        std::stop_source stop_loading;
+        std::exception_ptr load_error;
+        std::thread loader([&] {
+            try {
+                system.Renderer().ReadRasterizer()->LoadDiskResources(
+                    system.GetApplicationProcessProgramID(), stop_loading.get_token(),
+                    [&](VideoCore::LoadCallbackStage stage, size_t value, size_t count) {
+                        if (stage == VideoCore::LoadCallbackStage::Build) {
+                            total.store(count, std::memory_order_relaxed);
+                            built.store(value, std::memory_order_relaxed);
+                        }
+                    });
+            } catch (...) {
+                load_error = std::current_exception();
+            }
+            finished.store(true, std::memory_order_release);
+        });
+        while (!finished.load(std::memory_order_acquire)) {
+            emu_window->ShowBuildProgress(built.load(std::memory_order_relaxed),
+                                          total.load(std::memory_order_relaxed));
+            if (!emu_window->PumpEventsWhileLoading()) {
+                stop_loading.request_stop();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
+        loader.join();
+        emu_window->HideBuildProgress();
         try {
-            system.Renderer().ReadRasterizer()->LoadDiskResources(
-                system.GetApplicationProcessProgramID(), std::stop_token{},
-                [&emu_window](VideoCore::LoadCallbackStage stage, size_t value, size_t total) {
-                    if (stage == VideoCore::LoadCallbackStage::Build && emu_window) {
-                        emu_window->SetBuildProgressTitle(value, total);
-                    }
-                });
+            if (load_error) {
+                std::rethrow_exception(load_error);
+            }
         } catch (const std::exception& e) {
             LOG_ERROR(Frontend, "Failed to load disk shader cache: {}", e.what());
         } catch (...) {
