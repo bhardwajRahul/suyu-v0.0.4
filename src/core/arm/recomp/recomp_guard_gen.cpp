@@ -27,12 +27,15 @@ struct ModuleState {
     Module m;
     bool sticky = false;
     std::uint64_t active_base = 0; // base at activation
-    Runs pa_runs;                  // [pa, pa + size) backing the guarded range
+    Runs pa_runs;                  // [pa, pa + size) backing the guarded span
 };
 
+// One live mapping, as Core::Memory made it: `size` bytes at `va` in `table`,
+// backed by physical `pa`, with the guest write permission it has now.
 struct MapRecord {
     const void* table;
     std::uint64_t va, size, pa;
+    bool writable;
 };
 
 struct State {
@@ -46,8 +49,11 @@ struct State {
     // still at its zero initialiser never matches.
     std::uint32_t counter = 0;
     bool exhausted = false;
-    std::uint64_t seq = 0; // every hook moves it; activation retries if it moved
+    // Every live mapping of every table created while watching, kept current by
+    // the map, unmap and protect hooks. A table not in `tables` was created
+    // before the modules were registered, so its log is incomplete.
     std::vector<MapRecord> map_log;
+    std::vector<const void*> tables;
     bool map_log_overflow = false;
     std::uint64_t bumps[static_cast<unsigned>(Reason::Count)]{};
 };
@@ -70,9 +76,16 @@ bool Overlaps(std::uint64_t a, std::uint64_t a_size, std::uint64_t b, std::uint6
     return a_size != 0 && b_size != 0 && a < b + b_size && b < a + a_size;
 }
 
+std::uint64_t SpanStart(const ModuleState& s) {
+    return LoadBase(s.m) + s.m.code_lo;
+}
+
+std::uint64_t SpanSize(const ModuleState& s) {
+    return s.m.code_end - s.m.code_lo;
+}
+
 bool OverlapsModuleVa(const ModuleState& s, std::uint64_t va, std::uint64_t size) {
-    const std::uint64_t base = LoadBase(s.m);
-    return Overlaps(va, size, base + s.m.code_lo, s.m.code_end - s.m.code_lo);
+    return Overlaps(va, size, SpanStart(s), SpanSize(s));
 }
 
 bool OverlapsModulePa(const ModuleState& s, std::uint64_t pa, std::uint64_t size) {
@@ -96,7 +109,7 @@ void Bump(State& s, Reason reason) {
     }
     for (auto& module : s.modules) {
         if (s.active && LoadBase(module.m) != module.active_base) {
-            module.sticky = true; // rebased since the probe
+            module.sticky = true; // rebased since activation
         }
         const bool verify_always = !s.active || s.exhausted || module.sticky;
         StoreWord(module.m, verify_always ? kVerifyAlways : s.counter);
@@ -119,24 +132,74 @@ void StickyWhere(State& s, Reason reason, Hit&& hit) {
     }
 }
 
-void TrimLog(State& s, const void* table, std::uint64_t va, std::uint64_t size) {
-    std::vector<MapRecord> kept;
-    kept.reserve(s.map_log.size());
+// Caller holds the lock. Splits every record of `table` at the edges of
+// [va, va + size) and hands each piece inside it to `inside`, which returns
+// whether to keep it (possibly changed).
+template <typename Inside>
+void EditLog(State& s, const void* table, std::uint64_t va, std::uint64_t size, Inside&& inside) {
+    if (std::none_of(s.map_log.begin(), s.map_log.end(), [&](const MapRecord& rec) {
+            return rec.table == table && Overlaps(rec.va, rec.size, va, size);
+        })) {
+        return;
+    }
+    std::vector<MapRecord> out;
+    out.reserve(s.map_log.size() + 2);
     const std::uint64_t end = va + size;
     for (const auto& rec : s.map_log) {
         if (rec.table != table || !Overlaps(rec.va, rec.size, va, size)) {
-            kept.push_back(rec);
+            out.push_back(rec);
             continue;
         }
         const std::uint64_t rec_end = rec.va + rec.size;
         if (rec.va < va) {
-            kept.push_back({rec.table, rec.va, va - rec.va, rec.pa});
+            out.push_back({rec.table, rec.va, va - rec.va, rec.pa, rec.writable});
+        }
+        const std::uint64_t lo = std::max(rec.va, va), hi = std::min(rec_end, end);
+        MapRecord mid{rec.table, lo, hi - lo, rec.pa + (lo - rec.va), rec.writable};
+        if (inside(mid)) {
+            out.push_back(mid);
         }
         if (end < rec_end) {
-            kept.push_back({rec.table, end, rec_end - end, rec.pa + (end - rec.va)});
+            out.push_back({rec.table, end, rec_end - end, rec.pa + (end - rec.va), rec.writable});
         }
     }
-    s.map_log.swap(kept);
+    s.map_log.swap(out);
+    if (s.map_log.size() > kMaxMapLog) {
+        s.map_log_overflow = true;
+    }
+}
+
+// Caller holds the lock. Whether [va, va + size) is wholly mapped in `table`
+// without write permission; fills the physical runs behind it.
+bool StableSpan(const State& s, const void* table, std::uint64_t va, std::uint64_t size,
+                Runs& runs) {
+    std::vector<MapRecord> parts;
+    for (const auto& rec : s.map_log) {
+        if (rec.table == table && Overlaps(rec.va, rec.size, va, size)) {
+            parts.push_back(rec);
+        }
+    }
+    std::sort(parts.begin(), parts.end(),
+              [](const MapRecord& a, const MapRecord& b) { return a.va < b.va; });
+    std::uint64_t at = va;
+    const std::uint64_t end = va + size;
+    for (const auto& rec : parts) {
+        if (rec.va > at || rec.writable) {
+            return false; // a hole, or code the guest may store to
+        }
+        const std::uint64_t hi = std::min(rec.va + rec.size, end);
+        const std::uint64_t pa = rec.pa + (at - rec.va);
+        if (!runs.empty() && runs.back().first + runs.back().second == pa) {
+            runs.back().second += hi - at;
+        } else {
+            runs.emplace_back(pa, hi - at);
+        }
+        at = hi;
+        if (at >= end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -154,6 +217,7 @@ void SetModules(std::vector<Module> modules, bool enabled) {
     s.active_table = nullptr;
     s.active_key.store(0, std::memory_order_release);
     s.map_log.clear();
+    s.tables.clear();
     s.map_log_overflow = false;
     detail::g_watching.store(s.enabled, std::memory_order_seq_cst);
 }
@@ -168,6 +232,7 @@ void Forget() {
     s.active_table = nullptr;
     s.active_key.store(0, std::memory_order_release);
     s.map_log.clear();
+    s.tables.clear();
     s.map_log_overflow = false;
 }
 
@@ -175,80 +240,51 @@ bool IsActive(std::uint64_t key) {
     return S().active_key.load(std::memory_order_acquire) == key;
 }
 
-void Activate(std::uint64_t key, const void* table, const ProbeFn& probe) {
+void Activate(std::uint64_t key, const void* table) {
     auto& s = S();
-    constexpr int kAttempts = 3;
-    for (int attempt = 0;; ++attempt) {
-        std::uint64_t seq_before = 0;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-        {
-            std::scoped_lock lk{s.lock};
-            if (!s.enabled || s.active_key.load(std::memory_order_relaxed) == key) {
-                return;
-            }
-            // Until this completes, every module verifies on every entry.
-            s.active = false;
-            seq_before = s.seq;
-            for (const auto& module : s.modules) {
-                StoreWord(module.m, kVerifyAlways);
-                ranges.emplace_back(LoadBase(module.m) + module.m.code_lo,
-                                    module.m.code_end - module.m.code_lo);
-            }
-        }
-        // The probe takes the kernel's page-table lock, which the hooks run
-        // under, so it must run without ours.
-        std::vector<bool> stable(ranges.size());
-        std::vector<Runs> runs(ranges.size());
-        for (std::size_t i = 0; i < ranges.size(); ++i) {
-            stable[i] = ranges[i].second != 0 && probe(ranges[i].first, ranges[i].second, runs[i]);
-        }
-        std::scoped_lock lk{s.lock};
-        if (!s.enabled || s.active_key.load(std::memory_order_relaxed) == key ||
-            ranges.size() != s.modules.size()) {
-            return;
-        }
-        const bool contended = s.seq != seq_before;
-        if (contended && attempt + 1 < kAttempts) {
-            continue; // something was mapped meanwhile; probe again
-        }
-        for (std::size_t i = 0; i < s.modules.size(); ++i) {
-            auto& module = s.modules[i];
-            module.active_base = ranges[i].first - module.m.code_lo;
-            module.pa_runs = std::move(runs[i]);
-            module.sticky = contended || s.map_log_overflow || !stable[i];
-            if (module.sticky) {
-                continue;
-            }
-            // Any other live mapping of this module's physical pages, in any
-            // table, is an alias through which its code could change.
-            for (const auto& rec : s.map_log) {
-                const bool own = rec.table == table &&
-                                 Overlaps(rec.va, rec.size, ranges[i].first, ranges[i].second);
-                if (!own && OverlapsModulePa(module, rec.pa, rec.size)) {
-                    module.sticky = true;
-                    break;
-                }
-            }
-        }
-        s.active = true;
-        s.active_table = table;
-        Bump(s, Reason::Activate);
-        s.active_key.store(key, std::memory_order_release);
+    std::scoped_lock lk{s.lock};
+    if (!s.enabled || s.active_key.load(std::memory_order_relaxed) == key) {
         return;
     }
+    // Only a table whose every mapping the hooks saw can prove anything.
+    const bool tracked = !s.map_log_overflow &&
+                         std::find(s.tables.begin(), s.tables.end(), table) != s.tables.end();
+    for (auto& module : s.modules) {
+        module.active_base = LoadBase(module.m);
+        module.pa_runs.clear();
+        module.sticky = !tracked || SpanSize(module) == 0 ||
+                        !StableSpan(s, table, SpanStart(module), SpanSize(module), module.pa_runs);
+        if (module.sticky) {
+            continue;
+        }
+        // Any other live mapping of the same physical pages, in any table, is
+        // an alias through which this code could change.
+        for (const auto& rec : s.map_log) {
+            const bool own =
+                rec.table == table && Overlaps(rec.va, rec.size, SpanStart(module), SpanSize(module));
+            if (!own && OverlapsModulePa(module, rec.pa, rec.size)) {
+                module.sticky = true;
+                break;
+            }
+        }
+    }
+    s.active = true;
+    s.active_table = table;
+    Bump(s, Reason::Activate);
+    s.active_key.store(key, std::memory_order_release);
 }
 
 void OnMap(const void* table, std::uint64_t va, std::uint64_t size, std::uint64_t pa,
            bool writable) {
-    (void)writable; // any new mapping over a module is already sticky
     if (!Watching()) {
         return;
     }
     auto& s = S();
     std::scoped_lock lk{s.lock};
-    ++s.seq;
+    // A new mapping replaces whatever the log had there.
+    EditLog(s, table, va, size, [](MapRecord&) { return false; });
     if (s.map_log.size() < kMaxMapLog) {
-        s.map_log.push_back({table, va, size, pa});
+        s.map_log.push_back({table, va, size, pa, writable});
     } else {
         s.map_log_overflow = true;
     }
@@ -267,8 +303,7 @@ void OnUnmap(const void* table, std::uint64_t va, std::uint64_t size) {
     }
     auto& s = S();
     std::scoped_lock lk{s.lock};
-    ++s.seq;
-    TrimLog(s, table, va, size);
+    EditLog(s, table, va, size, [](MapRecord&) { return false; });
     if (!s.active || table != s.active_table) {
         return;
     }
@@ -282,7 +317,10 @@ void OnProtect(const void* table, std::uint64_t va, std::uint64_t size, bool wri
     }
     auto& s = S();
     std::scoped_lock lk{s.lock};
-    ++s.seq;
+    EditLog(s, table, va, size, [writable](MapRecord& rec) {
+        rec.writable = writable;
+        return true;
+    });
     if (!s.active || table != s.active_table) {
         return;
     }
@@ -306,7 +344,6 @@ void OnDeviceMap(const void* table, std::uint64_t va, std::uint64_t size) {
     }
     auto& s = S();
     std::scoped_lock lk{s.lock};
-    ++s.seq;
     if (!s.active || table != s.active_table) {
         return;
     }
@@ -321,7 +358,7 @@ void OnInvalidate(std::uint64_t va, std::uint64_t size) {
     }
     auto& s = S();
     std::scoped_lock lk{s.lock};
-    // Outside every module range this cannot concern a guarded word: a module
+    // Outside every module span this cannot concern a guarded word: a module
     // with a writable, aliased or device-mapped page is already sticky.
     const bool hit = std::any_of(s.modules.begin(), s.modules.end(), [&](const auto& module) {
         return OverlapsModuleVa(module, va, size);
@@ -340,13 +377,19 @@ void OnInvalidateAll() {
     Bump(s, Reason::InvalidateAll);
 }
 
-void OnPageTableSwap() {
+void OnPageTableSwap(const void* table) {
     if (!Watching()) {
         return;
     }
     auto& s = S();
     std::scoped_lock lk{s.lock};
-    ++s.seq;
+    // A reused address is a new table: drop what the log still says about it.
+    s.map_log.erase(std::remove_if(s.map_log.begin(), s.map_log.end(),
+                                   [table](const MapRecord& rec) { return rec.table == table; }),
+                    s.map_log.end());
+    if (std::find(s.tables.begin(), s.tables.end(), table) == s.tables.end()) {
+        s.tables.push_back(table);
+    }
     Bump(s, Reason::PageTableSwap);
 }
 

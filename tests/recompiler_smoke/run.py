@@ -27,8 +27,9 @@ VARIANTS = (("abi5", None, None), ("abi6", "1", None), ("abi6gg", "1", "1"))
 
 # smoke_gg_host modes: exit 0 (protocol, activation, controls, races) or 86
 # (a hook that must end skipping, followed by a changed block).
-GG_HOST_PASS = ("skip", "mutate-no-bump", "log-alias", "log-trim", "unstable", "contended",
-                "disabled", "ctl-ivau-elsewhere", "ctl-map-elsewhere", "race-bump")
+GG_HOST_PASS = ("skip", "mutate-no-bump", "log-alias", "log-trim", "unstable", "unmapped-code",
+                "untracked", "overflow", "disabled", "ctl-ivau-elsewhere", "ctl-map-elsewhere",
+                "race-bump")
 GG_HOST_ABORT = ("hook-map", "hook-unmap", "hook-protect-rx", "hook-protect-rw", "hook-alias",
                  "hook-device", "hook-ivau", "hook-ivau-all", "hook-new-table",
                  "hook-new-process", "hook-rebase")

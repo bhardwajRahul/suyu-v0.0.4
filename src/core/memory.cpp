@@ -63,8 +63,9 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
-        // A new process: recompiled blocks re-verify (ABI 6 GG1).
-        Core::RecompGuardGen::OnPageTableSwap();
+        // A new process and table: recompiled blocks re-verify, and GG1 starts
+        // tracking this table's mappings (ABI 6 GG1).
+        Core::RecompGuardGen::OnPageTableSwap(current_page_table->entries.data());
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,

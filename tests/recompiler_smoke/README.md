@@ -52,9 +52,10 @@ manager (`core/arm/recomp/recomp_guard_gen.cpp`):
   another table, device map, IC IVAU, whole-cache invalidation, new table, new
   process, rebase): verify, change the code, fire the hook, and require the
   next entry to abort (exit 86);
-- activation that must pin "verify always" (an alias existing before the first
-  run, an unstable probe, mappings racing the probe), and controls that must
-  not bump;
+- activation, decided from what the hooks recorded since the table was
+  created, that must pin "verify always" (an alias existing before the first
+  run, writable or partly unmapped code, a table created before registration,
+  an overflowing log), and controls that must not bump;
 - `race-bump`, three verifying threads against a thread bumping 200,000 times,
   and `race-mutate-N`, a thread that changes the code, bumps and publishes while
   another enters the block, at 50 different delays.

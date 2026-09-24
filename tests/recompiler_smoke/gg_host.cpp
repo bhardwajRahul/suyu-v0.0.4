@@ -53,10 +53,13 @@ std::uint32_t* word;
 GG::Module module_info;
 void* ctx;
 
-bool StableProbe(std::uint64_t va, std::uint64_t size,
-                 std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
-    runs.emplace_back(kCodePa + (va & 0xfff), size);
-    return true;
+// What Core::Memory reports while the loader builds the process: a new table,
+// the code pages mapped writable, then the page holding the blocks made RX.
+// (The protect splits the mapping, so activation must see through the split.)
+void CreateProcess() {
+    GG::OnPageTableSwap(table);
+    GG::OnMap(table, 0x0, 0x3000, kCodePa - 0x1000, true);
+    GG::OnProtect(table, 0x1000, 0x1000, false);
 }
 
 std::uint32_t Word() {
@@ -81,8 +84,10 @@ int Setup(bool activate = true) {
     // Not active yet: every entry verifies.
     CHECK(ggc_enter(ctx, kBlock, 0) == 2);
     CHECK(ggc_enter(ctx, kBlock, 0) == 2);
+    CreateProcess();
+    CHECK(ggc_enter(ctx, kBlock, 0) == 2);
     if (activate) {
-        GG::Activate(7, table, StableProbe);
+        GG::Activate(7, table);
         CHECK(GG::IsActive(7) && !GG::IsActive(8));
         CHECK(Word() != GG::kVerifyAlways && Word() != 0);
         CHECK(GG::GetStats().sticky == 0);
@@ -205,8 +210,9 @@ int RaceMutate(unsigned delay_us) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
-    const bool activate = mode != "log-alias" && mode != "log-trim" && mode != "contended" &&
-                          mode != "unstable" && mode != "disabled";
+    const bool activate = mode != "log-alias" && mode != "log-trim" && mode != "untracked" &&
+                          mode != "unstable" && mode != "unmapped-code" && mode != "overflow" &&
+                          mode != "disabled";
     if (mode == "disabled") {
         ggc_init();
         std::uint64_t lo, end;
@@ -215,7 +221,9 @@ int main(int argc, char** argv) {
         CHECK(word);
         GG::SetModules({{word, base, lo, end}}, false); // e.g. SUYU_RECOMP_GUARD_GEN=0
         CHECK(!GG::Watching());
-        GG::Activate(7, table, StableProbe);
+        GG::OnPageTableSwap(table);
+        GG::OnMap(table, 0x1000, 0x1000, kCodePa, false);
+        GG::Activate(7, table);
         GG::OnInvalidateAll();
         CHECK(Word() == GG::kVerifyAlways);
         ctx = ggc_new_context();
@@ -266,9 +274,9 @@ int main(int argc, char** argv) {
     } else if (mode == "hook-ivau-all") {
         return MustCatch([] { GG::OnInvalidateAll(); });
     } else if (mode == "hook-new-table") {
-        return MustCatch([] { GG::OnPageTableSwap(); });
+        return MustCatch([] { GG::OnPageTableSwap(other_table); });
     } else if (mode == "hook-new-process") {
-        return MustCatch([] { GG::Activate(9, table, StableProbe); });
+        return MustCatch([] { GG::Activate(9, table); });
     } else if (mode == "hook-rebase") {
         // The module moves; its own set_base drops it to verify-always, and
         // the code at the new base no longer matches.
@@ -288,35 +296,48 @@ int main(int argc, char** argv) {
     else if (mode == "log-alias") {
         // An alias of the code's physical page that already exists when the
         // process first runs.
+        GG::OnPageTableSwap(other_table);
         GG::OnMap(other_table, 0x7000000, 0x2000, kCodePa - 0x1000, true);
-        GG::Activate(7, table, StableProbe);
+        GG::Activate(7, table);
         CHECK(GG::GetStats().sticky == 1 && Word() == GG::kVerifyAlways);
         CHECK(ggc_enter(ctx, kBlock, 0) == 2 && ggc_enter(ctx, kBlock, 0) == 2);
     } else if (mode == "log-trim") {
         // The same alias, unmapped again before the first run: no longer a
         // reason. A mapping of the module's own range is not an alias either.
         GG::OnMap(other_table, 0x7000000, 0x3000, kCodePa - 0x1000, true);
-        GG::OnMap(table, 0x1000, 0x1000, kCodePa, false);
+        GG::OnMap(table, 0x1000, 0x1000, kCodePa, false); // the code's own mapping again
         GG::OnUnmap(other_table, 0x7000000, 0x1000);
         GG::OnUnmap(other_table, 0x7001000, 0x2000);
-        GG::Activate(7, table, StableProbe);
+        GG::Activate(7, table);
         CHECK(GG::GetStats().sticky == 0 && Word() != GG::kVerifyAlways);
         CHECK(ggc_enter(ctx, kBlock, 0) == 2 && ggc_enter(ctx, kBlock, 0) == 0);
     } else if (mode == "unstable") {
-        // Writable or unmapped code: the probe says no.
-        GG::Activate(7, table, [](auto, auto, auto&) { return false; });
+        // Code the guest may store to (W+X, or made writable again).
+        GG::OnProtect(table, 0x1000, 0x1000, true);
+        GG::Activate(7, table);
         CHECK(GG::IsActive(7) && GG::GetStats().sticky == 1);
         CHECK(ggc_enter(ctx, kBlock, 0) == 2 && ggc_enter(ctx, kBlock, 0) == 2);
-    } else if (mode == "contended") {
-        // Something maps during every probe: after three tries, verify-always.
-        int probes = 0;
-        GG::Activate(7, table, [&](auto va, auto size, auto& runs) {
-            ++probes;
-            GG::OnMap(other_table, 0x9000000, 0x1000, 0x10000000, true);
-            return StableProbe(va, size, runs);
-        });
-        CHECK(probes == 3 && GG::GetStats().sticky == 1);
+    } else if (mode == "unmapped-code") {
+        // Part of the guarded span is not mapped at all.
+        GG::OnUnmap(table, 0x1000, 0x1000);
+        GG::Activate(7, table);
+        CHECK(GG::IsActive(7) && GG::GetStats().sticky == 1);
+    } else if (mode == "untracked") {
+        // A table created before the modules were registered: its log is
+        // incomplete, so nothing about it is proven.
+        GG::OnMap(other_table, 0x1000, 0x1000, kCodePa, false);
+        GG::Activate(7, other_table);
+        CHECK(GG::IsActive(7) && GG::GetStats().sticky == 1);
         CHECK(ggc_enter(ctx, kBlock, 0) == 2 && ggc_enter(ctx, kBlock, 0) == 2);
+    } else if (mode == "overflow") {
+        // More live mappings than the log keeps: nothing is proven.
+        GG::OnPageTableSwap(other_table);
+        for (std::uint64_t i = 0; i <= GG::kMaxMapLog; ++i) {
+            GG::OnMap(other_table, 0x100000000 + i * 0x2000, 0x1000, 0x200000000 + i * 0x1000, true);
+        }
+        CHECK(GG::GetStats().map_log_overflow);
+        GG::Activate(7, table);
+        CHECK(GG::IsActive(7) && GG::GetStats().sticky == 1);
     }
     // ---- hooks that must not bump ----
     else if (mode == "ctl-ivau-elsewhere") {

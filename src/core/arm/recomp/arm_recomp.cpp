@@ -898,48 +898,13 @@ struct ArmRecomp::Impl {
         }
     }
 
-    /// ABI 6 GG1 activation for `process`. A module may skip its per-entry check
-    /// only if every page of its guarded span is mapped without guest write
-    /// permission; the physical pages behind that span are handed over for the
-    /// alias check. See RecompGuardGen::Activate.
+    /// ABI 6 GG1 activation for `process`. Decided entirely from what the
+    /// Core::Memory hooks recorded since the process's table was created: a
+    /// kernel query here would take the page-table KLightLock, and a contended
+    /// KLightLock reschedules, which inside RunThread could enter this core's
+    /// RunThread again for another guest thread.
     void ActivateGuardGen(Kernel::KProcess& process, u64 key) {
-        auto& page_table = process.GetPageTable();
-        const Common::PageTable& table = page_table.GetImpl();
-        const auto probe = [&](u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) {
-            const u64 end = va + size;
-            for (u64 addr = va & ~u64{Memory::YUZU_PAGEMASK}; addr < end;) {
-                Kernel::KMemoryInfo info{};
-                Kernel::Svc::PageInfo page_info{};
-                if (page_table.QueryInfo(&info, &page_info, addr) != ResultSuccess ||
-                    info.GetEndAddress() <= addr) {
-                    return false;
-                }
-                const auto user_write = static_cast<Kernel::KMemoryPermission>(
-                    Kernel::Svc::MemoryPermission::Write);
-                if (False(info.GetState() & Kernel::KMemoryState::FlagMapped) ||
-                    True(info.GetPermission() & user_write)) {
-                    return false;
-                }
-                addr = info.GetEndAddress();
-            }
-            for (u64 page = va & ~u64{Memory::YUZU_PAGEMASK}; page < end;
-                 page += Memory::YUZU_PAGESIZE) {
-                Common::PhysicalAddress pa{};
-                if (!table.GetPhysicalAddress(&pa, page) ||
-                    table.entries[page >> Memory::YUZU_PAGEBITS].ptr.Type() ==
-                        Common::PageType::Unmapped) {
-                    return false;
-                }
-                const u64 phys = GetInteger(pa);
-                if (!runs.empty() && runs.back().first + runs.back().second == phys) {
-                    runs.back().second += Memory::YUZU_PAGESIZE;
-                } else {
-                    runs.emplace_back(phys, Memory::YUZU_PAGESIZE);
-                }
-            }
-            return true;
-        };
-        RecompGuardGen::Activate(key, process.GetMemory().GetPageTableView().entries, probe);
+        RecompGuardGen::Activate(key, process.GetMemory().GetPageTableView().entries);
         const auto stats = RecompGuardGen::GetStats();
         LOG_INFO(Core_ARM,
                  "recomp generation guard: process {} active={} generation={}; {} of {} "

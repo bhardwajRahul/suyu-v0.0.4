@@ -5,7 +5,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <functional>
 #include <utility>
 #include <vector>
 
@@ -28,8 +27,9 @@ namespace Core::RecompGuardGen {
 inline constexpr std::uint32_t kVerifyAlways = 0xFFFFFFFFu;
 /// Passed to recomp_image_guard_gen_v1.
 inline constexpr std::uint32_t kHostVersion = 1;
-/// Live mappings remembered for the alias check before everything goes sticky.
-inline constexpr std::size_t kMaxMapLog = 65536;
+/// Live mappings remembered (for permissions and the alias check) before
+/// everything goes sticky.
+inline constexpr std::size_t kMaxMapLog = 16384;
 
 /// What recomp_image_guard_gen_v1 hands the host.
 struct Module {
@@ -50,12 +50,6 @@ enum class Reason : unsigned {
     PageTableSwap,
     Count,
 };
-
-/// Called at activation for each module's guarded range [va, va + size), with
-/// no GG1 lock held. Returns true only if every page in it is mapped without
-/// guest write permission, and fills the physical runs backing it.
-using ProbeFn = std::function<bool(std::uint64_t va, std::uint64_t size,
-                                   std::vector<std::pair<std::uint64_t, std::uint64_t>>& pa_runs)>;
 
 struct Stats {
     bool enabled;
@@ -87,10 +81,14 @@ void Forget();
 /// True once Activate has completed for this process key. Acquire, so a core
 /// that sees it also sees the generation words that activation stored.
 bool IsActive(std::uint64_t key);
-/// First run of a process: probe every module, decide which are provably
-/// stable, then move the generation. `table` identifies the process page table
-/// the hooks report (Common::PageTable::entries.data()).
-void Activate(std::uint64_t key, const void* table, const ProbeFn& probe);
+/// First run of a process: decide which modules are provably stable, then move
+/// the generation. `table` identifies the process page table the hooks report
+/// (Common::PageTable::entries.data()). Everything is decided from what the
+/// hooks recorded since that table was created: a module is stable only if
+/// its whole guarded span is mapped in `table` without write permission and
+/// no other live mapping, in any table, shares its physical pages. Takes no
+/// lock but its own, so it is safe inside ArmInterface::RunThread.
+void Activate(std::uint64_t key, const void* table);
 
 // Hooks. `table` is the page table being changed, same identity as above.
 /// Core::Memory::MapMemoryRegion, any process.
@@ -106,8 +104,8 @@ void OnDeviceMap(const void* table, std::uint64_t va, std::uint64_t size);
 void OnInvalidate(std::uint64_t va, std::uint64_t size);
 /// Whole instruction-cache invalidation.
 void OnInvalidateAll();
-/// Core::Memory::SetCurrentPageTable: a process was created.
-void OnPageTableSwap();
+/// Core::Memory::SetCurrentPageTable: a process and its table were created.
+void OnPageTableSwap(const void* table);
 
 Stats GetStats();
 
