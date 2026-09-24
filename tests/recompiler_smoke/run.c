@@ -14,6 +14,9 @@ extern BlockFn recomp_image_lookup(uint64_t);
 extern unsigned recomp_image_features(void);
 extern unsigned recomp_image_fastmem_v1(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t);
 #endif
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+extern uint32_t* recomp_image_guard_gen_v1(uint32_t, uint64_t*, uint64_t*, const uint64_t**);
+#endif
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
@@ -347,6 +350,25 @@ int main(int argc, char** argv) {
     bridge.address_space_max = 0x100000;
     set_page(1, memory, T_MEMORY);
     set_page(2, memory + 0x1000, T_MEMORY);
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+    /* GG1: the FM1 handshake completes only after the GG1 one, so a host
+       that knows FM1 but not GG1 refuses the image. Until a host takes the
+       generation word over it stays VERIFY_ALWAYS, and every mode below then
+       runs exactly as on ABI 5. */
+    {
+        uint64_t lo = 0, end = 0;
+        const uint64_t* base = NULL;
+        CHECK(recomp_image_features() ==
+              (RECOMP_FEATURE_FASTMEM_PT1 | RECOMP_FEATURE_GUARD_GEN1));
+        CHECK(recomp_image_fastmem_v1(12, 5, ~(uint64_t)3, 872, 880) == 0);
+        CHECK(recomp_image_guard_gen_v1(0, &lo, &end, &base) == NULL);
+        CHECK(recomp_image_guard_gen_v1(2, &lo, &end, &base) == NULL);
+        CHECK(recomp_image_fastmem_v1(12, 5, ~(uint64_t)3, 872, 880) == 0);
+        CHECK(recomp_image_guard_gen_v1(1, &lo, &end, &base) == &g_recomp_gg_word);
+        CHECK(lo == 0x1000 && end == 0x1000 + sizeof(smoke_code) && base == &g_module_base);
+        CHECK(g_recomp_gg_word == RECOMP_GG_VERIFY_ALWAYS);
+    }
+#endif
 #ifdef RECOMP_FEATURE_FASTMEM_PT1
     CHECK(recomp_image_abi() == 6);
     CHECK(recomp_image_features() & RECOMP_FEATURE_FASTMEM_PT1);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and execute synthetic ABI 5 and ABI 6 tests; requires only Python, CMake, C/C++."""
+"""Compile and execute synthetic ABI 5, ABI 6 and ABI 6 + GG1 tests; requires only Python, CMake, C/C++."""
 import argparse
 import hashlib
 import os
@@ -18,7 +18,20 @@ ABI6_GOLDEN = "9a7689e833d7b364fd103d2b5c83729d6bb0acc8dc33afa10a86defedf80965f"
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}
 
-VARIANTS = (("abi5", None), ("abi6", "1"))
+# GG1 (the generation code guard) changes the block units as well, never the
+# dispatch table (src/recompiled_<module>.c) or the file set.
+GG1_CHANGED = ABI6_CHANGED | {"recompiled_smoke_0.c", "recompiled_second_0.c"}
+
+# name, SUYU_RECOMP_AB_FASTMEM, SUYU_RECOMP_AB_GUARD_GEN
+VARIANTS = (("abi5", None, None), ("abi6", "1", None), ("abi6gg", "1", "1"))
+
+# smoke_gg_host modes: exit 0 (protocol, activation, controls, races) or 86
+# (a hook that must end skipping, followed by a changed block).
+GG_HOST_PASS = ("skip", "mutate-no-bump", "log-alias", "log-trim", "unstable", "contended",
+                "disabled", "ctl-ivau-elsewhere", "ctl-map-elsewhere", "race-bump")
+GG_HOST_ABORT = ("hook-map", "hook-unmap", "hook-protect-rx", "hook-protect-rw", "hook-alias",
+                 "hook-device", "hook-ivau", "hook-ivau-all", "hook-new-table",
+                 "hook-new-process", "hook-rebase")
 
 
 def call(args, expected=0, timeout=120, env=None):
@@ -41,6 +54,27 @@ def tree_hash(root):
         digest.update(path.relative_to(root).as_posix().encode() + b"\0" +
                       str(len(data)).encode() + b"\0" + data)
     return digest.hexdigest()
+
+
+def check_guard_gen(abi6, gg):
+    files6 = sorted(p.relative_to(abi6) for p in abi6.rglob("*") if p.is_file())
+    filesg = sorted(p.relative_to(gg) for p in gg.rglob("*") if p.is_file())
+    if files6 != filesg:
+        raise RuntimeError("GG1 export produced a different file set")
+    for rel in files6:
+        same = (abi6 / rel).read_bytes() == (gg / rel).read_bytes()
+        if same == (rel.name in GG1_CHANGED):
+            raise RuntimeError(f"unexpected GG1 difference state for {rel.as_posix()}")
+    for module in (gg, gg / "second"):
+        header = (module / "recomp_runtime.h").read_text()
+        export = (module / "recomp_export.c").read_text()
+        if "#define RECOMP_IMAGE_ABI 6\n" not in header or "RECOMP_FEATURE_GUARD_GEN1" not in header:
+            raise RuntimeError(f"{module} is not ABI 6 with GG1")
+        if "recomp_image_guard_gen_v1" not in export or "recomp_image_fastmem_v1" not in export:
+            raise RuntimeError(f"{module}: GG1 handshake presence is wrong")
+        units = list((module / "src").glob("*_0.c"))
+        if not units or "recomp_code_guard(" in units[0].read_text():
+            raise RuntimeError(f"{module}: blocks still call the per-entry guard directly")
 
 
 def check_outputs(abi5, abi6):
@@ -94,7 +128,7 @@ def main():
 
         exporter = executable(build("export"), "smoke_export")
         generated = {}
-        for name, fastmem in VARIANTS:
+        for name, fastmem, guard_gen in VARIANTS:
             generated[name] = root / f"generated-{name}"
             generated[name].mkdir()
             env = dict(os.environ)
@@ -102,10 +136,13 @@ def main():
             env.pop("SUYU_RECOMP_AB_GUARD_GEN", None)
             if fastmem:
                 env["SUYU_RECOMP_AB_FASTMEM"] = fastmem
+            if guard_gen:
+                env["SUYU_RECOMP_AB_GUARD_GEN"] = guard_gen
             call([exporter, generated[name]], env=env)
         check_outputs(generated["abi5"], generated["abi6"])
+        check_guard_gen(generated["abi6"], generated["abi6gg"])
 
-        for name, _ in VARIANTS:
+        for name, _, guard_gen in VARIANTS:
             run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name]}")
             runner = executable(run, "smoke_run")
             for mode in ("slice", "ordinary-page", "cross-page", "special-page",
@@ -118,6 +155,15 @@ def main():
             call([executable(run, "smoke_static")], timeout=15)
             if name != "abi5":
                 call([executable(run, "smoke_features")], timeout=15)
+            if guard_gen:
+                host = executable(run, "smoke_gg_host")
+                for mode in GG_HOST_PASS:
+                    call([host, mode], timeout=120)
+                for mode in GG_HOST_ABORT:
+                    call([host, mode], expected=86, timeout=15)
+                # The cross-thread catch, at a spread of mutation times.
+                for delay in range(0, 2000, 40):
+                    call([host, f"race-mutate-{delay}"], expected=86, timeout=15)
             print(f"All synthetic {name.upper()} smoke checks passed.")
 
 
