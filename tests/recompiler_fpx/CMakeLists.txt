@@ -19,9 +19,10 @@ add_library(fpx_runtime STATIC "${gen}/rt_soft.c")
 target_include_directories(fpx_runtime PRIVATE "${gen}")
 target_compile_definitions(fpx_runtime PRIVATE SUYU_HOSTED_RECOMP=1 RECOMP_STATIC_HOST=1)
 
-set(driver_sources driver.c "${gen}/ops_soft.c" "${gen}/ops_fpx.c"
+set(driver_sources driver.c fpx_env.cpp "${gen}/ops_soft.c" "${gen}/ops_fpx.c"
     "${gen}/ops_nokeep.c" "${gen}/ops_nomid.c")
-set(driver_defs FPX_HAVE_FPX=1)
+# fpx_env.cpp: the host's own FP-mode check (core/arm/recomp/guest_fp_env.h).
+set(driver_defs FPX_HAVE_FPX=1 FPX_HAVE_ENV=1)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$" AND NOT MSVC)
   list(APPEND driver_sources "${gen}/hw.c")
   list(APPEND driver_defs FPX_HAVE_HW=1)

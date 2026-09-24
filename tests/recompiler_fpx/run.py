@@ -104,6 +104,12 @@ def main():
                 print(f"CONTROL {name}: {found} mismatches",
                       "(fails as designed)" if found else "(DID NOT FAIL)")
                 status |= failed or not found
+            # L6(d): the same poisoning, repaired by the host's own check first.
+            result = subprocess.run([str(driver), "env", "--legs", "13", *common], check=False,
+                                    capture_output=True, text=True, **low_priority())
+            print("".join(line + "\n" for line in result.stdout.splitlines()
+                          if line.startswith(("ENV", "LEG", "TOTAL"))), end="")
+            status |= result.returncode != 0
         print("FPX harness:", "FAILED" if status else "passed")
         sys.exit(1 if status else 0)
 

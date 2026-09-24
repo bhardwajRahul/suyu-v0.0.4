@@ -20,6 +20,7 @@
 #include "common/string_util.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/guest_fp_env.h"
 #include "core/arm/recomp/recomp_diagnostic_sampler.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -357,6 +358,38 @@ const bool kGuardGenDisabled = [] {
     const char* e = std::getenv("SUYU_RECOMP_GUARD_GEN");
     return e && *e == '0';
 }();
+// ABI 6 feature FPX1. Set by the loader once every module passed the FPX1
+// handshake, before any guest thread runs. While set, generated code may keep
+// native FP results, which is exact only in the host FP mode guest_fp_env.h
+// describes; RunThread puts every guest-core thread in that mode and checks it
+// on each dispatch. SUYU_RECOMP_FPX=0 sets the kill-switch bit instead.
+std::atomic<bool> g_fpx_ready{false};
+const bool kFpxDisabled = [] {
+    const char* e = std::getenv("SUYU_RECOMP_FPX");
+    return e && *e == '0';
+}();
+// Bit 32 of the context's fpcr: host-owned, above the 32-bit guest register.
+// FPX1 code masks it out of MRS/MSR FPCR and takes the exact path while it is
+// set. Only an all-FPX1 bundle is loaded, so no module can read it.
+constexpr u64 kFpxInhibit = u64{1} << 32;
+std::atomic<u64> g_fpx_env_repairs{0};
+
+u64 FpxInhibitBits() {
+    return kFpxDisabled && g_fpx_ready.load(std::memory_order_acquire) ? kFpxInhibit : 0;
+}
+bool FpxActive() {
+    return !kFpxDisabled && g_fpx_ready.load(std::memory_order_acquire);
+}
+// Puts this thread's FP mode back where FPX1 code needs it; logged the first
+// time, since something on a guest-core thread (a host callback, an injected
+// library) changed it.
+void RepairFpEnv(const char* where) {
+    if (RecompFpEnv::Ensure() &&
+        g_fpx_env_repairs.fetch_add(1, std::memory_order_relaxed) == 0) {
+        LOG_WARNING(Core_ARM, "recomp: host FP mode was not the one FPX1 code needs ({}); restored",
+                    where);
+    }
+}
 std::atomic<u64> g_forced_cutoff_pc{0};
 std::atomic<u64> g_forced_cutoff_blocks{0};
 
@@ -688,6 +721,7 @@ void SetRecompLookup(RecompLookupFn lookup) {
     g_fastmem_ready.store(false, std::memory_order_release);
     // The previous bundle's images may be unloaded; drop them untouched.
     RecompGuardGen::Forget();
+    g_fpx_ready.store(false, std::memory_order_release);
     g_recomp_lookup.store(lookup, std::memory_order_release);
 }
 
@@ -715,6 +749,22 @@ RecompFastmemLayout GetRecompFastmemLayout() {
 
 void SetRecompFastmemReady(bool ready) {
     g_fastmem_ready.store(ready, std::memory_order_release);
+}
+
+RecompFpxLayout GetRecompFpxLayout() {
+    return RecompFpxLayout{
+        static_cast<u32>(offsetof(GuestContextView, fpcr)),
+        static_cast<u32>(offsetof(GuestContextView, fpsr)),
+        kFpxInhibit,
+    };
+}
+
+void SetRecompFpxReady(bool ready) {
+    g_fpx_ready.store(ready, std::memory_order_release);
+}
+
+bool IsRecompFpxReady() {
+    return g_fpx_ready.load(std::memory_order_acquire);
 }
 
 bool IsRecompFastmemReady() {
@@ -1691,6 +1741,20 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     }
 
     impl->RefreshPageTable();
+    // FPX1: the guest register is 32 bits; bit 32 is this host's kill switch,
+    // re-applied on every entry because every import of the context drops it.
+    const bool fpx_active = FpxActive();
+    impl->ctx.fpcr = (impl->ctx.fpcr & 0xffffffffULL) | FpxInhibitBits();
+    if (fpx_active) {
+        RepairFpEnv("entry");
+    }
+    if (first_run) {
+        LOG_INFO(Core_ARM, "ArmRecomp FPX1 native FP: {}",
+                 !g_fpx_ready.load(std::memory_order_acquire)
+                     ? "not used"
+                     : kFpxDisabled ? "negotiated, disabled by SUYU_RECOMP_FPX=0"
+                                    : "on, host FP mode enforced");
+    }
     if (first_run) {
         LOG_INFO(Core_ARM,
                  "ArmRecomp page table ready: entries={} stride={} page_bits={} max={:#x} "
@@ -1770,6 +1834,12 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     impl->ctx.halted = 0;
 
     while (!impl->ctx.halted) {
+        // A host callback or SVC path run since the last block could have
+        // changed this thread's FP mode; one control-register read per
+        // dispatch, not per op.
+        if (fpx_active && !RecompFpEnv::Conforms()) {
+            RepairFpEnv("dispatch");
+        }
         impl->SampleDiagnostics(thread);
         if (impl->core_index < g_current_pcs.size()) {
             g_current_pcs[impl->core_index].store(impl->ctx.pc, std::memory_order_relaxed);
@@ -2326,7 +2396,8 @@ void ArmRecomp::SetContext(const Kernel::Svc::ThreadContext& ctx) {
         impl->ctx.vreg[i][0] = ctx.v[i][0];
         impl->ctx.vreg[i][1] = ctx.v[i][1];
     }
-    impl->ctx.fpcr = ctx.fpcr;
+    // ThreadContext carries the 32-bit guest FPCR; keep the FPX1 kill switch.
+    impl->ctx.fpcr = static_cast<u32>(ctx.fpcr) | FpxInhibitBits();
     impl->ctx.fpsr = ctx.fpsr;
     // Only the guest-owned thread pointer travels in ThreadContext. The
     // read-only one is republished separately by PhysicalCore::LoadContext

@@ -81,6 +81,22 @@ bool IsRecompFastmemReady();
 /// module verifies on every entry. Returns whether it engaged.
 bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules);
 
+/// ABI 6 feature FPX1 (exact native FP): the arguments the loader passes to each
+/// FPX1 module's recomp_image_fpx_v1, this host's view of the generated
+/// context's FP fields and of its kill-switch bit.
+struct RecompFpxLayout {
+    u32 off_fpcr;
+    u32 off_fpsr;
+    u64 inhibit_bit;
+};
+RecompFpxLayout GetRecompFpxLayout();
+/// True only after every loaded module reports FPX1 and passed that handshake.
+/// While set, ArmRecomp keeps the host FP mode the fast paths rely on (MXCSR or
+/// FPCR, see core/arm/recomp/guest_fp_env.h) on every guest-core thread;
+/// SUYU_RECOMP_FPX=0 turns the fast paths off through the kill-switch bit.
+void SetRecompFpxReady(bool ready);
+bool IsRecompFpxReady();
+
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by
 /// the static pass are module-relative - the loader picks the real base at run

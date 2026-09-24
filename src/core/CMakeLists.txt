@@ -11,6 +11,7 @@ add_library(core STATIC
     arm/recomp/arm_recomp.h
     arm/recomp/recomp_guard_gen.cpp
     arm/recomp/recomp_guard_gen.h
+    arm/recomp/guest_fp_env.h
     arm/recomp/recomp_image_features.h
     arm/debug.cpp
     arm/debug.h
