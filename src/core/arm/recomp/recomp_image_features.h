@@ -23,11 +23,11 @@
 namespace Core::RecompImageFeature {
 
 inline constexpr std::uint32_t FastmemPT1 = 1u << 0;
-inline constexpr std::uint32_t GuardGen1 = 1u << 1;   // assigned; see the list above
+inline constexpr std::uint32_t GuardGen1 = 1u << 1;
 inline constexpr std::uint32_t ExactFpX1 = 1u << 2;   // reserved
 
 /// Features this host implements.
-inline constexpr std::uint32_t kHostSupported = FastmemPT1;
+inline constexpr std::uint32_t kHostSupported = FastmemPT1 | GuardGen1;
 
 /// The bits of `features` a host implementing `supported` does not know; any
 /// nonzero result means the image must be refused.

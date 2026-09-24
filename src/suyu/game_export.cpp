@@ -74,6 +74,7 @@
 #include "common/swap.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
+#include "core/arm/recomp/recomp_image_features.h"
 #include "core/core.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/patch_manager.h"
@@ -2586,6 +2587,21 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     // ABI 6 (FM1) page-table fast path for guest memory access. Off by default,
     // which keeps exports byte-identical to ABI 5.
     suyu::recomp::g_emit_fastmem = qEnvironmentVariable("SUYU_AOT_FASTMEM") == QStringLiteral("1");
+    // ABI 6 feature GG1, the generation code guard. An ABI 6 feature, so it
+    // needs SUYU_AOT_FASTMEM=1 as well; off by default.
+    suyu::recomp::g_emit_guard_gen =
+        qEnvironmentVariable("SUYU_AOT_GUARD_GEN") == QStringLiteral("1");
+    if (suyu::recomp::g_emit_guard_gen && !suyu::recomp::g_emit_fastmem) {
+        LOG_WARNING(Frontend, "SUYU_AOT_GUARD_GEN=1 needs SUYU_AOT_FASTMEM=1; exporting without "
+                              "the generation code guard");
+    }
+    // What the images will report from recomp_image_features(), recorded in the
+    // manifest so a cached export with other features is not reused.
+    const unsigned image_features =
+        suyu::recomp::g_emit_fastmem
+            ? (Core::RecompImageFeature::FastmemPT1 |
+               (suyu::recomp::EmitGuardGen() ? Core::RecompImageFeature::GuardGen1 : 0u))
+            : 0u;
     const QString debug_root = cache_dir + QDir::separator() + QStringLiteral("debug");
     const QString blockmap_dir = debug_root + QDir::separator() + QStringLiteral("blockmaps");
     const QString code_dir = debug_root + QDir::separator() + QStringLiteral("code");
@@ -2622,6 +2638,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const bool same_image_abi = contents.contains(
                 suyu::recomp::g_emit_fastmem ? QStringLiteral("\"image_abi\": 6,")
                                              : QStringLiteral("\"image_abi\": 5,"));
+            const bool same_image_features =
+                !suyu::recomp::g_emit_fastmem ||
+                contents.contains(QStringLiteral("\"image_features\": %1,").arg(image_features));
             const bool same_correctness_revision = contents.contains(
                 QStringLiteral("\"correctness_revision\": \"20260920-fixedpoint-v1\","));
             const bool same_translate_all = contents.contains(
@@ -2633,7 +2652,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             QStringList cached_fallback_modules;
             const bool same_fallback_policy = ReadCachedFallbackPolicy(
                 manifest_bytes, fallback_enabled, cached_fallback_modules);
-            if (same_scan && same_backend && same_image_abi && same_correctness_revision &&
+            if (same_scan && same_backend && same_image_abi && same_image_features &&
+                same_correctness_revision &&
                 same_translate_all && same_source && same_fallback_policy &&
                 has_recompiled_project && has_required_launcher) {
                 last_fallback_modules = std::move(cached_fallback_modules);
@@ -3104,6 +3124,28 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     }
                     o << "  return f;\n}\n";
                 }
+                if (suyu::recomp::EmitGuardGen()) {
+                    // GG1: one handshake per module, in load order; 0 refuses.
+                    // suyu.cpp runs it before the FM1 handshake, which GG1
+                    // images do not complete without it.
+                    o << "\ntypedef struct { uint32_t* word; const uint64_t* base; "
+                         "uint64_t code_lo, code_end; } SuyuRecompGuardGenModule;\n";
+                    for (const auto& m : ordered) {
+                        o << "extern uint32_t* recomp_image_guard_gen_v1_" << m
+                          << "(uint32_t, uint64_t*, uint64_t*, const uint64_t**);\n";
+                    }
+                    o << "unsigned suyu_recomp_static_guard_gen_v1(uint32_t host_version,\n"
+                         "                                         SuyuRecompGuardGenModule* out,\n"
+                         "                                         unsigned max) {\n"
+                         "  unsigned n=0;\n"
+                      << "  if(max<" << ordered.size() << "u) return 0;\n";
+                    for (const auto& m : ordered) {
+                        o << "  out[n].word=recomp_image_guard_gen_v1_" << m
+                          << "(host_version,&out[n].code_lo,&out[n].code_end,&out[n].base);\n"
+                             "  if(!out[n++].word) return 0;\n";
+                    }
+                    o << "  return n;\n}\n";
+                }
                 reg.close();
                 QFile abi_marker(recomp_root + QDir::separator() + QStringLiteral("recomp_abi_v4.h"));
                 if (abi_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -3133,6 +3175,17 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     }
                 } else {
                     QFile::remove(features_marker_path);
+                }
+                const QString guard_gen_marker_path =
+                    recomp_root + QDir::separator() + QStringLiteral("recomp_guard_gen_v1.h");
+                if (suyu::recomp::EmitGuardGen()) {
+                    QFile guard_gen_marker(guard_gen_marker_path);
+                    if (guard_gen_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                        guard_gen_marker.write(
+                            "/* ABI 6 registry exports suyu_recomp_static_guard_gen_v1. */\n");
+                    }
+                } else {
+                    QFile::remove(guard_gen_marker_path);
                 }
             }
         };
@@ -3557,6 +3610,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         out << "{\n";
         out << "  \"version\": 2,\n";
         out << "  \"image_abi\": " << (suyu::recomp::g_emit_fastmem ? 6 : 5) << ",\n";
+        if (suyu::recomp::g_emit_fastmem) {
+            out << "  \"image_features\": " << image_features << ",\n";
+        }
         out << "  \"correctness_revision\": \"20260920-fixedpoint-v1\",\n";
         out << "  \"source_exefs_sha256\": \"" << source_hash << "\",\n";
         out << "  \"translate_all\": " << (translate_all ? "true" : "false") << ",\n";

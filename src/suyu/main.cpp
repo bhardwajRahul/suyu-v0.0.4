@@ -7253,6 +7253,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
 
     std::vector<QLibrary*> found;
     std::vector<RecompImage> records;
+    // ABI 6 GG1 handshakes, handed over once the bundle is accepted.
+    std::vector<Core::RecompGuardGen::Module> guard_gen_modules;
     const auto discard_found = [&] {
         for (auto* prior : found) {
             prior->unload();
@@ -7260,6 +7262,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
         }
         found.clear();
         records.clear();
+        guard_gen_modules.clear();
     };
     for (const QString& image_path : image_paths) {
         auto* lib = new QLibrary(image_path, this);
@@ -7311,7 +7314,22 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
                 discard_found();
                 return 0;
             }
-            abi_ok = features && (features() & 1u) && fastmem_v1 &&
+            // GG1 images complete the FM1 handshake only after this one.
+            if (features && (features() & Core::RecompImageFeature::GuardGen1)) {
+                using GuardGenFn = u32* (*)(u32, u64*, u64*, const u64**);
+                auto* guard_gen_v1 =
+                    reinterpret_cast<GuardGenFn>(lib->resolve("recomp_image_guard_gen_v1"));
+                Core::RecompGuardGen::Module gg{};
+                gg.word = guard_gen_v1 ? guard_gen_v1(Core::RecompGuardGen::kHostVersion,
+                                                      &gg.code_lo, &gg.code_end, &gg.base)
+                                       : nullptr;
+                if (gg.word) {
+                    guard_gen_modules.push_back(gg);
+                } else {
+                    abi_ok = false;
+                }
+            }
+            abi_ok = abi_ok && features && (features() & 1u) && fastmem_v1 &&
                      fastmem_v1(layout.page_bits, layout.stride_log2, layout.pointer_mask,
                                 layout.off_table, layout.off_limit) == 1;
         }
@@ -7563,6 +7581,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
     Core::SetRecompFastmemReady(expected_bundle_abi == FastmemRecompImageAbi);
     LOG_INFO(Frontend, "Recompiled image ABI {}; page-table fastmem: {}", expected_bundle_abi,
              expected_bundle_abi == FastmemRecompImageAbi ? "negotiated" : "not used");
+    // After SetRecompLookup, which forgets any earlier modules. Logs its outcome.
+    Core::SetRecompGuardGenModules(std::move(guard_gen_modules));
     LOG_INFO(Frontend, "Loaded {} recompiled module image(s) from {}", loaded_images.size(),
              dir.toStdString());
     return static_cast<int>(loaded_images.size());

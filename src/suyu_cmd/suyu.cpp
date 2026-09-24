@@ -202,6 +202,18 @@ int suyu_recomp_static_fastmem_v1(u32 page_bits, u32 stride_log2, u64 pointer_ma
 // ABI 6 registrations: the OR of every module's recomp_image_features().
 unsigned suyu_recomp_static_features_v1(void);
 #endif
+#ifdef SUYU_RECOMP_GUARD_GEN_V1
+// ABI 6 GG1 registrations: every module's recomp_image_guard_gen_v1 result, in
+// load order. Returns the number filled, or 0 if any module refused.
+struct SuyuRecompGuardGenModule {
+    u32* word;
+    const u64* base;
+    u64 code_lo;
+    u64 code_end;
+};
+unsigned suyu_recomp_static_guard_gen_v1(u32 host_version, SuyuRecompGuardGenModule* out,
+                                         unsigned max);
+#endif
 #endif
 }
 
@@ -1389,6 +1401,8 @@ int main(int argc, char** argv) {
         return true;
     };
     [[maybe_unused]] const auto fastmem_layout = Core::GetRecompFastmemLayout();
+    // ABI 6 GG1: filled by the handshakes below, handed over after SetRecompLookup.
+    std::vector<Core::RecompGuardGen::Module> recomp_guard_gen_modules;
 
     // Preferred path: modules compiled straight into this executable. Nothing
     // to find on disk, nothing to load, and no version skew between the exe and
@@ -1433,6 +1447,25 @@ int main(int argc, char** argv) {
                              "host does not implement; update suyu or re-export with this build",
                              unknown);
                 return EXIT_FAILURE;
+            }
+            // GG1 images complete the FM1 handshake only after this one.
+            if (features & Core::RecompImageFeature::GuardGen1) {
+                bool guard_gen_ok = false;
+#ifdef SUYU_RECOMP_GUARD_GEN_V1
+                std::vector<SuyuRecompGuardGenModule> gg(count);
+                const unsigned filled = suyu_recomp_static_guard_gen_v1(
+                    Core::RecompGuardGen::kHostVersion, gg.data(), count);
+                guard_gen_ok = filled == count;
+                for (unsigned i = 0; guard_gen_ok && i < filled; ++i) {
+                    recomp_guard_gen_modules.push_back(
+                        {gg[i].word, gg[i].base, gg[i].code_lo, gg[i].code_end});
+                }
+#endif
+                if (!guard_gen_ok) {
+                    LOG_CRITICAL(Frontend, "ABI 6 static modules refused the generation guard "
+                                           "handshake; re-export all modules with this build");
+                    return EXIT_FAILURE;
+                }
             }
             bool fastmem_ok = false;
 #ifdef SUYU_RECOMP_FASTMEM_V1
@@ -1510,6 +1543,25 @@ int main(int argc, char** argv) {
                         FreeLibrary(h);
                         return EXIT_FAILURE;
                     }
+                    // GG1 images complete the FM1 handshake only after this one.
+                    if (features && (features() & Core::RecompImageFeature::GuardGen1)) {
+                        using GuardGenFn = u32* (*)(u32, u64*, u64*, const u64**);
+                        auto guard_gen_v1 = reinterpret_cast<GuardGenFn>(
+                            GetProcAddress(h, "recomp_image_guard_gen_v1"));
+                        Core::RecompGuardGen::Module gg{};
+                        gg.word = guard_gen_v1 ? guard_gen_v1(Core::RecompGuardGen::kHostVersion,
+                                                              &gg.code_lo, &gg.code_end, &gg.base)
+                                               : nullptr;
+                        if (!gg.word) {
+                            LOG_CRITICAL(Frontend,
+                                         "{} refused the generation guard handshake; re-export "
+                                         "all modules with this build",
+                                         Common::UTF16ToUTF8(dll_name));
+                            FreeLibrary(h);
+                            return EXIT_FAILURE;
+                        }
+                        recomp_guard_gen_modules.push_back(gg);
+                    }
                     if (!features || !(features() & 1u) || !fastmem_v1 ||
                         fastmem_v1(fastmem_layout.page_bits, fastmem_layout.stride_log2,
                                    fastmem_layout.pointer_mask, fastmem_layout.off_table,
@@ -1558,6 +1610,9 @@ int main(int argc, char** argv) {
         Core::SetRecompFastmemReady(recomp_bundle_abi == 6);
         LOG_INFO(Frontend, "Recompiled image ABI {}; page-table fastmem: {}", recomp_bundle_abi,
                  recomp_bundle_abi == 6 ? "negotiated" : "not used");
+        // After SetRecompLookup, which forgets any earlier modules, and before
+        // the process exists. Logs its own outcome.
+        Core::SetRecompGuardGenModules(std::move(recomp_guard_gen_modules));
         // Route base to the module at the same index in load order.
         // rtld=index0, main=index1, subsdk0=index2, ..., sdk=last.
         Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {
