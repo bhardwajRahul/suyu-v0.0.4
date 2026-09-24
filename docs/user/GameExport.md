@@ -45,6 +45,15 @@ race, Hybrid at 31–35 and static at about 25.
 - **Build** is the default on Windows. It produces a standalone program. The Hybrid
   and static backends compile the generated code, which needs CMake and a C compiler
   and can take a long time for large games.
+
+  On Windows, the game code runs faster when LLVM/Clang is installed, because the
+  export then compiles it with clang-cl instead of Microsoft's compiler (it also
+  compiles faster). To get it, run `winget install LLVM.LLVM`, or add **C++ Clang
+  tools for Windows** in the Visual Studio Installer. The export uses Microsoft's
+  compiler when Clang is missing or does not work, and the export log and the
+  package's `README_NATIVE_EXPORT.txt` say which compiler it used. To choose a
+  particular `clang-cl.exe`, set `SUYU_CLANG_CL` to its path; to use Microsoft's
+  compiler anyway, set `SUYU_RECOMP_COMPILER=msvc`.
 - **Source** writes the generated C project, its `CMakeLists.txt` and a build script,
   and stops there. It does not include a compiled program. This is the only format for
   Linux and macOS.
