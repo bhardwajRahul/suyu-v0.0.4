@@ -50,6 +50,8 @@ FMA emulation) must show value mismatches in L3; `mxcsr` runs FPX1 with the host
 FP mode poisoned (x86-64: FTZ, DAZ, round toward zero; AArch64: FZ and round
 toward zero) and must show mismatches; `env` poisons the mode the same way but
 first lets the host's own check (`core/arm/recomp/guest_fp_env.h`, as ArmRecomp
-runs it) repair it, and must show none. Hosts differ in whether FPX1 double
+runs it) repair it, and must show none. `inhibit` sets the host's kill-switch
+bit (bit 32 of fpcr) and requires the exact body's result, no fast-path hit,
+and MRS/MSR FPCR that neither expose nor clear the bit. Hosts differ in whether FPX1 double
 precision FMA forms have a fast path (x86-64 needs `__FMA__`), so their hit
 rate can be 0 there.

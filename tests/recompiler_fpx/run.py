@@ -104,6 +104,11 @@ def main():
                 print(f"CONTROL {name}: {found} mismatches",
                       "(fails as designed)" if found else "(DID NOT FAIL)")
                 status |= failed or not found
+            result = subprocess.run([str(driver), "inhibit", "--cases", str(args.cases)], check=False,
+                                    capture_output=True, text=True, **low_priority())
+            print("".join(line + "\n" for line in result.stdout.splitlines()
+                          if line.startswith("INHIBIT")), end="")
+            status |= result.returncode != 0
             # L6(d): the same poisoning, repaired by the host's own check first.
             result = subprocess.run([str(driver), "env", "--legs", "13", *common], check=False,
                                     capture_output=True, text=True, **low_priority())

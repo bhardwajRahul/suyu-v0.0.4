@@ -14,6 +14,7 @@
           driver check FILE [options] recompute hashes for soft (and fpx) and compare
           driver control NAME [options]  nokeep | nomid | mxcsr: must find mismatches
           driver env   [options]      poisoned host FP mode repaired by the host shim
+          driver inhibit [options]    the host kill switch (fpcr bit 32) turns FPX1 off
    options: --cases N (L1 cases per word per FPCR), --legs 1234, --seed S,
             --shard I/N, --l4-step K, --word 0xXXXXXXXX, --adv N (L3 cases) */
 #include "rt_soft.h"
@@ -63,7 +64,7 @@ static int ImplAvailable(int impl) {
 
 /* q0..q3 as lo/hi pairs, then x0, x1, NZCV in bits 31..28: the layout hw.c reads. */
 typedef struct { uint64_t w[11]; } In;
-typedef struct { uint64_t q0[2], x0, nzcv, fpsr; } Out;
+typedef struct { uint64_t q0[2], x0, nzcv, fpsr, fpcr; } Out;
 
 static GuestContext g_ctx[I_COUNT];
 
@@ -75,6 +76,7 @@ static void Run(int impl, unsigned op, const In* in, uint64_t fpcr, uint64_t fs0
         out->q0[0] = o[0]; out->q0[1] = o[1]; out->x0 = o[2];
         out->nzcv = o[3] & 0xf0000000u;
         out->fpsr = fs0 | (fs & 0x9f);
+        out->fpcr = fpcr;
         return;
     }
 #endif
@@ -97,6 +99,7 @@ static void Run(int impl, unsigned op, const In* in, uint64_t fpcr, uint64_t fs0
     out->nzcv = ((uint64_t)(c->n & 1) << 31) | ((uint64_t)(c->z & 1) << 30) |
                 ((uint64_t)(c->c & 1) << 29) | ((uint64_t)(c->v & 1) << 28);
     out->fpsr = c->fpsr;
+    out->fpcr = c->fpcr;
 }
 
 static int SameValue(const Out* a, const Out* b) {
@@ -783,6 +786,38 @@ int main(int argc, char** argv) {
         /* The verdict needs every shard's count; run.py adds them up. */
         printf("CONTROL %s: %llu mismatches\n", name, bad);
         return 0;
+    }
+    if (!strcmp(mode, "inhibit")) {
+        /* With bit 32 of fpcr set every op must take the exact body: same
+           result and FPSR as soft at FPCR 0, no fast-path hit, the bit kept,
+           and MRS/MSR FPCR must neither expose nor clear it. */
+        const uint64_t inhibit = 1ULL << 32;
+        unsigned long long cases = 0, bad = 0;
+        ParseOpts(argc, argv, 2, &o);
+        for (unsigned op = 0; op < FPX_NWORDS; ++op) {
+            if (!Selected(&o, op)) continue;
+            In in;
+            Out ref, got;
+            Seed(o.seed, g_fpx_words[op].word, 0, 9);
+            for (unsigned long t = 0; t < o.cases; ++t) {
+                RandomInput(op, &in);
+                const uint64_t fs0 = RandomFs0() | 0x10;
+                const unsigned long long hits = g_fpx_probe[1];
+                Run(I_SOFT, op, &in, 0, fs0, &ref);
+                Run(I_FPX, op, &in, inhibit, fs0, &got);
+                int ok = SameValue(&ref, &got) && ref.fpsr == got.fpsr && g_fpx_probe[1] == hits &&
+                         (got.fpcr & inhibit);
+                if (!strncmp(g_fpx_words[op].text, "msr fpcr", 8))
+                    ok = ok && got.fpcr == ((in.w[9] & 0xffffffffULL) | inhibit);
+                if (!strncmp(g_fpx_words[op].text, "mrs", 3)) ok = ok && got.x0 == 0;
+                ++cases;
+                if (!ok && bad++ < 4)
+                    printf("  inhibit %s: x0 %016llx fpcr %016llx\n", g_fpx_words[op].text,
+                           (unsigned long long)got.x0, (unsigned long long)got.fpcr);
+            }
+        }
+        printf("INHIBIT cases %llu mismatches %llu\n", cases, bad);
+        return bad ? 1 : 0;
     }
 #endif
 #ifdef FPX_HAVE_ENV

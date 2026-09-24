@@ -177,5 +177,7 @@ static const FpxWord g_fpx_words[] = {
     {0x5ea1d820u, "frecpe s0, s1", 'S', 1},
     {0x6ea1d820u, "frsqrte v0.4s, v1.4s", 'S', 1},
     {0x4ee1d820u, "frecpe v0.2d, v1.2d", 'D', 1},
+    {0xd53b4400u, "mrs x0, fpcr", 'X', 1},
+    {0xd51b4401u, "msr fpcr, x1", 'X', 1},
 };
 #define FPX_NWORDS (sizeof g_fpx_words / sizeof g_fpx_words[0])

@@ -178,3 +178,5 @@ fabs v0.4s, v1.4s | S | 1
 frecpe s0, s1 | S | 1
 frsqrte v0.4s, v1.4s | S | 1
 frecpe v0.2d, v1.2d | D | 1
+mrs x0, fpcr | X | 1
+msr fpcr, x1 | X | 1
