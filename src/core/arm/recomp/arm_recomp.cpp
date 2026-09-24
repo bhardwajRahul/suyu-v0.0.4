@@ -632,10 +632,12 @@ void ReportRecompCoverage() {
         LOG_INFO(Core_ARM,
                  "recomp generation guard: enabled={} active={} generation={} modules={} "
                  "sticky={} bumps: activate={} map={} unmap={} protect={} device={} "
-                 "invalidate={} invalidate_all={} new_table={} map_log={}{}",
+                 "invalidate={} invalidate_all={} new_table={} code_write={} pointer={} "
+                 "jit={} map_log={}{}",
                  gg.enabled, gg.active, gg.generation, gg.modules, gg.sticky, n(R::Activate),
                  n(R::Map), n(R::Unmap), n(R::Protect), n(R::DeviceMap), n(R::Invalidate),
-                 n(R::InvalidateAll), n(R::PageTableSwap), gg.map_log,
+                 n(R::InvalidateAll), n(R::PageTableSwap), n(R::CodeWrite),
+                 n(R::PointerExposed), n(R::JitFallback), gg.map_log,
                  gg.map_log_overflow ? " (overflowed)" : "");
     }
     const std::string report = FormatRecompCoverage();
