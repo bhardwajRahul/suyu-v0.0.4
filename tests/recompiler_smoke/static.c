@@ -13,6 +13,13 @@
     extern int g_recomp_guard_host_v2_##name
 MODULE(smoke);
 MODULE(second);
+#ifdef RECOMP_FEATURE_FASTMEM_PT1
+#define FASTMEM_MODULE(name) \
+    extern unsigned recomp_image_features_##name(void); \
+    extern unsigned recomp_image_fastmem_v1_##name(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t)
+FASTMEM_MODULE(smoke);
+FASTMEM_MODULE(second);
+#endif
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
 static void context_at(GuestContext* c, uint64_t base, int budget) {
@@ -29,7 +36,15 @@ int main(void) {
     uint64_t first_lo, first_hi, second_lo, second_hi;
     BlockFn *first_index, *second_index;
     GuestContext first, second;
+#ifdef RECOMP_FEATURE_FASTMEM_PT1
+    CHECK(recomp_image_abi_smoke() == 6 && recomp_image_abi_second() == 6);
+    CHECK(recomp_image_features_smoke() & recomp_image_features_second() & RECOMP_FEATURE_FASTMEM_PT1);
+    CHECK(recomp_image_fastmem_v1_smoke(12, 5, ~(uint64_t)3, 872, 880) == 1);
+    CHECK(recomp_image_fastmem_v1_second(12, 5, ~(uint64_t)3, 872, 880) == 1);
+    CHECK(recomp_image_fastmem_v1_second(12, 5, ~(uint64_t)3, 872, 872) == 0);
+#else
     CHECK(recomp_image_abi_smoke() == 5 && recomp_image_abi_second() == 5);
+#endif
     CHECK(g_recomp_guard_host_v2_smoke == 0 && g_recomp_guard_host_v2_second == 0);
     CHECK(recomp_image_guard_v2_smoke(2) == 2);
     CHECK(g_recomp_guard_host_v2_smoke == 2 && g_recomp_guard_host_v2_second == 0);
