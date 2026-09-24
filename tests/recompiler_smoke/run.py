@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Compile and execute synthetic ABI 5, ABI 6 and ABI 6 + GG1 tests; requires only Python, CMake, C/C++."""
+"""Compile and execute synthetic ABI 5, ABI 6 and ABI 6 + GG1 tests, and the coverage loop;
+requires only Python, CMake, C/C++."""
 import argparse
 import hashlib
 import os
@@ -131,6 +132,37 @@ def check_ggfpx(abi6gg, ggfpx):
             raise RuntimeError(f"{module}: GG1+FPX1 handshake presence is wrong")
 
 
+def check_coverage_loop(root, exporter, build):
+    """recomp_gaps.json end to end: record a miss, re-export with it, run statically."""
+    env = dict(os.environ)
+    for key in ("SUYU_RECOMP_AB_FASTMEM", "SUYU_RECOMP_AB_GUARD_GEN", "SUYU_RECOMP_AB_FPX"):
+        env.pop(key, None)
+    gaps = root / "loop-gaps.json"
+
+    def export(name, gaps_file=None):
+        out = root / name
+        call([exporter, "--loop", out] + ([gaps_file] if gaps_file else []), env=env)
+        return out
+
+    first = export("loop-1")
+    call([executable(build("run-loop-1", f"-DLOOP_DIR={first}"), "smoke_loop"), "record", gaps])
+    # No usable gaps must leave the output byte-identical: an empty file, and
+    # gaps recorded against another build of the module.
+    empty = root / "loop-empty.json"
+    empty.write_text('{"schema": "suyu-recomp-gaps", "schema_version": 1, "runs": 3, '
+                     '"clean_runs": 3}\n')
+    other = root / "loop-other.json"
+    other.write_text(gaps.read_text().replace("5eedc0de", "5eedc0df"))
+    for name, gaps_file in (("loop-empty", empty), ("loop-other", other)):
+        if tree_hash(export(name, gaps_file)) != tree_hash(first):
+            raise RuntimeError(f"{name}: output changed without a matching gap")
+    second = export("loop-2", gaps)
+    if tree_hash(second) == tree_hash(first):
+        raise RuntimeError("the recorded gap did not reach block discovery")
+    call([executable(build("run-loop-2", f"-DLOOP_DIR={second}"), "smoke_loop"), "static", gaps])
+    print("Coverage loop checks passed.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2])
@@ -155,7 +187,10 @@ def main():
             call([args.cmake, "--build", directory, "--config", "Release", "--parallel", "2"])
             return directory
 
-        exporter = executable(build("export"), "smoke_export")
+        export_build = build("export")
+        exporter = executable(export_build, "smoke_export")
+        call([executable(export_build, "smoke_gaps_unit")])
+        check_coverage_loop(root, exporter, build)
         generated = {}
         for name, switches in VARIANTS:
             generated[name] = root / f"generated-{name}"

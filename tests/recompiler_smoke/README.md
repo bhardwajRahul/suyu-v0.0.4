@@ -81,3 +81,25 @@ The block-count assertions also exercise the host accounting formula: the first
 block is counted on entry; a budget decrement to zero parks the next PC without
 executing another block. This suite checks generated-code behavior, not full
 emulator integration or title compatibility.
+
+## Coverage loop (recomp_gaps.json)
+
+`smoke_gaps_unit` checks `core/arm/recomp/recomp_gaps.cpp` on its own: the
+schema (exact round trip, a wrong or newer schema refused, unknown keys
+ignored), merging and deduplication across runs, the per-module offset bound,
+exact build-ID matching (case and zero padding aside; an all-zero ID matches
+nothing), that no directory survives into a file, and how the session recorder
+classifies a miss: an offset in a module with an image, a hit on a module
+without one, or unattributed.
+
+The loop itself uses a synthetic module (`loop_code.h`) whose first function
+calls a second through a pointer loaded from memory. Block discovery indexes
+every nonzero word, so the only code it leaves out is a zero word straight
+after an unconditional branch or return; the callee starts on one. The first
+export has no block there, and `smoke_loop record` sees the call miss exactly
+as ArmRecomp would, records it with the real recorder and merges it into a
+gaps file. Exporting again with an empty gaps file, or with gaps recorded
+against another build ID, must reproduce the first tree byte for byte; with
+the recorded file the tree must change, and `smoke_loop static` then finds a
+block at the callee and the same call stays in recompiled code (stopping on
+the callee's own `udf #0`, reported as an unimplemented opcode, not a miss).
