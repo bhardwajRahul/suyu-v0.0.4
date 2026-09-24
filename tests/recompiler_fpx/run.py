@@ -97,14 +97,13 @@ def main():
             for name in ("nokeep", "nomid", "mxcsr"):
                 failed, text = sharded(driver, ["control", name, "--legs", "13", *common], args.jobs,
                                        logs, name)
-                print("".join(line + "\n" for line in text.splitlines()
-                              if line.startswith(("CONTROL", "LEG"))), end="")
-                status |= failed
-            result = subprocess.run([str(driver), "env", "--legs", "13", *common], check=False,
-                                    capture_output=True, text=True, **low_priority())
-            print("".join(line + "\n" for line in result.stdout.splitlines()
-                          if line.startswith(("ENV", "LEG", "TOTAL"))), end="")
-            status |= result.returncode != 0
+                print("".join(line + "\n" for line in text.splitlines() if line.startswith("LEG")),
+                      end="")
+                found = sum(int(line.split()[2]) for line in text.splitlines()
+                            if line.startswith("CONTROL"))
+                print(f"CONTROL {name}: {found} mismatches",
+                      "(fails as designed)" if found else "(DID NOT FAIL)")
+                status |= failed or not found
         print("FPX harness:", "FAILED" if status else "passed")
         sys.exit(1 if status else 0)
 

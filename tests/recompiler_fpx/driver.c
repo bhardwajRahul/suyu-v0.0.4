@@ -35,7 +35,9 @@ extern const FpxOpFn g_ops_nokeep[];
 extern const FpxOpFn g_ops_nomid[];
 /* RECOMP_FPX_PROBE in ops_fpx.c: [1] fast path kept, [2] fell through. */
 unsigned long long g_fpx_probe[3];
-/* The host's EnsureGuestFpEnv (fpx_env.cpp); returns 1 if it had to repair. */
+#endif
+#ifdef FPX_HAVE_ENV
+/* The host's FP-environment repair (fpx_env.cpp); returns 1 if it changed anything. */
 int fpx_env_shim(void);
 #endif
 #ifdef FPX_HAVE_HW
@@ -778,9 +780,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(name, "nomid")) { const int c[] = {I_NOMID}; bad = Diff(&o, I_SOFT, c, 1, 0, 0, 0); }
         else if (!strcmp(name, "mxcsr")) { const int c[] = {I_FPX}; bad = Diff(&o, I_SOFT, c, 1, 1, 0, 0); }
         else { fprintf(stderr, "unknown control\n"); return 2; }
-        printf("CONTROL %s: %llu mismatches (%s)\n", name, bad, bad ? "fails as designed" : "DID NOT FAIL");
-        return bad ? 0 : 1;
+        /* The verdict needs every shard's count; run.py adds them up. */
+        printf("CONTROL %s: %llu mismatches\n", name, bad);
+        return 0;
     }
+#endif
+#ifdef FPX_HAVE_ENV
     if (!strcmp(mode, "env")) {
         /* L6(d): poison the host mode, let the host's check repair it, then run. */
         ParseOpts(argc, argv, 2, &o);

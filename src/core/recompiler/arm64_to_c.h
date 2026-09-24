@@ -319,6 +319,12 @@ inline bool EmitGuardGen() {
     return g_emit_fastmem && g_emit_guard_gen;
 }
 
+// ABI 6 "FPX1": exact native floating point. Each FP op the option covers gets a
+// native fast path whose result is kept only when it provably equals the
+// architectural result and adds no FPSR bit the guest has not already set;
+// anything else runs the unchanged exact body. Off by default, and while it is
+// off the emitted text is byte-identical to what it would be without it.
+inline bool g_emit_fpx = false;
 // Strict static exports have no fallback to carry deliberately gated forms.
 inline bool TranslateAllForExport(bool strict_static, bool explicitly_requested) {
     return strict_static || explicitly_requested;
@@ -452,11 +458,26 @@ inline std::string Xsp(u32 r) {
 // Emit one baseline S/D addition/subtraction from raw uint64_t _a/_b to _v.
 // Three guard bits plus sticky alignment preserve exact rounding, including
 // cancellation. No host FP arithmetic or host FP state is involved.
-// Use the integer value emitter on every host. The former native shortcut
-// did not publish guest FPSR flags and depended on the ambient host FPCR.
-// Reintroduce it only with value/status differential tests on AArch64.
-inline std::string EmitFPNativeValue(bool /*dbl*/, const char* /*op*/) {
-    return {};
+// The integer value emitter is the reference on every host. With FPX1 each
+// covered op first tries recomp_fpx_<op> (recomp_runtime.h), which computes
+// natively and answers 0 unless the result is provably exact (see the FPX1
+// block of the runtime header); the exact body is the fallback. The prefix
+// opens a do{ ... }while(0) whose break skips the exact body, and
+// EmitFPNativeSuffix closes it. `op` names the helper: add, sub, mul, div
+// or fma.
+inline std::string FpxArgs(const char* op) {
+    if (!std::strcmp(op, "fma")) return "_a,_b,_z";
+    return "_a,_b";
+}
+inline std::string EmitFPNativeValue(bool dbl, const char* op) {
+    if (!g_emit_fpx) return {};
+    const std::string call = std::string("recomp_fpx_") + op + (dbl ? "64(" : "32(") + FpxArgs(op);
+    return "do{if(RECOMP_FPX_OPEN(c)&&RECOMP_LIKELY(" + call +
+           ",&_v))){RECOMP_FPX_PROBE(1);break;}RECOMP_FPX_PROBE(2);";
+}
+inline std::string EmitFPNativeSuffix(bool /*dbl*/, const char* /*op*/) {
+    if (!g_emit_fpx) return {};
+    return "}while(0);";
 }
 
 inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
@@ -495,7 +516,7 @@ inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
         "if(_rounded>=(_hidden<<1)){_rounded>>=1;++_ea;}"
         "if(_ea>=(unsigned)(_exp>>_f)){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_sa)||(_mode==2&&_sa))?_exp:_exp-1;}"
         "else _v=((_rounded>=_hidden?(uint64_t)_ea:0)<<_f)|(_rounded&_frac);}"
-        "if(_sa)_v|=_sign;}}}";
+        "if(_sa)_v|=_sign;}}}" + EmitFPNativeSuffix(dbl, subtract ? "sub" : "add");
 }
 
 // Generated exact product/addend lattice. Inputs _a,_b,_z and output _v are
@@ -541,7 +562,7 @@ else {
  }
 }
 }
-)C";
+)C" + EmitFPNativeSuffix(dbl, "div");
 }
 
 // Architectural reciprocal estimate. The estimate is deliberately computed
@@ -612,8 +633,10 @@ else {
     return s;
 }
 
-inline std::string EmitFPMulAddValue(bool dbl) {
-    std::string s=EmitFPNativeValue(dbl, "fma")+
+// `mul` marks a multiply (FMUL/FNMUL), whose addend is the sign-matched zero
+// the caller supplies: the fast path then needs no fused multiply-add.
+inline std::string EmitFPMulAddValue(bool dbl, bool mul = false) {
+    std::string s=EmitFPNativeValue(dbl, mul ? "mul" : "fma")+
         "{ const unsigned _f="+std::string(dbl?"52":"23")+
         ",_bias="+(dbl?"1023":"127")+",_count="+(dbl?"67":"9")+
         "; const int _base="+(dbl?"-2148":"-298")+"; uint64_t _p["+
@@ -678,6 +701,7 @@ else {
 }
 }
 )C";
+    s += EmitFPNativeSuffix(dbl, mul ? "mul" : "fma");
     return s;
 }
 
@@ -3224,6 +3248,18 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         constexpr u32 kFpsr = 0x5A21;
         if (sysreg == kFpcr || sysreg == kFpsr) {
             const char* field = (sysreg == kFpcr) ? "fpcr" : "fpsr";
+            if (g_emit_fpx && sysreg == kFpcr) {
+                // FPX1: bit 32 of fpcr is the host's kill switch. The guest
+                // register is 32 bits, so it never sees the bit or clears it.
+                if (is_read) {
+                    if (rt != 31) {
+                        put("c->x[" + std::to_string(rt) + "] = c->fpcr & 0xffffffffULL;");
+                    }
+                } else {
+                    put("c->fpcr = (" + Xz(rt) + " & 0xffffffffULL) | (c->fpcr & RECOMP_FPX_INHIBIT);");
+                }
+                return true;
+            }
             if (is_read) {
                 if (rt != 31) {
                     put("c->x[" + std::to_string(rt) + "] = c->" + std::string(field) + ";");
@@ -3739,7 +3775,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             ");memcpy(&_b,c->vreg["+std::to_string(rm)+"],"+sz+");_z=(_a^_b)&"+
             std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
         if(divide)put("(void)_z;");
-        put(divide?EmitFPDivideValue(dbl):EmitFPMulAddValue(dbl));
+        put(divide?EmitFPDivideValue(dbl):EmitFPMulAddValue(dbl,true));
         // FNMUL negates the rounded product, including NaN/zero sign. Moving
         // this sign change to an input would reverse directed rounding.
         if(negate)put("_v^="+std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
@@ -4234,7 +4270,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 const std::string sign=dbl?"0x8000000000000000ULL":"0x80000000ULL";
                 if(idxop==9)s+="_z=(_a^_b)&"+sign+";";
                 if(idxop==5)s+="_a^="+sign+";";
-                s+=EmitFPMulAddValue(dbl);
+                s+=EmitFPMulAddValue(dbl,idxop==9);
                 s+="_r[_i]=("+std::string(ct)+")_v;}}";
                 s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                      "][1]=0; ";
@@ -4669,7 +4705,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                     "memcpy(_m,c->vreg["+std::to_string(rm)+"],"+std::to_string(vbytes)+");"
                     "for(unsigned _j=0;_j<"+std::to_string(fne)+";++_j){uint64_t _a=_n[_j],_b=_m[_j],_z=(_a^_b)&"+
                     std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+",_v;");
-                put(EmitFPMulAddValue(dbl));
+                put(EmitFPMulAddValue(dbl,true));
                 put("_d[_j]=("+ty+")_v;}memcpy(c->vreg["+std::to_string(rd)+"],_d,"+std::to_string(vbytes)+");");
                 if(!Q)put("c->vreg["+std::to_string(rd)+"][1]=0;");
                 put("}");
@@ -5558,6 +5594,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        // downgrade it back to a warning for generated sources specifically.
        << "  set(_recomp_msvc_opts \"/O2\" \"/bigobj\" \"/WX-\" \"/wd4127\" \"/wd4723\" \"/wd4102\" "
           "\"/wd4101\" \"/wd4189\" \"/wd4456\" \"/wd4457\" \"/wd4459\")\n"
+       // FPX1's fast paths need IEEE arithmetic; fast-math compiles them out
+       // (RECOMP_FPX_HOST 0), so pin the model rather than inherit one.
+       << (g_emit_fpx ? "  list(APPEND _recomp_msvc_opts \"/fp:precise\")\n" : "")
        << "  if(NOT CMAKE_GENERATOR MATCHES \"Ninja\")\n"
        // Bare /MP means "one compile per core", which is exactly the
        // oversubscription that exhausts memory on these units.
@@ -5576,6 +5615,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        // Same reasoning as /WX- above: a host tree built with -Werror must not
        // fail on a shadowed local inside generated code.
        << "  list(APPEND _recomp_opt \"-Wno-error\")\n"
+       << (g_emit_fpx ? "  list(APPEND _recomp_opt \"-ffp-contract=off\" \"-fno-fast-math\")\n" : "")
        << "  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "
           "\"${_recomp_opt}\")\n"
        << "endif()\n\n"
@@ -5659,6 +5699,11 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     if (g_emit_fastmem) {
         cm << " recomp_image_features=recomp_image_features_" << mod
            << " recomp_image_fastmem_v1=recomp_image_fastmem_v1_" << mod;
+    } else if (g_emit_fpx) {
+        cm << " recomp_image_features=recomp_image_features_" << mod;
+    }
+    if (g_emit_fpx) {
+        cm << " recomp_image_fpx_v1=recomp_image_fpx_v1_" << mod;
     }
     if (EmitGuardGen()) {
         cm << " g_recomp_gg_word=g_recomp_gg_word_" << mod
@@ -5733,11 +5778,10 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         ex << "/* ABI 6 feature handshake. The host passes its own view of the page\n"
               "   table layout and of the context offsets; 1 means this image was\n"
               "   compiled against exactly those, so the host may enable fm_limit. */\n"
-           << (EmitGuardGen() ? "RECOMP_API unsigned recomp_image_features(void){ return "
-                                "RECOMP_FEATURE_FASTMEM_PT1|RECOMP_FEATURE_GUARD_GEN1; }\n"
-                              : "RECOMP_API unsigned recomp_image_features(void){ return "
-                                "RECOMP_FEATURE_FASTMEM_PT1; }\n")
-           << "RECOMP_API unsigned recomp_image_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
+              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FASTMEM_PT1"
+           << (EmitGuardGen() ? " | RECOMP_FEATURE_GUARD_GEN1" : "")
+           << (g_emit_fpx ? " | RECOMP_FEATURE_FPX1" : "") << "; }\n"
+              "RECOMP_API unsigned recomp_image_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
               "                                            uint64_t ptr_mask, uint32_t off_table,\n"
               "                                            uint32_t off_limit){\n"
            << (EmitGuardGen() ? "  if(!g_recomp_gg_host) return 0;\n" : "")
@@ -5745,6 +5789,21 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
               "         ptr_mask==(uint64_t)RECOMP_FM_PTR_MASK &&\n"
               "         off_table==offsetof(GuestContext,fm_table) &&\n"
               "         off_limit==offsetof(GuestContext,fm_limit);\n"
+              "}\n";
+    } else if (g_emit_fpx) {
+        ex << "/* ABI 6 feature report. */\n"
+              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FPX1; }\n";
+    }
+    if (g_emit_fpx) {
+        ex << "/* FPX1 handshake. The host passes its own view of the FP control and\n"
+              "   status fields and of its kill-switch bit; nonzero means this image was\n"
+              "   compiled against exactly those. The low byte is RECOMP_FPX_HOST, the\n"
+              "   fast path this image was compiled to (0: compiled out). */\n"
+              "RECOMP_API unsigned recomp_image_fpx_v1(uint32_t off_fpcr, uint32_t off_fpsr,\n"
+              "                                        uint64_t inhibit_bit){\n"
+              "  if(off_fpcr!=offsetof(GuestContext,fpcr) || off_fpsr!=offsetof(GuestContext,fpsr) ||\n"
+              "     inhibit_bit!=RECOMP_FPX_INHIBIT) return 0;\n"
+              "  return 0x100u | (unsigned)RECOMP_FPX_HOST;\n"
               "}\n";
     }
     ex << "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
@@ -6283,7 +6342,265 @@ RECOMP_GG_STATIC RECOMP_NOINLINE void recomp_gg_miss(GuestContext* c,uint32_t* s
 )RT";
 }
 
-inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false) {
+// ABI 6 feature FPX1 pieces of the runtime header. Empty unless the option is on.
+// Kept under MSVC's 16380-byte limit per string literal.
+inline const char* FpxAbiH() {
+    return R"RT(6
+/* ABI 6 without FM1 carries only FPX1 below. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RECOMP_NOINLINE __declspec(noinline)
+#define RECOMP_LIKELY(x) (x)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_NOINLINE __attribute__((noinline))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define RECOMP_NOINLINE
+#define RECOMP_LIKELY(x) (x)
+#endif
+)RT";
+}
+
+inline const char* FpxH() {
+    return R"RT(
+/* ABI 6 feature FPX1: exact native floating point.
+
+   A covered op (FADD/FSUB/FMUL/FNMUL/FDIV/FMLA-family/FRECPS/FRSQRTS/FSQRT,
+   S and D, scalar and per lane) first computes natively, and keeps that result
+   only when it provably equals the architectural one and adds no FPSR bit:
+   - the gate RECOMP_FPX_OPEN: guest FPCR at its default (RMode RN, no FZ, DN,
+     AHP or FZ16, no trap enables, no FEAT_AFP bits) and FPSR.IXC already set;
+   - the result is finite and larger in magnitude than the smallest normal, so
+     it is neither NaN (IOC), infinite (DZC, OFC) nor tiny (UFC), and IDC needs
+     FZ; or it is exact: any finite sum, or a finite product or quotient of a
+     zero. What is left is IXC, which is already set.
+   IEEE add, subtract, multiply, divide, square root and fused multiply-add are
+   correctly rounded, so under the host FP mode below every such result equals
+   the ARM result bit for bit. Anything else takes the unchanged exact body.
+
+   Host contract, enforced by the host once it has negotiated FPX1 through
+   recomp_image_fpx_v1: on x86-64 MXCSR round-to-nearest with DAZ and FTZ clear
+   and every exception masked; on AArch64 FPCR 0. Bit 32 of fpcr is the host's
+   kill switch (RECOMP_FPX_INHIBIT): the guest register is 32 bits, so MRS/MSR
+   never expose or clear it, and with it set every op takes the exact body.
+
+   x86-64 has no FMA in its baseline, so a single-precision FMA is computed in
+   binary64: the product of two binary32 values is exact there, one rounding
+   follows, and rounding that again to binary32 equals rounding the exact value
+   once unless the binary64 value is itself a binary32 midpoint, which falls
+   back (RECOMP_FPX_MIDPOINT). Because the product is exact, contracting the
+   expression gives the same value. Double-precision FMA needs a hardware FMA
+   (__FMA__); without one it stays exact-body only. */
+#include <float.h>
+#define RECOMP_FEATURE_FPX1 4u
+#define RECOMP_FPX_INHIBIT (UINT64_C(1) << 32)
+#define RECOMP_FPX_FPCR_MASK (UINT64_C(0x07C8FF07) | RECOMP_FPX_INHIBIT)
+#if defined(RECOMP_NO_NATIVE_FP) || defined(__FAST_MATH__) || defined(_M_FP_FAST) || \
+    (defined(FLT_EVAL_METHOD) && FLT_EVAL_METHOD != 0)
+#define RECOMP_FPX_HOST 0 /* compiled out: every op takes the exact body */
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#define RECOMP_FPX_HOST 1 /* the host FPU is the guest's */
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
+#define RECOMP_FPX_HOST 2 /* SSE2 */
+#include <emmintrin.h>
+#else
+#define RECOMP_FPX_HOST 0
+#endif
+#if RECOMP_FPX_HOST == 1 || \
+    (RECOMP_FPX_HOST == 2 && defined(__FMA__) && (defined(__GNUC__) || defined(__clang__)))
+#define RECOMP_FPX_FMA64 1 /* a correctly rounded binary64 FMA instruction */
+#else
+#define RECOMP_FPX_FMA64 0
+#endif
+#ifndef RECOMP_FPX_PROBE
+#define RECOMP_FPX_PROBE(k) ((void)0) /* test and shadow builds count here */
+#endif
+#define RECOMP_FPX_OPEN(c) (((c)->fpsr & 16u) && !((c)->fpcr & RECOMP_FPX_FPCR_MASK))
+#define RECOMP_FPX_FIN32(t) (((t) & 0x7f800000u) != 0x7f800000u)
+#define RECOMP_FPX_BIG32(t) ((uint32_t)(((t) & 0x7fffffffu) - 0x00800001u) < 0x7effffffu)
+#define RECOMP_FPX_ZERO32(x) (((x) & 0x7fffffffu) == 0)
+#define RECOMP_FPX_FIN64(t) (((t) & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000))
+#define RECOMP_FPX_BIG64(t) \
+    (((t) & UINT64_C(0x7fffffffffffffff)) - UINT64_C(0x0010000000000001) < UINT64_C(0x7fdfffffffffffff))
+#define RECOMP_FPX_ZERO64(x) (((x) & UINT64_C(0x7fffffffffffffff)) == 0)
+/* Products: large, or a finite product of a zero (exact, the zero's sign rule
+   is IEEE's on both). Quotients: large, or a finite quotient of a zero. */
+#define RECOMP_FPX_KEEP32(t, a, b) \
+    (RECOMP_FPX_BIG32(t) || ((RECOMP_FPX_ZERO32(a) || RECOMP_FPX_ZERO32(b)) && RECOMP_FPX_FIN32(t)))
+#define RECOMP_FPX_KEEP64(t, a, b) \
+    (RECOMP_FPX_BIG64(t) || ((RECOMP_FPX_ZERO64(a) || RECOMP_FPX_ZERO64(b)) && RECOMP_FPX_FIN64(t)))
+#define RECOMP_FPX_KEEPDIV32(t, a) (RECOMP_FPX_BIG32(t) || (RECOMP_FPX_ZERO32(a) && RECOMP_FPX_FIN32(t)))
+#define RECOMP_FPX_KEEPDIV64(t, a) (RECOMP_FPX_BIG64(t) || (RECOMP_FPX_ZERO64(a) && RECOMP_FPX_FIN64(t)))
+/* A binary64 value in the binary32 normal range that lies exactly halfway
+   between two binary32 values. */
+#define RECOMP_FPX_MIDPOINT(s) ((recomp_fpx_db(s) & UINT64_C(0x1fffffff)) == UINT64_C(0x10000000))
+
+static RECOMP_INLINE float recomp_fpx_f(uint64_t x) { uint32_t t = (uint32_t)x; float f; memcpy(&f, &t, 4); return f; }
+static RECOMP_INLINE uint64_t recomp_fpx_fb(float f) { uint32_t t; memcpy(&t, &f, 4); return t; }
+static RECOMP_INLINE double recomp_fpx_d(uint64_t x) { double f; memcpy(&f, &x, 8); return f; }
+static RECOMP_INLINE uint64_t recomp_fpx_db(double f) { uint64_t t; memcpy(&t, &f, 8); return t; }
+
+/* Each returns 1 and the result bits in *v when the native result may be kept. */
+static RECOMP_INLINE int recomp_fpx_add32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) + recomp_fpx_f(b));
+    if (RECOMP_FPX_FIN32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sub32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b));
+    if (RECOMP_FPX_FIN32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_mul32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) * recomp_fpx_f(b));
+    if (RECOMP_FPX_KEEP32(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_div32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) / recomp_fpx_f(b));
+    if (RECOMP_FPX_KEEPDIV32(t, a)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_fma32(uint64_t a, uint64_t b, uint64_t z, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(recomp_fpx_f(a), recomp_fpx_f(b), recomp_fpx_f(z)));
+#elif RECOMP_FPX_HOST == 2
+    const double s = (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b) + (double)recomp_fpx_f(z);
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_KEEP32(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)z; (void)v; return 0;
+}
+/* FRECPS: 2 - a*b; FRSQRTS: (3 - a*b)/2, each rounded once. inf*0 gives NaN
+   here, which is never kept; the exact body returns 2.0 or 1.5. */
+static RECOMP_INLINE int recomp_fpx_recps32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(-recomp_fpx_f(a), recomp_fpx_f(b), 2.0f));
+#elif RECOMP_FPX_HOST == 2
+    const double s = 2.0 - (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b);
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_BIG32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_rsqrts32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    /* Halving a normal result is exact, and a normal result is all that is kept. */
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(-recomp_fpx_f(a), recomp_fpx_f(b), 3.0f) * 0.5f);
+#elif RECOMP_FPX_HOST == 2
+    const double s = (3.0 - (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b)) * 0.5;
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_BIG32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+/* Square root of a positive finite input (subnormal included) is normal and
+   finite; of +-0 it is the input. Negative inputs, infinities and NaNs fall back. */
+static RECOMP_INLINE int recomp_fpx_sqrt32(uint64_t a, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_ZERO32(a)) { *v = a; return 1; }
+    if ((uint32_t)a - 1u >= 0x7f7fffffu) return 0;
+#if RECOMP_FPX_HOST == 1
+    *v = recomp_fpx_fb(__builtin_sqrtf(recomp_fpx_f(a)));
+#else
+    *v = recomp_fpx_fb(_mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(recomp_fpx_f(a)))));
+#endif
+    return 1;
+#else
+    (void)a; (void)v; return 0;
+#endif
+}
+)RT";
+}
+
+inline const char* FpxH64() {
+    return R"RT(
+static RECOMP_INLINE int recomp_fpx_add64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) + recomp_fpx_d(b));
+    if (RECOMP_FPX_FIN64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sub64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) - recomp_fpx_d(b));
+    if (RECOMP_FPX_FIN64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_mul64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) * recomp_fpx_d(b));
+    if (RECOMP_FPX_KEEP64(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_div64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) / recomp_fpx_d(b));
+    if (RECOMP_FPX_KEEPDIV64(t, a)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_fma64(uint64_t a, uint64_t b, uint64_t z, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(recomp_fpx_d(a), recomp_fpx_d(b), recomp_fpx_d(z)));
+    if (RECOMP_FPX_KEEP64(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)z; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_recps64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(-recomp_fpx_d(a), recomp_fpx_d(b), 2.0));
+    if (RECOMP_FPX_BIG64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_rsqrts64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(-recomp_fpx_d(a), recomp_fpx_d(b), 3.0) * 0.5);
+    if (RECOMP_FPX_BIG64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sqrt64(uint64_t a, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_ZERO64(a)) { *v = a; return 1; }
+    if (a - 1u >= UINT64_C(0x7fefffffffffffff)) return 0;
+#if RECOMP_FPX_HOST == 1
+    *v = recomp_fpx_db(__builtin_sqrt(recomp_fpx_d(a)));
+#else
+    *v = recomp_fpx_db(_mm_cvtsd_f64(_mm_sqrt_sd(_mm_setzero_pd(), _mm_set_sd(recomp_fpx_d(a)))));
+#endif
+    return 1;
+#else
+    (void)a; (void)v; return 0;
+#endif
+}
+)RT";
+}
+
+inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false, bool fpx = false) {
     std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
@@ -6520,11 +6837,17 @@ int  recomp_save_exists(GuestContext* c, const char* name);
 int  recomp_load_segments(GuestContext* c, const char* data_dir);
 #endif
 )RT";
-    if (fastmem) {
+    if (fastmem || fpx) {
         // The ABI line stays literal above; ABI 6 replaces it with its own block.
         static constexpr std::string_view abi5_line = "#define RECOMP_IMAGE_ABI 5\n";
         text.replace(text.find(abi5_line), abi5_line.size(),
-                     std::string("#define RECOMP_IMAGE_ABI ") + FastmemAbiH());
+                     std::string("#define RECOMP_IMAGE_ABI ") + (fastmem ? FastmemAbiH() : FpxAbiH()));
+    }
+    if (fpx) {
+        // After GuestContext, before the include guard closes.
+        static constexpr std::string_view guard_end = "#endif\n";
+        const size_t at = text.rfind(guard_end);
+        text.insert(at, std::string(FpxH()) + FpxH64());
     }
     if (fastmem && guard_gen) {
         static constexpr std::string_view anchor = "void recomp_ic_ivau(GuestContext*,uint64_t,int);\n";
@@ -6536,10 +6859,14 @@ int  recomp_load_segments(GuestContext* c, const char* data_dir);
 // One cached text per variant: the first caller must not fix the variant for
 // the whole process.
 inline const char* RuntimeH() {
-    static const std::string abi5 = BuildRuntimeH(false);
-    static const std::string fastmem = BuildRuntimeH(true);
-    static const std::string guard_gen = BuildRuntimeH(true, true);
-    return (EmitGuardGen() ? guard_gen : g_emit_fastmem ? fastmem : abi5).c_str();
+    static const std::string abi5 = BuildRuntimeH(false, false, false);
+    static const std::string fastmem = BuildRuntimeH(true, false, false);
+    static const std::string guard_gen = BuildRuntimeH(true, true, false);
+    static const std::string fpx = BuildRuntimeH(true, false, true);
+    static const std::string guard_gen_fpx = BuildRuntimeH(true, true, true);
+    if (!g_emit_fastmem) return abi5.c_str();
+    if (EmitGuardGen()) return (g_emit_fpx ? guard_gen_fpx : guard_gen).c_str();
+    return (g_emit_fpx ? fpx : fastmem).c_str();
 }
 
 inline const char* EstimateRuntimeC() {

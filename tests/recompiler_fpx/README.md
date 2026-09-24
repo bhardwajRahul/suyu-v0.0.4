@@ -12,11 +12,14 @@ flags of the generated code, for the compiler matrix.
 
 `fpx_gen` translates every instruction word in `words.h` (generated from
 `ops.txt` by `mkwords.py`) with the current emitter into `ops_soft.c`, the
-default ABI 5 text. On an AArch64 host it also writes `hw.c`, which executes the
-same words natively. `fpx_driver` then runs identical inputs through each
-implementation and compares the whole of q0, x0, NZCV and the final guest FPSR,
-for seven FPCR settings (0, FZ, DN, RP, RM, RZ, FZ|DN) and start FPSRs with and
-without IXC.
+default ABI 5 text, and `ops_fpx.c`, the same words with the FPX1 fast paths
+(ABI 6 feature bit 2, `recomp_runtime.h`). On an AArch64 host it also writes
+`hw.c`, which executes the same words natively. `fpx_driver` then runs
+identical inputs through each implementation and compares the whole of q0, x0,
+NZCV and the final guest FPSR, for seven FPCR settings (0, FZ, DN, RP, RM, RZ,
+FZ|DN) and start FPSRs with and without IXC. It also reports the FPX1 fast-path
+hit rate per word (lane operations that kept the native result, at FPCR 0 with
+IXC set, L1).
 
 Legs:
 
@@ -37,5 +40,14 @@ FPCR; any other host then checks its own results against that file with
 depend on which words or shards are run, and the `--cases`/`--l4-step` values
 must match the ones the file was written with.
 
-On an AArch64 host `diff` compares the emitted code against the hardware; on
-other hosts, where soft is the only implementation, run L5.
+On an AArch64 host `diff` compares soft and FPX1 against the hardware; on other
+hosts it compares FPX1 against soft, and L5 ties soft to the hardware.
+
+L6, `--controls`, are negative controls that must fail: `nokeep` (FPX1 with the
+keep test reduced to "always", like the native build without flags) must show
+FPSR and value mismatches; `nomid` (no binary32 midpoint test in the binary64
+FMA emulation) must show value mismatches in L3; `mxcsr` runs FPX1 with the host
+FP mode poisoned (x86-64: FTZ, DAZ, round toward zero; AArch64: FZ and round
+toward zero) and must show mismatches. Hosts differ in whether FPX1 double
+precision FMA forms have a fast path (x86-64 needs `__FMA__`), so their hit
+rate can be 0 there.

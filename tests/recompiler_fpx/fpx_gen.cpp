@@ -1,6 +1,8 @@
 // Writes the C the differential driver links: every word of words.h translated
-// by the current emitter into ops_soft.c (the default, ABI 5 text) with its
-// runtime header, and hw.c, which runs the same words on an AArch64 host.
+// by the current emitter into ops_soft.c (the default, ABI 5 text) and
+// ops_fpx.c (FPX1), each with its runtime header; the two negative controls
+// ops_nokeep.c and ops_nomid.c; and hw.c, which runs the same words on an
+// AArch64 host.
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +28,17 @@ std::string Renamed(std::string text, const std::string& header) {
     for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at))
         text.replace(at, from.size(), "#include \"" + header + "\"");
     return text;
+}
+
+// Replaces the one occurrence of `from` in `text`; false if it is missing.
+bool Replace(std::string& text, const std::string& from, const std::string& to) {
+    const size_t at = text.find(from);
+    if (at == std::string::npos || text.find(from, at + 1) != std::string::npos) {
+        std::fprintf(stderr, "control edit not found: %s\n", from.c_str());
+        return false;
+    }
+    text.replace(at, from.size(), to);
+    return true;
 }
 
 // One translation unit of op functions plus its table, named g_ops_<tag>.
@@ -84,6 +97,25 @@ int main(int argc, char** argv) {
         !Write(dir / "rt_soft.c", Renamed(suyu::recomp::RuntimeC(), "rt_soft.h")) ||
         !Ops(dir, "soft", "rt_soft.h") ||
         !Write(dir / "hw.c", Hw())) {
+        return 1;
+    }
+    // FPX1, and the two negative controls: the same text with the keep test
+    // reduced to "always" (the D-style build), and without the midpoint test.
+    suyu::recomp::g_emit_fpx = true;
+    const std::string fpx = suyu::recomp::RuntimeH();
+    std::string nokeep = fpx, nomid = fpx;
+    const bool edited =
+        Replace(nokeep, "#define RECOMP_FPX_BIG32(t) ", "#define RECOMP_FPX_BIG32(t) (1) || ") &&
+        Replace(nokeep, "#define RECOMP_FPX_FIN32(t) ", "#define RECOMP_FPX_FIN32(t) (1) || ") &&
+        Replace(nokeep, "#define RECOMP_FPX_BIG64(t) ", "#define RECOMP_FPX_BIG64(t) (1) || ") &&
+        Replace(nokeep, "#define RECOMP_FPX_FIN64(t) ", "#define RECOMP_FPX_FIN64(t) (1) || ") &&
+        Replace(nomid, "#define RECOMP_FPX_MIDPOINT(s) ", "#define RECOMP_FPX_MIDPOINT(s) (0) && ");
+    // Only the fpx ops count their fast-path hits.
+    const std::string probe = "extern unsigned long long g_fpx_probe[3];\n"
+                              "#define RECOMP_FPX_PROBE(k) (++g_fpx_probe[k])\n";
+    if (!edited || !Write(dir / "rt_fpx.h", probe + fpx) || !Write(dir / "rt_nokeep.h", nokeep) ||
+        !Write(dir / "rt_nomid.h", nomid) || !Ops(dir, "fpx", "rt_fpx.h") ||
+        !Ops(dir, "nokeep", "rt_nokeep.h") || !Ops(dir, "nomid", "rt_nomid.h")) {
         return 1;
     }
     return 0;
