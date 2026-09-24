@@ -5103,6 +5103,13 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                         "#include <math.h>\n"
                         "struct _recomp_ent{uint64_t lo,hi; BlockFn fn;};\n\n";
         if (u == 0) units.back() << "int g_recomp_guard_host_v2=0;\n";
+        if (EmitGuardGen()) {
+            // GG1: this unit's blocks' seen words, one per block in unit order.
+            const size_t in_unit =
+                std::min<size_t>(kBlocksPerUnit, blocks.size() - std::min(blocks.size(), u * kBlocksPerUnit));
+            units.back() << "static uint32_t recomp_gg_seen[" << std::max<size_t>(in_unit, 1)
+                         << "];\n";
+        }
     }
 
     // Each unit accumulates into a string and is written out in large blocks.
@@ -5201,6 +5208,13 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         rcu += "(GuestContext* c){\n";
         const u32 first = (u32)((b.vaddr - base) / 4);
         rcu += "    static const uint32_t _expected[]={";
+        if (EmitGuardGen()) {
+            // GG1 header: word count, module-relative PC low and high.
+            char header[64];
+            snprintf(header, sizeof header, "%uU,0x%08xU,0x%08xU,", b.count,
+                     (unsigned)(b.vaddr & 0xffffffffu), (unsigned)(b.vaddr >> 32));
+            rcu += header;
+        }
         for (u32 k = 0; k < b.count; ++k) {
             char word[32]; snprintf(word, sizeof word, "0x%08xU,", p[first + k]); rcu += word;
         }
@@ -5209,10 +5223,10 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         // enter the same generated block. Per-entry verification also handles
         // process reuse and remapped addresses without an unsafe shared epoch.
         if (EmitGuardGen()) {
-            // GG1: the same check, skipped while this block's seen word (slot
-            // block_index - 1 of g_recomp_gg_seen) matches the module generation.
-            rcu += "};\n    RECOMP_GG_GUARD(" + std::to_string(b.vaddr) + "ULL,_expected," +
-                   std::to_string(b.count) + "U," + std::to_string(block_index - 1) + "U);\n";
+            // GG1: the same check, skipped while this block's seen word (its
+            // slot of the unit's recomp_gg_seen) matches the module generation.
+            rcu += "};\n    RECOMP_GG_GUARD(_expected," +
+                   std::to_string((block_index - 1) % kBlocksPerUnit) + "U);\n";
         } else {
             rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
                    "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
@@ -5683,7 +5697,6 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     }
     if (EmitGuardGen()) {
         cm << " g_recomp_gg_word=g_recomp_gg_word_" << mod
-           << " g_recomp_gg_seen=g_recomp_gg_seen_" << mod
            << " recomp_image_guard_gen_v1=recomp_image_guard_gen_v1_" << mod;
     }
     cm << " recomp_lookup=recomp_lookup_" << mod
@@ -5741,8 +5754,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
               "   lives. The FM1 handshake below refuses to complete before this one,\n"
               "   so a host that knows FM1 but not GG1 refuses the whole bundle. */\n"
               "uint32_t g_recomp_gg_word = RECOMP_GG_VERIFY_ALWAYS;\n"
-           << "uint32_t g_recomp_gg_seen[" << std::max<size_t>(blocks.size(), 1) << "];\n"
-           << "static int g_recomp_gg_host = 0;\n"
+              "static int g_recomp_gg_host = 0;\n"
               "RECOMP_API uint32_t* recomp_image_guard_gen_v1(uint32_t host_version, uint64_t* code_lo,\n"
               "                                               uint64_t* code_end, const uint64_t** base){\n"
               "  if(host_version!=1u) return 0;\n"
@@ -6200,29 +6212,42 @@ inline const char* GuardGenH() {
 #else
 #error "GG1 needs 32-bit atomic loads, stores and fences"
 #endif
+/* Hidden where that exists: the word is only ever reached from inside its own
+   image (the host gets its address from the handshake), so blocks address it
+   directly instead of through the GOT. Not __attribute__((cold)) on the miss
+   path: Apple clang then splits a cold fragment out of every block, one
+   symbol and unwind entry each; an unlikely branch keeps the call at the end
+   of the block instead. */
 #if defined(__GNUC__) || defined(__clang__)
-#define RECOMP_GG_COLD __attribute__((cold))
 #define RECOMP_GG_STATIC static inline
+#define RECOMP_GG_UNLIKELY(x) __builtin_expect(!!(x),0)
+#if defined(_WIN32)
+#define RECOMP_GG_HIDDEN
 #else
-#define RECOMP_GG_COLD
-#define RECOMP_GG_STATIC static __inline
+#define RECOMP_GG_HIDDEN __attribute__((visibility("hidden")))
 #endif
-extern uint32_t g_recomp_gg_word;
-extern uint32_t g_recomp_gg_seen[];
+#else
+#define RECOMP_GG_STATIC static __inline
+#define RECOMP_GG_UNLIKELY(x) (x)
+#define RECOMP_GG_HIDDEN
+#endif
+extern uint32_t g_recomp_gg_word RECOMP_GG_HIDDEN;
 void recomp_code_guard_gen(GuestContext*,uint64_t,const uint32_t*,uint32_t,int,uint32_t*,uint32_t);
-/* The miss path, one private copy per translation unit, so a block's call
-   carries four register arguments: the module-relative PC and the word count
-   travel packed as off | n << 40. The generation is loaded here, before
-   recomp_code_guard_gen's acquire fence; a value newer than the one the block
-   compared is equally valid to record. */
-RECOMP_GG_STATIC RECOMP_NOINLINE RECOMP_GG_COLD void recomp_gg_miss(GuestContext* c,uint32_t idx,
-    const uint32_t* exp,uint64_t off_n){
-  recomp_code_guard_gen(c,g_module_base+(off_n&UINT64_C(0xFFFFFFFFFF)),exp,(uint32_t)(off_n>>40),
-                        g_recomp_guard_host_v2,&g_recomp_gg_seen[idx],RECOMP_GG_LOAD(g_recomp_gg_word));
+/* Each unit keeps its blocks' seen words in its own zero-initialised static
+   array, recomp_gg_seen (no file size), so a block reaches its slot at a
+   link-time constant address. Each block's expected words are preceded by a
+   three-word header: word count, then the module-relative PC, low and high.
+   The miss path is one private copy per unit with three register arguments.
+   The generation is loaded there, before recomp_code_guard_gen's acquire
+   fence; a value newer than the one the block compared is equally valid to
+   record. */
+RECOMP_GG_STATIC RECOMP_NOINLINE void recomp_gg_miss(GuestContext* c,uint32_t* seen,const uint32_t* h){
+  recomp_code_guard_gen(c,g_module_base+((uint64_t)h[1]|((uint64_t)h[2]<<32)),h+3,h[0],
+                        g_recomp_guard_host_v2,seen,RECOMP_GG_LOAD(g_recomp_gg_word));
 }
-#define RECOMP_GG_GUARD(off,exp,n,idx) \
-  if(RECOMP_GG_LOAD(g_recomp_gg_seen[idx])!=RECOMP_GG_LOAD(g_recomp_gg_word)) \
-    recomp_gg_miss(c,idx,exp,((uint64_t)(n)<<40)|(off));
+#define RECOMP_GG_GUARD(hdr,idx) \
+  if(RECOMP_GG_UNLIKELY(RECOMP_GG_LOAD(recomp_gg_seen[idx])!=RECOMP_GG_LOAD(g_recomp_gg_word))) \
+    recomp_gg_miss(c,&recomp_gg_seen[idx],hdr);
 )RT";
 }
 

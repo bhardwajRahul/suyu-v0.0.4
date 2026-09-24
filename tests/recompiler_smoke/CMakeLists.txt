@@ -36,7 +36,10 @@ else()
   string(FIND "${generated_export}" "recomp_image_guard_gen_v1" has_guard_gen)
   if(NOT has_guard_gen EQUAL -1)
     find_package(Threads REQUIRED)
-    add_executable(smoke_gg_host gg_host.cpp gg_c.c ${generated_sources}
+    # gg_c.c includes the block unit itself, to read its private seen words.
+    set(generated_sources_gg ${generated_sources})
+    list(FILTER generated_sources_gg EXCLUDE REGEX "_0[.]c$")
+    add_executable(smoke_gg_host gg_host.cpp gg_c.c ${generated_sources_gg}
         "${GENERATED_DIR}/recomp_runtime.c" "${GENERATED_DIR}/recomp_export.c"
         "${SUYU_SOURCE}/src/core/arm/recomp/recomp_guard_gen.cpp")
     target_compile_features(smoke_gg_host PRIVATE cxx_std_20 c_std_11)

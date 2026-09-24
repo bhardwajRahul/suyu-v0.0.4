@@ -3,6 +3,9 @@
    which plays the emulator side through Core::RecompGuardGen. */
 #include "recomp_runtime.h"
 #include "code.h"
+/* The module's only block unit, included rather than compiled on its own so
+   this file can read the unit-private seen words (recomp_gg_seen). */
+#include "src/recompiled_smoke_0.c"
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,5 +105,5 @@ void ggc_move_code(uint64_t base) {
 }
 
 uint32_t ggc_seen(unsigned index) {
-    return RECOMP_GG_LOAD(g_recomp_gg_seen[index]);
+    return RECOMP_GG_LOAD(recomp_gg_seen[index]);
 }
