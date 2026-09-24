@@ -2,6 +2,7 @@
 """Build and run the FP differential harness (see README.md)."""
 import argparse
 import os
+import platform
 from pathlib import Path
 import subprocess
 import sys
@@ -127,9 +128,13 @@ def main():
                               if line.startswith("LEG")), end="")
                 found = sum(int(line.split()[2]) for line in text.splitlines()
                             if line.startswith("CONTROL"))
+                # AArch64 fast paths use the hardware FMA, so there is no
+                # midpoint test for the nomid control to take away.
+                exempt = name == "nomid" and platform.machine().lower() in ("arm64", "aarch64")
                 print(f"CONTROL {name}: {found} mismatches",
-                      "(fails as designed)" if found else "(DID NOT FAIL)")
-                status |= failed or not found
+                      "(fails as designed)" if found else
+                      "(not applicable on AArch64)" if exempt else "(DID NOT FAIL)")
+                status |= failed or (not found and not exempt)
             result = subprocess.run([str(driver), "inhibit", "--cases", str(args.cases)], check=False,
                                     capture_output=True, text=True, **low_priority())
             print("".join(line + "\n" for line in result.stdout.splitlines()

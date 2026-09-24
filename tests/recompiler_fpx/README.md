@@ -46,7 +46,8 @@ hosts it compares FPX1 against soft, and L5 ties soft to the hardware.
 L6, `--controls`, are negative controls that must fail: `nokeep` (FPX1 with the
 keep test reduced to "always", like the native build without flags) must show
 FPSR and value mismatches; `nomid` (no binary32 midpoint test in the binary64
-FMA emulation) must show value mismatches in L3; `mxcsr` runs FPX1 with the host
+FMA emulation) must show value mismatches in L3 on x86-64 (AArch64 uses the
+hardware FMA and has no such test, so it is exempt there); `mxcsr` runs FPX1 with the host
 FP mode poisoned (x86-64: FTZ, DAZ, round toward zero; AArch64: FZ and round
 toward zero) and must show mismatches; `env` poisons the mode the same way but
 first lets the host's own check (`core/arm/recomp/guest_fp_env.h`, as ArmRecomp
