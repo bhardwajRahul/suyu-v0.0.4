@@ -2064,7 +2064,11 @@ int main(int argc, char** argv) {
         try {
             system.Renderer().ReadRasterizer()->LoadDiskResources(
                 system.GetApplicationProcessProgramID(), std::stop_token{},
-                [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
+                [&emu_window](VideoCore::LoadCallbackStage stage, size_t value, size_t total) {
+                    if (stage == VideoCore::LoadCallbackStage::Build && emu_window) {
+                        emu_window->SetBuildProgressTitle(value, total);
+                    }
+                });
         } catch (const std::exception& e) {
             LOG_ERROR(Frontend, "Failed to load disk shader cache: {}", e.what());
         } catch (...) {

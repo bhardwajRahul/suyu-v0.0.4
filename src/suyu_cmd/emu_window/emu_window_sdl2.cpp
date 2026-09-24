@@ -122,7 +122,27 @@ constexpr int kIdBindOne = 1012;
 constexpr int kIdClearOne = 1013;
 constexpr int kIdCombineJoycons = 1014;
 constexpr int kIdSplitJoycons = 1015;
+constexpr int kIdResScale = 1016;
 constexpr UINT_PTR kTimer = 1;
+
+// Same choices, in the same order, as the Qt frontend's View -> Resolution Scale submenu
+// (src/suyu/main.cpp, PopulateResolutionScaleMenu). Kept as one array so the F12 panel and
+// Qt never drift apart on what "2X" etc. means.
+constexpr std::array<std::pair<Settings::ResolutionSetup, const wchar_t*>, 13> kResScaleEntries{{
+    {Settings::ResolutionSetup::Res1_4X, L"0.25X (180p/270p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res1_2X, L"0.5X (360p/540p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res3_4X, L"0.75X (540p/810p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res1X, L"1X (720p/1080p)"},
+    {Settings::ResolutionSetup::Res5_4X, L"1.25X (900p/1350p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res3_2X, L"1.5X (1080p/1620p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res2X, L"2X (1440p/2160p)"},
+    {Settings::ResolutionSetup::Res3X, L"3X (2160p/3240p)"},
+    {Settings::ResolutionSetup::Res4X, L"4X (2880p/4320p)"},
+    {Settings::ResolutionSetup::Res5X, L"5X (3600p/5400p)"},
+    {Settings::ResolutionSetup::Res6X, L"6X (4320p/6480p)"},
+    {Settings::ResolutionSetup::Res7X, L"7X (5040p/7560p)"},
+    {Settings::ResolutionSetup::Res8X, L"8X (5760p/8640p)"},
+}};
 
 std::filesystem::path DevExeDir() {
     wchar_t exe_path[MAX_PATH]{};
@@ -149,8 +169,45 @@ struct DevPanelState {
     HWND binds{};
     HWND combine{};
     HWND split{};
+    HWND res_scale{};
     std::vector<Common::ParamPackage> device_list;
 };
+
+// Shows the current value; see DevApplyResScale for the write side.
+void DevRefreshResScale(DevPanelState& st) {
+    const auto current = Settings::values.resolution_setup.GetValue();
+    int index = 0;
+    for (std::size_t i = 0; i < kResScaleEntries.size(); ++i) {
+        if (kResScaleEntries[i].first == current) {
+            index = static_cast<int>(i);
+            break;
+        }
+    }
+    SendMessageW(st.res_scale, CB_SETCURSEL, index, 0);
+}
+
+// Same effect as the Qt frontend's OnResolutionScaleSelected while a game is running: the
+// setting is changed and saved right away. Existing render targets already on the GPU keep
+// their current size (see GMainWindow::RestartForResolutionScale in src/suyu/main.cpp for
+// why - rescaled images refuse in-place reallocation and the pipeline cache does not key on
+// resolution), so - exactly like Qt - the new scale takes full effect the next time this
+// package is started, not on the frame after picking it.
+void DevApplyResScale(DevPanelState& st) {
+    const int index = static_cast<int>(SendMessageW(st.res_scale, CB_GETCURSEL, 0, 0));
+    if (index < 0 || static_cast<std::size_t>(index) >= kResScaleEntries.size()) {
+        return;
+    }
+    const auto setup = kResScaleEntries[index].first;
+    if (Settings::values.resolution_setup.GetValue() == setup) {
+        return;
+    }
+    Settings::values.resolution_setup.SetValue(setup);
+    Settings::UpdateRescalingInfo();
+    if (st.system != nullptr) {
+        st.system->ApplySettings();
+    }
+    SaveNativeControls();
+}
 
 // Combine shows while a pair's halves are on two players, Split while a pair is on one.
 void DevRefreshJoyconButtons(DevPanelState& st) {
@@ -586,6 +643,11 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DevRefreshMods(st->mods);
             }
             return 0;
+        case kIdResScale:
+            if (HIWORD(wp) == CBN_SELCHANGE && st != nullptr) {
+                DevApplyResScale(*st);
+            }
+            return 0;
         default:
             break;
         }
@@ -632,7 +694,7 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
 
     const HWND hwnd = CreateWindowExW(0, kClass, title.c_str(),
                                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT,
-                                      CW_USEDEFAULT, 720, 780, nullptr, nullptr,
+                                      CW_USEDEFAULT, 720, 820, nullptr, nullptr,
                                       GetModuleHandleW(nullptr), nullptr);
     if (hwnd == nullptr) {
         if (previous_dpi != nullptr) {
@@ -685,8 +747,17 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
     state.split = CreateWindowExW(0, L"BUTTON", L"Split Joy-Cons into two players",
                                   WS_CHILD | BS_PUSHBUTTON | BS_MULTILINE, 528, 556, 172, 40, hwnd,
                                   reinterpret_cast<HMENU>(kIdSplitJoycons), inst, nullptr);
+    CreateWindowExW(0, L"STATIC", L"Resolution Scale (takes full effect next launch):",
+                    WS_CHILD | WS_VISIBLE, 12, 644, 320, 18, hwnd, nullptr, inst, nullptr);
+    state.res_scale =
+        CreateWindowExW(0, L"COMBOBOX", nullptr,
+                        WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST, 340, 640, 360, 300,
+                        hwnd, reinterpret_cast<HMENU>(kIdResScale), inst, nullptr);
+    for (const auto& [setup, label] : kResScaleEntries) {
+        SendMessageW(state.res_scale, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+    }
     const auto button = [&](const wchar_t* text, int x, int id) {
-        CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, 640, 160, 28,
+        CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, 680, 160, 28,
                         hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), inst, nullptr);
     };
     button(L"Open user data folder", 10, kIdOpenUser);
@@ -709,6 +780,7 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
     DevRefreshDevices(state);
     DevRefreshBinds(state);
     DevRefreshJoyconButtons(state);
+    DevRefreshResScale(state);
     SetTimer(hwnd, kTimer, 500, nullptr);
     ShowWindow(hwnd, SW_SHOW);
 
@@ -1022,6 +1094,28 @@ void EmuWindow_SDL2::WaitEvent() {
         last_time = current_time;
         RefreshWindowStatus();
     }
+}
+
+void EmuWindow_SDL2::SetBuildProgressTitle(std::size_t built, std::size_t total) {
+    static u64 last_update_ticks = 0;
+    const u64 now = SDL_GetTicks();
+    // Always show the first and last update; throttle the ones in between so thousands of
+    // pipelines don't turn into thousands of SetWindowTitle calls.
+    if (built != 0 && built != total && now < last_update_ticks + 100) {
+        return;
+    }
+    last_update_ticks = now;
+
+    char title[64];
+    if (total == 0) {
+        std::snprintf(title, sizeof(title), "Loading...");
+    } else {
+        std::snprintf(title, sizeof(title), "Building shaders %zu/%zu", built, total);
+    }
+    SDL_SetWindowTitle(render_window, title);
+    // The precompile is a tight synchronous loop with no event pump of its own; pump here
+    // so Windows doesn't decide the window has stopped responding.
+    SDL_PumpEvents();
 }
 
 void EmuWindow_SDL2::RefreshWindowStatus() {

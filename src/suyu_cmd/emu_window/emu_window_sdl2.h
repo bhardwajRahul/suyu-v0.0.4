@@ -56,6 +56,12 @@ public:
     // Sets the window icon from suyu.bmp
     void SetWindowIcon();
 
+    /// Shows precompile progress in the title bar during the boot-time shader cache load
+    /// (see the LoadDiskResources call in suyu.cpp). That call blocks before the main loop
+    /// starts pumping events, so without this a long precompile looks like a frozen window
+    /// instead of visible progress. Throttled internally; safe to call for every pipeline.
+    void SetBuildProgressTitle(std::size_t built, std::size_t total);
+
 protected:
     /// Called by WaitEvent when a key is pressed or released.
     void OnKeyEvent(int key, u8 state);
