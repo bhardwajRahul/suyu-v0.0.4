@@ -5757,7 +5757,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
               "static int g_recomp_gg_host = 0;\n"
               "RECOMP_API uint32_t* recomp_image_guard_gen_v1(uint32_t host_version, uint64_t* code_lo,\n"
               "                                               uint64_t* code_end, const uint64_t** base){\n"
-              "  if(host_version!=1u) return 0;\n"
+              "  if(host_version!=2u) return 0;\n"
               "  RECOMP_GG_STORE_RELEASE(g_recomp_gg_word,RECOMP_GG_VERIFY_ALWAYS);\n"
            << span
            << "  g_recomp_gg_host=1;\n"
@@ -6195,6 +6195,9 @@ inline const char* GuardGenH() {
    publishes the seen word with release after the check has passed. */
 #define RECOMP_FEATURE_GUARD_GEN1 2u
 #define RECOMP_GG_VERIFY_ALWAYS 0xFFFFFFFFu
+/* Byte offset of the watch word in a host page-table entry. Nonzero marks a
+   code page the host keeps stable; stores to it must go to the host. */
+#define RECOMP_GG_WATCH_OFFSET 24
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #define RECOMP_GG_LOAD(x) (*(const volatile uint32_t*)&(x))
@@ -6571,7 +6574,7 @@ uint64_t recomp_fp_estimate(GuestContext* c,uint64_t bits,unsigned width,int rsq
 // recomp_*_slow (their calls to one another included) and made static and
 // noinline. Deriving it from the ABI 5 text rather than restating it means the
 // slow path cannot drift from what ABI 5 does.
-inline std::string FastmemHelpersC(std::string abi5) {
+inline std::string FastmemHelpersC(std::string abi5, bool guard_gen = false) {
     static constexpr const char* kHelpers[] = {
         "load8",  "load16",  "load32", "load64", "store8", "store16",
         "store32", "store64", "ldp64", "stp64",  "ldp32",  "stp32",
@@ -6589,7 +6592,7 @@ inline std::string FastmemHelpersC(std::string abi5) {
     }
     replace_all("\nuint64_t recomp_", "\nstatic RECOMP_NOINLINE uint64_t recomp_");
     replace_all("\nvoid recomp_", "\nstatic RECOMP_NOINLINE void recomp_");
-    return abi5 + R"RT(
+    std::string text = abi5 + R"RT(
 /* ABI 6 (FM1) fast path. One read of the same page-table entry the ABI 5 walk
    would read, for exactly the accesses ABI 5 would serve from that entry:
    in range, inside one page, and backed by a real pointer. It returns the
@@ -6663,6 +6666,75 @@ void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
     memcpy(p,&x,4); memcpy(p+4,&y,4); return;}
   recomp_stp32_slow(c,a,v0,v1);}
 )RT";
+    if (!guard_gen) {
+        return text;
+    }
+    // GG1: stores must not write a watched code page behind the host's back.
+    // The fast path also reads the entry's watch word (same cache line) and
+    // declines when it is set; the store then goes to the host callback, which
+    // writes through Core::Memory and so moves the generation. Stores the fast
+    // path declines for other reasons check the pages they touch the same way
+    // before taking the unchanged ABI 5 walk, which would write directly.
+    // Loads, and the code guard's own reads, are unchanged.
+    const auto replace_once = [&text](const std::string& from, const std::string& to) {
+        const size_t at = text.find(from);
+        text.replace(at, from.size(), to);
+    };
+    replace_once("#define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))\n",
+                 R"RT(#define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))
+static RECOMP_INLINE uintptr_t recomp_fm_entry_st(const GuestContext* c, uint64_t va, unsigned bytes){
+  const unsigned char* ent;
+  if(va >= c->fm_limit) return 0;
+  if((va & 0xfffu) > 0x1000u - bytes) return 0;
+  ent = c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS) << RECOMP_FM_STRIDE_LOG2);
+  if(*(const volatile uint64_t*)(ent + RECOMP_GG_WATCH_OFFSET)) return 0;
+  return *(const uintptr_t*)ent & RECOMP_FM_PTR_MASK;
+}
+/* Whether any page of [va, va + bytes) is watched. Addresses the ABI 5 walk
+   would not serve from the table (outside the space, or wrapping) reach the
+   host callback anyway, so they need no answer here. */
+static RECOMP_NOINLINE int recomp_gg_store_watched(GuestContext* c, uint64_t va, uint64_t bytes){
+  const RecompHostMem* hm = c->host_mem;
+  uint64_t page, last;
+  if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
+  va &= 0xffffffffffffULL;
+  if(va >= hm->address_space_max) return 0;
+  last = bytes - 1 > hm->address_space_max - 1 - va ? hm->address_space_max - 1 : va + bytes - 1;
+  for(page = va >> hm->page_bits; page <= last >> hm->page_bits; ++page){
+    if(*(const volatile uint64_t*)((const unsigned char*)hm->page_entries +
+                                   page * hm->page_entry_stride + RECOMP_GG_WATCH_OFFSET)) return 1;
+  }
+  return 0;
+}
+)RT");
+    static constexpr struct {
+        const char* head;
+        const char* slow;
+        const char* watched;
+    } kStores[] = {
+        {"void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store8_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,1)){memstore(c,a,1,v);return;}\n"},
+        {"void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store16_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,2)){memstore(c,a,2,v);return;}\n"},
+        {"void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store32_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,4)){memstore(c,a,4,v);return;}\n"},
+        {"void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store64_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,8)){memstore(c,a,8,v);return;}\n"},
+        {"void recomp_stp64(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){\n",
+         "  recomp_stp64_slow(c,a,v0,v1);}",
+         "  if(recomp_gg_store_watched(c,a,16)){memstore(c,a,8,v0);memstore(c,a+8,8,v1);return;}\n"},
+        {"void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){\n",
+         "  recomp_stp32_slow(c,a,v0,v1);}",
+         "  if(recomp_gg_store_watched(c,a,8)){memstore(c,a,4,v0);memstore(c,a+4,4,v1);return;}\n"},
+    };
+    for (const auto& store : kStores) {
+        const size_t at = text.find(store.head);
+        const size_t e = text.find("recomp_fm_entry(", at);
+        text.replace(e, std::strlen("recomp_fm_entry("), "recomp_fm_entry_st(");
+        const size_t slow = text.find(store.slow, at);
+        text.insert(slow, store.watched);
+    }
+    return text;
 }
 
 // ABI 6 feature GG1: the verification a block runs when its generation moved.
@@ -7322,7 +7394,7 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
-    std::string text = head + (fastmem ? FastmemHelpersC(abi5_helpers) : abi5_helpers) + tail +
+    std::string text = head + (fastmem ? FastmemHelpersC(abi5_helpers, guard_gen) : abi5_helpers) + tail +
                        EstimateRuntimeC();
     if (fastmem && guard_gen) {
         static constexpr std::string_view anchor =

@@ -52,10 +52,10 @@ int main(void) {
         uint64_t lo, end;
         const uint64_t* base;
         CHECK(recomp_image_fastmem_v1_smoke(12, 5, ~(uint64_t)3, 872, 880) == 0);
-        CHECK(recomp_image_guard_gen_v1_smoke(1, &lo, &end, &base) == &g_recomp_gg_word_smoke);
+        CHECK(recomp_image_guard_gen_v1_smoke(2, &lo, &end, &base) == &g_recomp_gg_word_smoke);
         CHECK(base == &g_module_base_smoke && lo == 0x1000);
         CHECK(recomp_image_fastmem_v1_second(12, 5, ~(uint64_t)3, 872, 880) == 0);
-        CHECK(recomp_image_guard_gen_v1_second(1, &lo, &end, &base) == &g_recomp_gg_word_second);
+        CHECK(recomp_image_guard_gen_v1_second(2, &lo, &end, &base) == &g_recomp_gg_word_second);
         CHECK(base == &g_module_base_second);
         CHECK(&g_recomp_gg_word_smoke != &g_recomp_gg_word_second);
         CHECK(g_recomp_gg_word_second == RECOMP_GG_VERIFY_ALWAYS);

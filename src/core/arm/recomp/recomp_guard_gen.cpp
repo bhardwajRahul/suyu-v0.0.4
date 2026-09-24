@@ -10,6 +10,7 @@ namespace Core::RecompGuardGen {
 
 namespace detail {
 std::atomic<bool> g_watching{false};
+std::atomic<bool> g_prelog{false};
 }
 
 namespace {
@@ -55,6 +56,11 @@ struct State {
     std::vector<MapRecord> map_log;
     std::vector<const void*> tables;
     bool map_log_overflow = false;
+    // Raw pointers handed out before the first activation (table, va, size).
+    std::vector<MapRecord> exposures;
+    bool exposures_overflow = false;
+    // Activations since registration; only the first can prove anything.
+    unsigned activations = 0;
     std::uint64_t bumps[static_cast<unsigned>(Reason::Count)]{};
 };
 
@@ -219,6 +225,10 @@ void SetModules(std::vector<Module> modules, bool enabled) {
     s.map_log.clear();
     s.tables.clear();
     s.map_log_overflow = false;
+    s.exposures.clear();
+    s.exposures_overflow = false;
+    s.activations = 0;
+    detail::g_prelog.store(s.enabled, std::memory_order_release);
     detail::g_watching.store(s.enabled, std::memory_order_seq_cst);
 }
 
@@ -226,6 +236,10 @@ void Forget() {
     auto& s = S();
     std::scoped_lock lk{s.lock};
     detail::g_watching.store(false, std::memory_order_seq_cst);
+    detail::g_prelog.store(false, std::memory_order_release);
+    s.exposures.clear();
+    s.exposures_overflow = false;
+    s.activations = 0;
     s.modules.clear();
     s.enabled = false;
     s.active = false;
@@ -240,15 +254,18 @@ bool IsActive(std::uint64_t key) {
     return S().active_key.load(std::memory_order_acquire) == key;
 }
 
-void Activate(std::uint64_t key, const void* table) {
+void Activate(std::uint64_t key, const void* table, const WatchFn& watch) {
     auto& s = S();
     std::scoped_lock lk{s.lock};
     if (!s.enabled || s.active_key.load(std::memory_order_relaxed) == key) {
         return;
     }
-    // Only a table whose every mapping the hooks saw can prove anything.
-    const bool tracked = !s.map_log_overflow &&
+    // Only a table whose every mapping the hooks saw can prove anything, and
+    // only for the first process: raw pointers are recorded before the first
+    // activation, not before a later one.
+    const bool tracked = !s.map_log_overflow && !s.exposures_overflow && s.activations == 0 &&
                          std::find(s.tables.begin(), s.tables.end(), table) != s.tables.end();
+    ++s.activations;
     for (auto& module : s.modules) {
         module.active_base = LoadBase(module.m);
         module.pa_runs.clear();
@@ -267,7 +284,25 @@ void Activate(std::uint64_t key, const void* table) {
                 break;
             }
         }
+        // A raw pointer into the span handed out before now may still be
+        // written through.
+        for (const auto& rec : s.exposures) {
+            if (rec.table == table && OverlapsModuleVa(module, rec.va, rec.size)) {
+                module.sticky = true;
+                break;
+            }
+        }
     }
+    // Watch the stable spans before their words leave kVerifyAlways: from the
+    // bump on, a store there must reach the host. Then end the pre-activation
+    // pointer log; Core::Memory reads the watch words once it sees that.
+    for (const auto& module : s.modules) {
+        if (!module.sticky) {
+            watch(SpanStart(module), SpanSize(module));
+        }
+    }
+    s.exposures.clear();
+    detail::g_prelog.store(false, std::memory_order_release);
     s.active = true;
     s.active_table = table;
     Bump(s, Reason::Activate);
@@ -336,6 +371,55 @@ void OnProtect(const void* table, std::uint64_t va, std::uint64_t size, bool wri
     if (any) {
         Bump(s, Reason::Protect);
     }
+}
+
+void OnWatchedWrite(const void* table, std::uint64_t va, std::uint64_t size) {
+    if (!Watching()) {
+        return;
+    }
+    auto& s = S();
+    std::scoped_lock lk{s.lock};
+    if (!s.active || table != s.active_table) {
+        return;
+    }
+    // Called after the bytes are written, so any entry ordered after this bump
+    // re-reads them and rejects a changed block exactly as ABI 5 would.
+    const bool hit = std::any_of(s.modules.begin(), s.modules.end(), [&](const auto& module) {
+        return OverlapsModuleVa(module, va, size);
+    });
+    if (hit) {
+        Bump(s, Reason::CodeWrite);
+    }
+}
+
+void OnPointerExposed(const void* table, std::uint64_t va, std::uint64_t size) {
+    if (!Watching()) {
+        return;
+    }
+    auto& s = S();
+    std::scoped_lock lk{s.lock};
+    if (s.activations == 0) {
+        if (s.exposures.size() < kMaxMapLog) {
+            s.exposures.push_back({table, va, size, 0, true});
+        } else {
+            s.exposures_overflow = true;
+        }
+        return;
+    }
+    if (!s.active || table != s.active_table) {
+        return;
+    }
+    StickyWhere(s, Reason::PointerExposed,
+                [&](const ModuleState& module) { return OverlapsModuleVa(module, va, size); });
+}
+
+void OnJitFallback() {
+    if (!Watching()) {
+        return;
+    }
+    auto& s = S();
+    std::scoped_lock lk{s.lock};
+    StickyWhere(s, Reason::JitFallback, [](const ModuleState&) { return true; });
 }
 
 void OnDeviceMap(const void* table, std::uint64_t va, std::uint64_t size) {

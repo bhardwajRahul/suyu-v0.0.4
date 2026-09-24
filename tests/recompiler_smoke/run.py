@@ -29,10 +29,11 @@ VARIANTS = (("abi5", None, None), ("abi6", "1", None), ("abi6gg", "1", "1"))
 # (a hook that must end skipping, followed by a changed block).
 GG_HOST_PASS = ("skip", "mutate-no-bump", "log-alias", "log-trim", "unstable", "unmapped-code",
                 "untracked", "overflow", "disabled", "ctl-ivau-elsewhere", "ctl-map-elsewhere",
-                "race-bump")
+                "pointer-prelog", "ctl-writes-elsewhere", "race-bump")
 GG_HOST_ABORT = ("hook-map", "hook-unmap", "hook-protect-rx", "hook-protect-rw", "hook-alias",
                  "hook-device", "hook-ivau", "hook-ivau-all", "hook-new-table",
-                 "hook-new-process", "hook-rebase")
+                 "hook-new-process", "hook-rebase", "guest-store", "guest-store-slow",
+                 "guest-store-cross", "host-write", "pointer-exposed", "jit-fallback")
 
 
 def call(args, expected=0, timeout=120, env=None):

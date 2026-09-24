@@ -48,6 +48,10 @@ ABI 5. `smoke_gg_host` then drives the generated module with the real host
 manager (`core/arm/recomp/recomp_guard_gen.cpp`):
 
 - the handshake and skip-after-verify protocol;
+- writes to a watched code page: guest stores through the FM1 fast path, the
+  ABI 5 walk and page-crossing stores, a host write, a writable raw pointer
+  (before and after activation) and the JIT fallback, each followed by an
+  entry that must abort; and writes elsewhere that must not bump;
 - for every hook that must move the generation (map, unmap, protect, alias in
   another table, device map, IC IVAU, whole-cache invalidation, new table, new
   process, rebase): verify, change the code, fire the hook, and require the

@@ -362,9 +362,9 @@ int main(int argc, char** argv) {
               (RECOMP_FEATURE_FASTMEM_PT1 | RECOMP_FEATURE_GUARD_GEN1));
         CHECK(recomp_image_fastmem_v1(12, 5, ~(uint64_t)3, 872, 880) == 0);
         CHECK(recomp_image_guard_gen_v1(0, &lo, &end, &base) == NULL);
-        CHECK(recomp_image_guard_gen_v1(2, &lo, &end, &base) == NULL);
+        CHECK(recomp_image_guard_gen_v1(1, &lo, &end, &base) == NULL);
         CHECK(recomp_image_fastmem_v1(12, 5, ~(uint64_t)3, 872, 880) == 0);
-        CHECK(recomp_image_guard_gen_v1(1, &lo, &end, &base) == &g_recomp_gg_word);
+        CHECK(recomp_image_guard_gen_v1(2, &lo, &end, &base) == &g_recomp_gg_word);
         CHECK(lo == 0x1000 && end == 0x1000 + sizeof(smoke_code) && base == &g_module_base);
         CHECK(g_recomp_gg_word == RECOMP_GG_VERIFY_ALWAYS);
     }

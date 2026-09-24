@@ -154,6 +154,10 @@ static_assert(offsetof(GuestContextView, fm_limit) == 880);
 static_assert(sizeof(Common::PageTable::PageEntryData) == 32);
 static_assert(Common::PageTable::ATTRIBUTE_BITS == 2);
 static_assert(Memory::YUZU_PAGEBITS == 12);
+// GG1: the generated store helpers read the watch word at this offset.
+static_assert(offsetof(Common::PageTable::PageEntryData, recomp_watch) ==
+              RecompGuardGen::kWatchOffset);
+static_assert(sizeof(std::atomic<u64>) == sizeof(u64) && std::atomic<u64>::is_always_lock_free);
 
 // Blocks a chain of direct calls may run before returning here. Only this side
 // sets it - the generated code just decrements - so the emitter does not need
@@ -904,7 +908,18 @@ struct ArmRecomp::Impl {
     /// KLightLock reschedules, which inside RunThread could enter this core's
     /// RunThread again for another guest thread.
     void ActivateGuardGen(Kernel::KProcess& process, u64 key) {
-        RecompGuardGen::Activate(key, process.GetMemory().GetPageTableView().entries);
+        // Watch every page of each stable module's span: GG1 stores there go to
+        // HostStore, and Core::Memory reports writes and raw pointers there.
+        auto& entries = process.GetPageTable().GetImpl().entries;
+        const auto watch = [&entries](u64 va, u64 size) {
+            const u64 first = va >> Memory::YUZU_PAGEBITS;
+            const u64 last = (va + size - 1) >> Memory::YUZU_PAGEBITS;
+            for (u64 page = first; page <= last && page < entries.size(); ++page) {
+                reinterpret_cast<std::atomic<u64>*>(&entries[page].recomp_watch)
+                    ->store(1, std::memory_order_relaxed);
+            }
+        };
+        RecompGuardGen::Activate(key, process.GetMemory().GetPageTableView().entries, watch);
         const auto stats = RecompGuardGen::GetStats();
         LOG_INFO(Core_ARM,
                  "recomp generation guard: process {} active={} generation={}; {} of {} "
@@ -1591,6 +1606,8 @@ bool ArmRecomp::EnterFallback() {
             impl->fallback_unavailable = true;
             return false;
         }
+        // The JIT stores through the page table without the GG1 watch.
+        RecompGuardGen::OnJitFallback();
         impl->fallback = std::make_unique<ArmDynarmic64>(
             impl->system, impl->uses_wall_clock, impl->owner_process,
             static_cast<DynarmicExclusiveMonitor&>(*impl->exclusive_monitor), impl->core_index);
