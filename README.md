@@ -89,13 +89,14 @@ automatic controller setup, and can be added to Steam directly. Linux and macOS
 exports are Source only. Exports never contain keys or firmware; they read them from
 the installed suyu. See the [Export Game guide](docs/user/GameExport.md).
 
-Static and Hybrid execution are experimental. **For MK8D today, the Dynarmic JIT
-export is the fastest** (Windows: JIT 60 fps, Hybrid 31–35, static ~25 in a race).
-Speeding up recompiled code on x86 is the next focus.
+Static and Hybrid execution are experimental and tested on MK8D. In its race, a
+v0.0.11 static export runs at about 56 fps on Windows (with Clang installed) and
+about 60 on macOS and Linux, against 60 for the JIT; see the
+[v0.0.11 performance notes](docs/releases/v0.0.11.md#performance).
 
 | Mode (in Export Game order) | Purpose |
 |---|---|
-| suyu Dynarmic JIT (Baseline) | Default. Dynamic compilation; the most compatible and currently the fastest for MK8D. |
+| suyu Dynarmic JIT (Baseline) | Default. Dynamic compilation; the most compatible. |
 | suyu Hybrid JIT + AOT | Static code with JIT fallback. Performance varies by game; compare it with the Dynarmic JIT export. |
 | suyu static AOT (Experimental) | Ahead-of-time AArch64 code with suyu HLE; use the separate `no-jit` binaries for a host with Dynarmic entirely absent. |
 
