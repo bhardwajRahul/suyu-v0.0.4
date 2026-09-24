@@ -44,6 +44,32 @@ def sharded(driver, args, jobs, log_dir, tag):
     return failed, text
 
 
+def summarize(text, hits):
+    """Adds up the per-shard LEG and TOTAL lines of `driver diff` output."""
+    legs, total, bad, lines = {}, 0, 0, []
+    for line in text.splitlines():
+        words = line.split()
+        if line.startswith("LEG "):
+            key = " ".join(words[1:5]).rstrip(":")
+            counts = legs.setdefault(key, [0, 0, 0])
+            for i, at in enumerate((6, 8, 10)):
+                counts[i] += int(words[at])
+        elif line.startswith("TOTAL "):
+            total += int(words[2])
+            bad += int(words[4])
+        elif line.startswith("FPX hit rate") or line.startswith("  ") or line.startswith("     "):
+            continue
+        elif "fpx hit" in line:
+            if hits:
+                lines.append(line)
+        elif line.strip():
+            lines.append(line)
+    for key, (cases, value, fpsr) in sorted(legs.items()):
+        lines.append(f"LEG {key}: cases {cases} value-mismatch {value} fpsr-mismatch {fpsr}")
+    lines.append(f"TOTAL cases {total} mismatches {bad}")
+    return "".join(line + "\n" for line in lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2])
@@ -61,6 +87,7 @@ def main():
     parser.add_argument("--golden", type=Path, help="L5: hash file written on an AArch64 host")
     parser.add_argument("--write-golden", type=Path, help="AArch64 only: write the hardware hashes")
     parser.add_argument("--controls", action="store_true", help="L6 negative controls")
+    parser.add_argument("--hits", action="store_true", help="print the fast-path hit rate per word")
     args = parser.parse_args()
     test_source = Path(__file__).resolve().parent
     with tempfile.TemporaryDirectory(prefix="suyu-fpx-") as tmp:
@@ -84,8 +111,7 @@ def main():
             print(f"wrote {len(text.splitlines())} hashes to {args.write_golden}")
             status |= failed
         failed, text = sharded(driver, ["diff", "--legs", args.legs, *common], args.jobs, logs, "diff")
-        print("".join(line + "\n" for line in text.splitlines()
-                      if not line.startswith("  ") and not line.startswith("     ")), end="")
+        print(summarize(text, args.hits), end="")
         status |= failed
         if args.golden:
             failed, text = sharded(driver, ["check", args.golden.resolve(), "--legs", "124", *common],
@@ -97,8 +123,8 @@ def main():
             for name in ("nokeep", "nomid", "mxcsr"):
                 failed, text = sharded(driver, ["control", name, "--legs", "13", *common], args.jobs,
                                        logs, name)
-                print("".join(line + "\n" for line in text.splitlines() if line.startswith("LEG")),
-                      end="")
+                print("".join(line + "\n" for line in summarize(text, False).splitlines()
+                              if line.startswith("LEG")), end="")
                 found = sum(int(line.split()[2]) for line in text.splitlines()
                             if line.startswith("CONTROL"))
                 print(f"CONTROL {name}: {found} mismatches",
