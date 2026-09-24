@@ -1394,7 +1394,7 @@ int main(int argc, char** argv) {
     // switch is a context bit that only FPX1 modules keep from the guest.
     // Nonzero: the handshake answer, whose low byte is the compiled fast path.
     unsigned recomp_fpx = 0;
-    int recomp_fpx_modules = -1;
+    [[maybe_unused]] int recomp_fpx_modules = -1;
     [[maybe_unused]] const auto fpx_layout = Core::GetRecompFpxLayout();
     [[maybe_unused]] const auto accept_recomp_abi = [&recomp_bundle_abi](unsigned abi) {
         if (abi != 5 && abi != 6) {
