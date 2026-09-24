@@ -214,6 +214,11 @@ struct SuyuRecompGuardGenModule {
 unsigned suyu_recomp_static_guard_gen_v1(u32 host_version, SuyuRecompGuardGenModule* out,
                                          unsigned max);
 #endif
+#ifdef SUYU_RECOMP_FPX_V1
+// FPX1 registrations: nonzero (the modules' recomp_image_fpx_v1 answer) only if
+// every module reports FPX1 and accepts this host's view (Core::GetRecompFpxLayout).
+unsigned suyu_recomp_static_fpx_v1(u32 off_fpcr, u32 off_fpsr, u64 inhibit_bit);
+#endif
 #endif
 }
 
@@ -1385,6 +1390,12 @@ int main(int argc, char** argv) {
     // ABI 5 and ABI 6 (FM1 fast path) images are both accepted, but never
     // mixed: ABI 6 extends the shared GuestContext, so one bundle has one ABI.
     unsigned recomp_bundle_abi = 0;
+    // FPX1 (exact native FP) is all or nothing across a bundle: its kill
+    // switch is a context bit that only FPX1 modules keep from the guest.
+    // Nonzero: the handshake answer, whose low byte is the compiled fast path.
+    unsigned recomp_fpx = 0;
+    int recomp_fpx_modules = -1;
+    [[maybe_unused]] const auto fpx_layout = Core::GetRecompFpxLayout();
     [[maybe_unused]] const auto accept_recomp_abi = [&recomp_bundle_abi](unsigned abi) {
         if (abi != 5 && abi != 6) {
             LOG_CRITICAL(Frontend, "Recompiled image ABI {} is not 5 or 6; re-export all modules",
@@ -1478,6 +1489,17 @@ int main(int argc, char** argv) {
                 LOG_CRITICAL(Frontend, "ABI 6 static modules do not match this host's fastmem "
                                        "layout; re-export all modules with this build");
                 return EXIT_FAILURE;
+            }
+            if (features & Core::RecompImageFeature::ExactFpX1) {
+#ifdef SUYU_RECOMP_FPX_V1
+                recomp_fpx = suyu_recomp_static_fpx_v1(fpx_layout.off_fpcr, fpx_layout.off_fpsr,
+                                                       fpx_layout.inhibit_bit);
+#endif
+                if (!recomp_fpx) {
+                    LOG_CRITICAL(Frontend, "FPX1 static modules are mixed or do not match this "
+                                           "host's FP layout; re-export all modules with this build");
+                    return EXIT_FAILURE;
+                }
             }
         }
     }
@@ -1573,6 +1595,27 @@ int main(int argc, char** argv) {
                         FreeLibrary(h);
                         return EXIT_FAILURE;
                     }
+                    const bool has_fpx = (features() & Core::RecompImageFeature::ExactFpX1) != 0;
+                    unsigned fpx = 0;
+                    if (has_fpx) {
+                        auto fpx_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64)>(
+                            GetProcAddress(h, "recomp_image_fpx_v1"));
+                        fpx = fpx_v1 ? fpx_v1(fpx_layout.off_fpcr, fpx_layout.off_fpsr,
+                                              fpx_layout.inhibit_bit)
+                                     : 0;
+                    }
+                    if ((has_fpx && !fpx) ||
+                        (recomp_fpx_modules >= 0 && recomp_fpx_modules != (has_fpx ? 1 : 0))) {
+                        LOG_CRITICAL(Frontend,
+                                     "{} does not match this host's FP layout or the FPX1 "
+                                     "feature of the other modules; re-export all modules "
+                                     "with this build",
+                                     Common::UTF16ToUTF8(dll_name));
+                        FreeLibrary(h);
+                        return EXIT_FAILURE;
+                    }
+                    recomp_fpx_modules = has_fpx ? 1 : 0;
+                    recomp_fpx = fpx;
                 }
                 auto guard = reinterpret_cast<unsigned (*)(unsigned)>(GetProcAddress(h, "recomp_image_guard_v2"));
                 s_recomp_modules.push_back({lkp, sbf, run_slice, abi, guard});
@@ -1613,6 +1656,10 @@ int main(int argc, char** argv) {
         // After SetRecompLookup, which forgets any earlier modules, and before
         // the process exists. Logs its own outcome.
         Core::SetRecompGuardGenModules(std::move(recomp_guard_gen_modules));
+        // Every FPX1 module passed its handshake above, or loading stopped.
+        Core::SetRecompFpxReady(recomp_fpx != 0);
+        LOG_INFO(Frontend, "Recompiled FPX1 native FP: {} (handshake {:#x})",
+                 recomp_fpx ? "negotiated" : "not used", recomp_fpx);
         // Route base to the module at the same index in load order.
         // rtld=index0, main=index1, subsdk0=index2, ..., sdk=last.
         Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {

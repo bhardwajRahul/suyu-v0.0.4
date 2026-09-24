@@ -17,6 +17,9 @@ extern unsigned recomp_image_fastmem_v1(uint32_t, uint32_t, uint64_t, uint32_t, 
 #ifdef RECOMP_FEATURE_GUARD_GEN1
 extern uint32_t* recomp_image_guard_gen_v1(uint32_t, uint64_t*, uint64_t*, const uint64_t**);
 #endif
+#ifdef RECOMP_FEATURE_FPX1
+extern unsigned recomp_image_fpx_v1(uint32_t, uint32_t, uint64_t);
+#endif
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
@@ -379,6 +382,13 @@ int main(int argc, char** argv) {
     CHECK(recomp_image_fastmem_v1(12, 5, ~(uint64_t)3, 864, 880) == 0);
     CHECK(recomp_image_fastmem_v1(12, 5, ~(uint64_t)3, 872, 888) == 0);
     CHECK(sizeof(PageEntry) == 32);
+#ifdef RECOMP_FEATURE_FPX1
+    CHECK(recomp_image_features() & RECOMP_FEATURE_FPX1);
+    CHECK((recomp_image_fpx_v1(848, 856, (uint64_t)1 << 32) & 0x1ffu) == (0x100u | RECOMP_FPX_HOST));
+    CHECK(recomp_image_fpx_v1(856, 856, (uint64_t)1 << 32) == 0);
+    CHECK(recomp_image_fpx_v1(848, 848, (uint64_t)1 << 32) == 0);
+    CHECK(recomp_image_fpx_v1(848, 856, (uint64_t)1 << 31) == 0);
+#endif
 #else
     CHECK(recomp_image_abi() == 5);
 #endif

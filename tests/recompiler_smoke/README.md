@@ -35,6 +35,12 @@ the fast path on and off, which must give the same registers, memory and
 callback sequence. `mem-ordinary` also proves that the fast path, not the ABI
 5 walk, serves ordinary accesses.
 
+A third export turns FPX1 (exact native FP) on as well
+(`SUYU_RECOMP_AB_FPX=1`). Its tree is pinned by its own golden hash, as is the
+FM1-only tree, and it may differ from the FM1 tree only in the runtime header,
+export and CMake files. Every runtime case runs against it too, and it checks
+the FPX1 handshake.
+
 For ABI 6, `smoke_features` checks the host's feature refusal
 (`core/arm/recomp/recomp_image_features.h`) against the image's
 `recomp_image_features()`: this host accepts exactly the bits its emitter

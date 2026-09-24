@@ -2595,12 +2595,20 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         LOG_WARNING(Frontend, "SUYU_AOT_GUARD_GEN=1 needs SUYU_AOT_FASTMEM=1; exporting without "
                               "the generation code guard");
     }
+    // ABI 6 feature FPX1, exact native FP. Off by default; it needs FM1, since
+    // hosts accept ABI 6 images only with it.
+    suyu::recomp::g_emit_fpx = qEnvironmentVariable("SUYU_AOT_FPX") == QStringLiteral("1");
+    if (suyu::recomp::g_emit_fpx && !suyu::recomp::g_emit_fastmem) {
+        LOG_WARNING(Frontend, "SUYU_AOT_FPX=1 needs SUYU_AOT_FASTMEM=1; exporting without FPX1");
+        suyu::recomp::g_emit_fpx = false;
+    }
     // What the images will report from recomp_image_features(), recorded in the
     // manifest so a cached export with other features is not reused.
     const unsigned image_features =
         suyu::recomp::g_emit_fastmem
             ? (Core::RecompImageFeature::FastmemPT1 |
-               (suyu::recomp::EmitGuardGen() ? Core::RecompImageFeature::GuardGen1 : 0u))
+               (suyu::recomp::EmitGuardGen() ? Core::RecompImageFeature::GuardGen1 : 0u) |
+               (suyu::recomp::g_emit_fpx ? Core::RecompImageFeature::ExactFpX1 : 0u))
             : 0u;
     const QString debug_root = cache_dir + QDir::separator() + QStringLiteral("debug");
     const QString blockmap_dir = debug_root + QDir::separator() + QStringLiteral("blockmaps");
@@ -2638,6 +2646,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const bool same_image_abi = contents.contains(
                 suyu::recomp::g_emit_fastmem ? QStringLiteral("\"image_abi\": 6,")
                                              : QStringLiteral("\"image_abi\": 5,"));
+            // ABI 6 images also have to carry the same feature set.
             const bool same_image_features =
                 !suyu::recomp::g_emit_fastmem ||
                 contents.contains(QStringLiteral("\"image_features\": %1,").arg(image_features));
@@ -3146,6 +3155,24 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     }
                     o << "  return n;\n}\n";
                 }
+                if (suyu::recomp::g_emit_fpx) {
+                    // FPX1: every module must report it and accept the host's
+                    // FP context fields and kill-switch bit.
+                    o << "\n";
+                    for (const auto& m : ordered) {
+                        o << "extern unsigned recomp_image_fpx_v1_" << m
+                          << "(uint32_t, uint32_t, uint64_t);\n";
+                    }
+                    o << "unsigned suyu_recomp_static_fpx_v1(uint32_t off_fpcr, uint32_t off_fpsr,\n"
+                         "                                   uint64_t inhibit_bit) {\n"
+                         "  unsigned r=0;\n";
+                    for (const auto& m : ordered) {
+                        o << "  if(!(recomp_image_features_" << m << "()&4u)) return 0;\n"
+                          << "  r=recomp_image_fpx_v1_" << m << "(off_fpcr,off_fpsr,inhibit_bit);\n"
+                          << "  if(!r) return 0;\n";
+                    }
+                    o << "  return r;\n}\n";
+                }
                 reg.close();
                 QFile abi_marker(recomp_root + QDir::separator() + QStringLiteral("recomp_abi_v4.h"));
                 if (abi_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -3164,6 +3191,16 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     }
                 } else {
                     QFile::remove(fastmem_marker_path);
+                }
+                const QString fpx_marker_path =
+                    recomp_root + QDir::separator() + QStringLiteral("recomp_fpx_v1.h");
+                if (suyu::recomp::g_emit_fpx) {
+                    QFile fpx_marker(fpx_marker_path);
+                    if (fpx_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                        fpx_marker.write("/* ABI 6 registry exports suyu_recomp_static_fpx_v1. */\n");
+                    }
+                } else {
+                    QFile::remove(fpx_marker_path);
                 }
                 const QString features_marker_path =
                     recomp_root + QDir::separator() + QStringLiteral("recomp_features_v1.h");

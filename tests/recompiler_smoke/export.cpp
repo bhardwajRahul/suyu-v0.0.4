@@ -12,6 +12,7 @@ int main(int argc, char** argv) {
     // Same switches the nso_emit harness uses for the ABI 6 variants.
     suyu::recomp::g_emit_fastmem = EnvOn("SUYU_RECOMP_AB_FASTMEM");
     suyu::recomp::g_emit_guard_gen = EnvOn("SUYU_RECOMP_AB_GUARD_GEN");
+    suyu::recomp::g_emit_fpx = EnvOn("SUYU_RECOMP_AB_FPX");
     const auto stats = suyu::recomp::EmitProject(
         "smoke", reinterpret_cast<const uint8_t*>(smoke_code), sizeof(smoke_code),
         0x1000, argv[1], true);

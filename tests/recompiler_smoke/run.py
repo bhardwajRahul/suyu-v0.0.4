@@ -11,21 +11,31 @@ import tempfile
 # the fast-path emit option off. That output must stay byte-identical to ABI 5;
 # update this only for a deliberate ABI 5 emitter change, never for ABI 6 work.
 ABI5_GOLDEN = "79c6670cdbda8d52600ff5e53ee7bd1982455dcb635f72cffdb8c924f0825a95"
-# The same for ABI 6 (FM1) with the generation guard option off, taken from the
-# e0dfeae093 emitter. GG1 work must never change it. Recomputed against this
-# integration tree since the FP exactness fixes above touch the shared emitter
-# and therefore this text too (see perf/integrated golden recompute).
-ABI6_GOLDEN = "9a7689e833d7b364fd103d2b5c83729d6bb0acc8dc33afa10a86defedf80965f"  # PLACEHOLDER: recompute
+# The same for ABI 6 with FM1 alone (GG1 and FPX1 both off), which neither
+# feature may move, and with FM1 and FPX1 (exact native FP) on, tracked so any
+# change is deliberate. Recomputed against this integration tree, since the FP
+# exactness fixes touch the shared emitter and so this text too; GG1's own
+# switch-off contract (DESIGN.md sec 0) guarantees it does not move these.
+FM1_GOLDEN = "d1ef5cbec953fce3bfb5ddfcf7fd2032d6bfa147f9902bfa0ffb3ac139a6a004"
+FPX_GOLDEN = "565d78a55c5d3a1c5b0cdb52c88afb35184cd9467327c478324b05945e844d96"
 
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}
-
+# FPX1 on top of FM1 changes only these: the smoke code has no FP instructions.
+FPX_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.h"}
 # GG1 (the generation code guard) changes the block units as well, never the
 # dispatch table (src/recompiled_<module>.c) or the file set.
 GG1_CHANGED = ABI6_CHANGED | {"recompiled_smoke_0.c", "recompiled_second_0.c"}
 
-# name, SUYU_RECOMP_AB_FASTMEM, SUYU_RECOMP_AB_GUARD_GEN
-VARIANTS = (("abi5", None, None), ("abi6", "1", None), ("abi6gg", "1", "1"))
+# name -> SUYU_RECOMP_AB_* switches. abi6gg and ggfpx are GG1's on-top-of-FM1
+# and GG1+FPX1-together combinations; neither is golden-hashed (GG1 is not
+# switch-off text, so DESIGN.md checks it structurally via check_guard_gen).
+VARIANTS = (("abi5", {}),
+            ("abi6", {"SUYU_RECOMP_AB_FASTMEM": "1"}),
+            ("abi6gg", {"SUYU_RECOMP_AB_FASTMEM": "1", "SUYU_RECOMP_AB_GUARD_GEN": "1"}),
+            ("fpx", {"SUYU_RECOMP_AB_FASTMEM": "1", "SUYU_RECOMP_AB_FPX": "1"}),
+            ("ggfpx", {"SUYU_RECOMP_AB_FASTMEM": "1", "SUYU_RECOMP_AB_GUARD_GEN": "1",
+                       "SUYU_RECOMP_AB_FPX": "1"}))
 
 # smoke_gg_host modes: exit 0 (protocol, activation, controls, races) or 86
 # (a hook that must end skipping, followed by a changed block).
@@ -60,15 +70,19 @@ def tree_hash(root):
     return digest.hexdigest()
 
 
+def check_differences(base, other, changed, what):
+    files_base = sorted(p.relative_to(base) for p in base.rglob("*") if p.is_file())
+    files_other = sorted(p.relative_to(other) for p in other.rglob("*") if p.is_file())
+    if files_base != files_other:
+        raise RuntimeError(f"{what} export produced a different file set")
+    for rel in files_base:
+        same = (base / rel).read_bytes() == (other / rel).read_bytes()
+        if same == (rel.name in changed):
+            raise RuntimeError(f"unexpected {what} difference state for {rel.as_posix()}")
+
+
 def check_guard_gen(abi6, gg):
-    files6 = sorted(p.relative_to(abi6) for p in abi6.rglob("*") if p.is_file())
-    filesg = sorted(p.relative_to(gg) for p in gg.rglob("*") if p.is_file())
-    if files6 != filesg:
-        raise RuntimeError("GG1 export produced a different file set")
-    for rel in files6:
-        same = (abi6 / rel).read_bytes() == (gg / rel).read_bytes()
-        if same == (rel.name in GG1_CHANGED):
-            raise RuntimeError(f"unexpected GG1 difference state for {rel.as_posix()}")
+    check_differences(abi6, gg, GG1_CHANGED, "GG1")
     for module in (gg, gg / "second"):
         header = (module / "recomp_runtime.h").read_text()
         export = (module / "recomp_export.c").read_text()
@@ -81,22 +95,16 @@ def check_guard_gen(abi6, gg):
             raise RuntimeError(f"{module}: blocks still call the per-entry guard directly")
 
 
-def check_outputs(abi5, abi6):
-    actual = tree_hash(abi5)
-    if actual != ABI5_GOLDEN:
-        raise RuntimeError(f"ABI 5 output changed: {actual} != {ABI5_GOLDEN}")
-    actual = tree_hash(abi6)
-    if actual != ABI6_GOLDEN:
-        raise RuntimeError(f"ABI 6 output changed: {actual} != {ABI6_GOLDEN}")
-    files5 = sorted(p.relative_to(abi5) for p in abi5.rglob("*") if p.is_file())
-    files6 = sorted(p.relative_to(abi6) for p in abi6.rglob("*") if p.is_file())
-    if files5 != files6:
-        raise RuntimeError("ABI 6 export produced a different file set")
-    for rel in files5:
-        same = (abi5 / rel).read_bytes() == (abi6 / rel).read_bytes()
-        if same == (rel.name in ABI6_CHANGED):
-            raise RuntimeError(f"unexpected ABI 6 difference state for {rel.as_posix()}")
-    for root, abi, fastmem in ((abi5, 5, False), (abi6, 6, True)):
+def check_outputs(abi5, abi6, fpx):
+    for root, golden, what in ((abi5, ABI5_GOLDEN, "ABI 5"), (abi6, FM1_GOLDEN, "ABI 6 FM1"),
+                               (fpx, FPX_GOLDEN, "ABI 6 FM1+FPX1")):
+        actual = tree_hash(root)
+        if actual != golden:
+            raise RuntimeError(f"{what} output changed: {actual} != {golden}")
+    check_differences(abi5, abi6, ABI6_CHANGED, "ABI 6")
+    check_differences(abi6, fpx, FPX_CHANGED, "FPX1")
+    for root, abi, fastmem, fpx_on in ((abi5, 5, False, False), (abi6, 6, True, False),
+                                       (fpx, 6, True, True)):
         for module in (root, root / "second"):
             header = (module / "recomp_runtime.h").read_text()
             export = (module / "recomp_export.c").read_text()
@@ -104,6 +112,21 @@ def check_outputs(abi5, abi6):
                 raise RuntimeError(f"{module} is not ABI {abi}")
             if ("recomp_image_fastmem_v1" in export) != fastmem:
                 raise RuntimeError(f"{module}: fastmem handshake presence is wrong")
+            if ("recomp_image_fpx_v1" in export) != fpx_on:
+                raise RuntimeError(f"{module}: FPX1 handshake presence is wrong")
+
+
+def check_ggfpx(abi6gg, ggfpx):
+    # FM1+GG1+FPX1 together: both features negotiated on top of the same FM1
+    # base, neither one disabling the other. Structural only, like GG1 alone.
+    check_differences(abi6gg, ggfpx, GG1_CHANGED | FPX_CHANGED, "GG1+FPX1")
+    for module in (ggfpx, ggfpx / "second"):
+        header = (module / "recomp_runtime.h").read_text()
+        export = (module / "recomp_export.c").read_text()
+        if ("RECOMP_FEATURE_GUARD_GEN1" not in header) or ("RECOMP_FEATURE_FPX1" not in header):
+            raise RuntimeError(f"{module} is missing GG1 or FPX1 in the runtime header")
+        if "recomp_image_guard_gen_v1" not in export or "recomp_image_fpx_v1" not in export:
+            raise RuntimeError(f"{module}: GG1+FPX1 handshake presence is wrong")
 
 
 def main():
@@ -132,21 +155,21 @@ def main():
 
         exporter = executable(build("export"), "smoke_export")
         generated = {}
-        for name, fastmem, guard_gen in VARIANTS:
+        for name, switches in VARIANTS:
             generated[name] = root / f"generated-{name}"
             generated[name].mkdir()
             env = dict(os.environ)
             env.pop("SUYU_RECOMP_AB_FASTMEM", None)
             env.pop("SUYU_RECOMP_AB_GUARD_GEN", None)
-            if fastmem:
-                env["SUYU_RECOMP_AB_FASTMEM"] = fastmem
-            if guard_gen:
-                env["SUYU_RECOMP_AB_GUARD_GEN"] = guard_gen
+            env.pop("SUYU_RECOMP_AB_FPX", None)
+            env.update(switches)
             call([exporter, generated[name]], env=env)
-        check_outputs(generated["abi5"], generated["abi6"])
+        check_outputs(generated["abi5"], generated["abi6"], generated["fpx"])
         check_guard_gen(generated["abi6"], generated["abi6gg"])
+        check_ggfpx(generated["abi6gg"], generated["ggfpx"])
 
-        for name, _, guard_gen in VARIANTS:
+        for name, switches in VARIANTS:
+            guard_gen = "SUYU_RECOMP_AB_GUARD_GEN" in switches
             run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name]}")
             runner = executable(run, "smoke_run")
             for mode in ("slice", "ordinary-page", "cross-page", "special-page",

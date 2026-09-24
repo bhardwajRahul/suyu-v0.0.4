@@ -7118,6 +7118,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
     // Set from bundle.json when there is one, otherwise from the first image;
     // every image must then report the same ABI.
     unsigned expected_bundle_abi = 0;
+    // FPX1 is all or nothing across a bundle (-1: no ABI 6 image yet).
+    int bundle_fpx = -1;
     const auto layout = Core::GetRecompFastmemLayout();
 
     QStringList image_paths;
@@ -7332,6 +7334,22 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
             abi_ok = abi_ok && features && (features() & 1u) && fastmem_v1 &&
                      fastmem_v1(layout.page_bits, layout.stride_log2, layout.pointer_mask,
                                 layout.off_table, layout.off_limit) == 1;
+            // FPX1 folds the FP context fields and the kill-switch bit in.
+            const bool has_fpx =
+                abi_ok && (features() & Core::RecompImageFeature::ExactFpX1) != 0;
+            if (has_fpx) {
+                auto* fpx_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64)>(
+                    lib->resolve("recomp_image_fpx_v1"));
+                const auto fpx_layout = Core::GetRecompFpxLayout();
+                abi_ok = fpx_v1 && fpx_v1(fpx_layout.off_fpcr, fpx_layout.off_fpsr,
+                                          fpx_layout.inhibit_bit) != 0;
+            }
+            if (abi_ok && bundle_fpx >= 0 && bundle_fpx != (has_fpx ? 1 : 0)) {
+                abi_ok = false;
+            }
+            if (abi_ok) {
+                bundle_fpx = has_fpx ? 1 : 0;
+            }
         }
         if (!abi_ok) {
             LOG_WARNING(Frontend,
@@ -7583,6 +7601,9 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
              expected_bundle_abi == FastmemRecompImageAbi ? "negotiated" : "not used");
     // After SetRecompLookup, which forgets any earlier modules. Logs its outcome.
     Core::SetRecompGuardGenModules(std::move(guard_gen_modules));
+    Core::SetRecompFpxReady(bundle_fpx == 1);
+    LOG_INFO(Frontend, "Recompiled FPX1 native FP: {}",
+             bundle_fpx == 1 ? "negotiated" : "not used");
     LOG_INFO(Frontend, "Loaded {} recompiled module image(s) from {}", loaded_images.size(),
              dir.toStdString());
     return static_cast<int>(loaded_images.size());

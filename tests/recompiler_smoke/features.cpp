@@ -24,7 +24,7 @@ int main() {
     CHECK(F::Unsupported(F::FastmemPT1) == 0);
     // Anything outside what the host implements comes back, bit for bit.
     CHECK(F::Unsupported(F::FastmemPT1 | 0x80000000u) == 0x80000000u);
-    CHECK(F::Unsupported(F::ExactFpX1) == F::ExactFpX1); // reserved, not implemented
+    CHECK(F::Unsupported(F::ExactFpX1) == 0);
     CHECK(F::Unsupported(0xFFFFFFFFu) == (0xFFFFFFFFu & ~F::kHostSupported));
 
     const unsigned features = recomp_image_features();
