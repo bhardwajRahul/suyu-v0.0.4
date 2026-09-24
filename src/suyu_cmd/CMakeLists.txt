@@ -164,6 +164,13 @@ if (SUYU_CMD OR YUZU_CMD)
                                         "handshake; re-export the title with this build")
                 endif()
                 target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_FASTMEM_V1=1)
+                # The registry's feature report, which suyu.cpp checks for bits
+                # this host does not implement before any other handshake.
+                if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_features_v1.h")
+                    message(FATAL_ERROR "ABI 6 modules need a registry with the feature "
+                                        "report; re-export the title with this build")
+                endif()
+                target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_FEATURES_V1=1)
             endif()
             target_link_libraries(suyu-cmd-static PRIVATE ${_recomp_libs})
             list(APPEND SUYU_CMD_TARGETS suyu-cmd-static)

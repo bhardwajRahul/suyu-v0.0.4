@@ -148,6 +148,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_image_features.h"
 #include "core/core_timing.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
@@ -7297,6 +7298,19 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
                 reinterpret_cast<unsigned (*)()>(lib->resolve("recomp_image_features"));
             auto* fastmem_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64, u32, u32)>(
                 lib->resolve("recomp_image_fastmem_v1"));
+            // A feature bit is a requirement on the host: refuse any this host
+            // does not implement, before trusting any other handshake.
+            if (const u32 unknown =
+                    features ? Core::RecompImageFeature::Unsupported(features()) : 0) {
+                LOG_WARNING(Frontend,
+                            "Refusing automatic AOT bundle {}: {} requires image features {:#x} "
+                            "that this host does not implement",
+                            dir.toStdString(), lib->fileName().toStdString(), unknown);
+                lib->unload();
+                lib->deleteLater();
+                discard_found();
+                return 0;
+            }
             abi_ok = features && (features() & 1u) && fastmem_v1 &&
                      fastmem_v1(layout.page_bits, layout.stride_log2, layout.pointer_mask,
                                 layout.off_table, layout.off_limit) == 1;

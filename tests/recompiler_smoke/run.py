@@ -109,6 +109,8 @@ def main():
                          "cross-page-mutated", "cross-page-unmapped"):
                 call([runner, mode], expected=86, timeout=15)
             call([executable(run, "smoke_static")], timeout=15)
+            if name != "abi5":
+                call([executable(run, "smoke_features")], timeout=15)
             print(f"All synthetic {name.upper()} smoke checks passed.")
 
 

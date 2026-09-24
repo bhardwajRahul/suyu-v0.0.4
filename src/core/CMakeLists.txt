@@ -9,6 +9,7 @@ add_library(core STATIC
     arm/arm_interface.h
     arm/recomp/arm_recomp.cpp
     arm/recomp/arm_recomp.h
+    arm/recomp/recomp_image_features.h
     arm/debug.cpp
     arm/debug.h
     arm/exclusive_monitor.cpp

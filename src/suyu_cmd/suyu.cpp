@@ -36,6 +36,7 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_image_features.h"
 #include "core/core.h"
 #include "core/perf_stats.h"
 #include "core/core_timing.h"
@@ -196,6 +197,10 @@ int suyu_recomp_static_guard_v2(unsigned version);
 // host's layout (see Core::GetRecompFastmemLayout).
 int suyu_recomp_static_fastmem_v1(u32 page_bits, u32 stride_log2, u64 pointer_mask,
                                   u32 off_table, u32 off_limit);
+#endif
+#ifdef SUYU_RECOMP_FEATURES_V1
+// ABI 6 registrations: the OR of every module's recomp_image_features().
+unsigned suyu_recomp_static_features_v1(void);
 #endif
 #endif
 }
@@ -1409,6 +1414,26 @@ int main(int argc, char** argv) {
         recomp_guard_ready = suyu_recomp_static_guard_v2(2) != 0;
 #endif
         if (recomp_bundle_abi == 6) {
+            // A feature bit is a requirement on the host: refuse any this host
+            // does not implement before trusting any other handshake.
+            bool features_known = false;
+            unsigned features = 0;
+#ifdef SUYU_RECOMP_FEATURES_V1
+            features = suyu_recomp_static_features_v1();
+            features_known = true;
+#endif
+            if (!features_known) {
+                LOG_CRITICAL(Frontend, "ABI 6 static modules predate the feature registry; "
+                                       "re-export all modules with this build");
+                return EXIT_FAILURE;
+            }
+            if (const u32 unknown = Core::RecompImageFeature::Unsupported(features)) {
+                LOG_CRITICAL(Frontend,
+                             "Static recompiled modules require image features {:#x} that this "
+                             "host does not implement; update suyu or re-export with this build",
+                             unknown);
+                return EXIT_FAILURE;
+            }
             bool fastmem_ok = false;
 #ifdef SUYU_RECOMP_FASTMEM_V1
             fastmem_ok = suyu_recomp_static_fastmem_v1(
@@ -1473,6 +1498,18 @@ int main(int argc, char** argv) {
                         GetProcAddress(h, "recomp_image_features"));
                     auto fastmem_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64, u32, u32)>(
                         GetProcAddress(h, "recomp_image_fastmem_v1"));
+                    // A feature bit is a requirement on the host: refuse any
+                    // this host does not implement.
+                    if (const u32 unknown = features ? Core::RecompImageFeature::Unsupported(
+                                                           features())
+                                                     : 0) {
+                        LOG_CRITICAL(Frontend,
+                                     "{} requires image features {:#x} that this host does not "
+                                     "implement; update suyu or re-export with this build",
+                                     Common::UTF16ToUTF8(dll_name), unknown);
+                        FreeLibrary(h);
+                        return EXIT_FAILURE;
+                    }
                     if (!features || !(features() & 1u) || !fastmem_v1 ||
                         fastmem_v1(fastmem_layout.page_bits, fastmem_layout.stride_log2,
                                    fastmem_layout.pointer_mask, fastmem_layout.off_table,

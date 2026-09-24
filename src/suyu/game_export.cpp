@@ -3096,6 +3096,13 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                           << m << "(page_bits,stride_log2,pointer_mask,off_table,off_limit)!=1) ready=0;\n";
                     }
                     o << "  return ready;\n}\n";
+                    // Every feature any module relies on, so the host can refuse
+                    // bits it does not implement.
+                    o << "unsigned suyu_recomp_static_features_v1(void) {\n  unsigned f=0;\n";
+                    for (const auto& m : ordered) {
+                        o << "  f|=recomp_image_features_" << m << "();\n";
+                    }
+                    o << "  return f;\n}\n";
                 }
                 reg.close();
                 QFile abi_marker(recomp_root + QDir::separator() + QStringLiteral("recomp_abi_v4.h"));
@@ -3115,6 +3122,17 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     }
                 } else {
                     QFile::remove(fastmem_marker_path);
+                }
+                const QString features_marker_path =
+                    recomp_root + QDir::separator() + QStringLiteral("recomp_features_v1.h");
+                if (suyu::recomp::g_emit_fastmem) {
+                    QFile features_marker(features_marker_path);
+                    if (features_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                        features_marker.write(
+                            "/* ABI 6 registry exports suyu_recomp_static_features_v1. */\n");
+                    }
+                } else {
+                    QFile::remove(features_marker_path);
                 }
             }
         };

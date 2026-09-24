@@ -34,6 +34,11 @@ the fast path on and off, which must give the same registers, memory and
 callback sequence. `mem-ordinary` also proves that the fast path, not the ABI
 5 walk, serves ordinary accesses.
 
+For ABI 6, `smoke_features` checks the host's feature refusal
+(`core/arm/recomp/recomp_image_features.h`) against the image's
+`recomp_image_features()`: this host accepts exactly the bits its emitter
+produces, and a host lacking any of them refuses the image.
+
 A second executable links two generated static libraries using their emitted
 CMake projects and one shared runtime. It checks that lookup indexes, load bases,
 guard negotiation, and execution remain independent, including after rebasing
