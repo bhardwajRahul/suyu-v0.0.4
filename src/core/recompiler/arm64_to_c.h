@@ -6127,7 +6127,8 @@ inline std::string BuildRuntimeH(bool fastmem) {
 )RT") + FPScanHelpers() + FPFixedHelpers() + R"RT(
 /* Supplied by the host when the recompiled image is driven by an emulator
    rather than run standalone. `size` is 1, 2, 4 or 8 bytes. */
-#define RECOMP_IMAGE_ABI )RT" + (fastmem ? FastmemAbiH() : "5\n") + R"RT(
+#define RECOMP_IMAGE_ABI 5
+
 typedef struct RecompHostMem {
     void* user;
     uint64_t (*load)(void* user, uint64_t va, uint32_t size);
@@ -6335,6 +6336,12 @@ int  recomp_save_exists(GuestContext* c, const char* name);
 int  recomp_load_segments(GuestContext* c, const char* data_dir);
 #endif
 )RT";
+    if (fastmem) {
+        // The ABI line stays literal above; ABI 6 replaces it with its own block.
+        static constexpr std::string_view abi5_line = "#define RECOMP_IMAGE_ABI 5\n";
+        text.replace(text.find(abi5_line), abi5_line.size(),
+                     std::string("#define RECOMP_IMAGE_ABI ") + FastmemAbiH());
+    }
     return text;
 }
 
