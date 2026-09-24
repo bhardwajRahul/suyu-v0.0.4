@@ -5208,8 +5208,15 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         // cache this in a function-static variable: multiple guest cores can
         // enter the same generated block. Per-entry verification also handles
         // process reuse and remapped addresses without an unsafe shared epoch.
-        rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
-               "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
+        if (EmitGuardGen()) {
+            // GG1: the same check, skipped while this block's seen word (slot
+            // block_index - 1 of g_recomp_gg_seen) matches the module generation.
+            rcu += "};\n    RECOMP_GG_GUARD(" + std::to_string(b.vaddr) + "ULL,_expected," +
+                   std::to_string(b.count) + "U," + std::to_string(block_index - 1) + "U);\n";
+        } else {
+            rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
+                   "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
+        }
         // Lookup indexes every emitted instruction, not only block starts. An
         // indirect transfer can therefore enter the middle of this function.
         // Direct chains publish their exact target PC before calling, so any
@@ -5674,6 +5681,11 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         cm << " recomp_image_features=recomp_image_features_" << mod
            << " recomp_image_fastmem_v1=recomp_image_fastmem_v1_" << mod;
     }
+    if (EmitGuardGen()) {
+        cm << " g_recomp_gg_word=g_recomp_gg_word_" << mod
+           << " g_recomp_gg_seen=g_recomp_gg_seen_" << mod
+           << " recomp_image_guard_gen_v1=recomp_image_guard_gen_v1_" << mod;
+    }
     cm << " recomp_lookup=recomp_lookup_" << mod
        << " recomp_build_index=recomp_build_index_" << mod
        << " _recomp_index_view=_recomp_index_view_" << mod
@@ -5710,15 +5722,49 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "RECOMP_API unsigned recomp_image_abi(void){ return RECOMP_IMAGE_ABI; }\n"
           "RECOMP_API unsigned recomp_image_guard_v2(unsigned host_version){\n"
           "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n";
+    if (EmitGuardGen()) {
+        u64 code_lo = 0, code_end = 0;
+        if (!blocks.empty()) {
+            code_lo = blocks.front().vaddr;
+            for (const auto& b : blocks) {
+                code_end = std::max<u64>(code_end, b.vaddr + (u64)b.count * 4);
+            }
+        }
+        char span[160];
+        snprintf(span, sizeof span,
+                 "  *code_lo=0x%llxULL; *code_end=0x%llxULL; *base=&g_module_base;\n",
+                 (unsigned long long)code_lo, (unsigned long long)code_end);
+        ex << "/* ABI 6 feature GG1. The generation word starts at VERIFY_ALWAYS, so\n"
+              "   until a host that knows GG1 takes it over every block verifies on\n"
+              "   every entry. The host passes its GG1 version and learns the word,\n"
+              "   the module-relative span the blocks cover, and where the load base\n"
+              "   lives. The FM1 handshake below refuses to complete before this one,\n"
+              "   so a host that knows FM1 but not GG1 refuses the whole bundle. */\n"
+              "uint32_t g_recomp_gg_word = RECOMP_GG_VERIFY_ALWAYS;\n"
+           << "uint32_t g_recomp_gg_seen[" << std::max<size_t>(blocks.size(), 1) << "];\n"
+           << "static int g_recomp_gg_host = 0;\n"
+              "RECOMP_API uint32_t* recomp_image_guard_gen_v1(uint32_t host_version, uint64_t* code_lo,\n"
+              "                                               uint64_t* code_end, const uint64_t** base){\n"
+              "  if(host_version!=1u) return 0;\n"
+              "  RECOMP_GG_STORE_RELEASE(g_recomp_gg_word,RECOMP_GG_VERIFY_ALWAYS);\n"
+           << span
+           << "  g_recomp_gg_host=1;\n"
+              "  return &g_recomp_gg_word;\n"
+              "}\n";
+    }
     if (g_emit_fastmem) {
         ex << "/* ABI 6 feature handshake. The host passes its own view of the page\n"
               "   table layout and of the context offsets; 1 means this image was\n"
               "   compiled against exactly those, so the host may enable fm_limit. */\n"
-              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FASTMEM_PT1; }\n"
-              "RECOMP_API unsigned recomp_image_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
+           << (EmitGuardGen() ? "RECOMP_API unsigned recomp_image_features(void){ return "
+                                "RECOMP_FEATURE_FASTMEM_PT1|RECOMP_FEATURE_GUARD_GEN1; }\n"
+                              : "RECOMP_API unsigned recomp_image_features(void){ return "
+                                "RECOMP_FEATURE_FASTMEM_PT1; }\n")
+           << "RECOMP_API unsigned recomp_image_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
               "                                            uint64_t ptr_mask, uint32_t off_table,\n"
               "                                            uint32_t off_limit){\n"
-              "  return page_bits==RECOMP_FM_PAGE_BITS && stride_log2==RECOMP_FM_STRIDE_LOG2 &&\n"
+           << (EmitGuardGen() ? "  if(!g_recomp_gg_host) return 0;\n" : "")
+           << "  return page_bits==RECOMP_FM_PAGE_BITS && stride_log2==RECOMP_FM_STRIDE_LOG2 &&\n"
               "         ptr_mask==(uint64_t)RECOMP_FM_PTR_MASK &&\n"
               "         off_table==offsetof(GuestContext,fm_table) &&\n"
               "         off_limit==offsetof(GuestContext,fm_limit);\n"
@@ -5779,7 +5825,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         u.close();
     }
     write("main.c", mc.str());
-    write("recomp_export.c", ex.str());
+    std::string export_text = ex.str();
+    if (EmitGuardGen()) {
+        // A module moved to another base must be re-verified there: drop back
+        // to VERIFY_ALWAYS until the host moves the generation again.
+        static constexpr std::string_view set_base =
+            "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base;\n";
+        export_text.replace(export_text.find(set_base), set_base.size(),
+                            "RECOMP_API void recomp_image_set_base(uint64_t base){\n"
+                            "  if(base!=g_module_base) RECOMP_GG_STORE_RELEASE(g_recomp_gg_word,"
+                            "RECOMP_GG_VERIFY_ALWAYS);\n"
+                            "  g_module_base = base;\n");
+    }
+    write("recomp_export.c", export_text);
     write("CMakeLists.txt", cm.str());
 
     // Coverage report. Without this the exporter cannot describe its own output:
@@ -6110,7 +6168,48 @@ typedef char recomp_layout_fm_limit[offsetof(GuestContext, fm_limit) == 880 ? 1 
 )RT";
 }
 
-inline std::string BuildRuntimeH(bool fastmem) {
+// ABI 6 feature GG1 (generation code guard). Declared after recomp_code_guard.
+inline const char* GuardGenH() {
+    return R"RT(/* ABI 6 feature GG1: the generation code guard.
+   A block runs the full recomp_code_guard only when its seen word differs from
+   its module's generation word, then records the generation it verified
+   against. The host moves the generation after every event that can change a
+   guarded instruction word or its mapping, and holds it at
+   RECOMP_GG_VERIFY_ALWAYS for anything it cannot prove stable; that value is
+   never stored as a seen word, and seen words start at 0, which the host never
+   uses, so an unnegotiated module verifies on every entry exactly as ABI 5.
+   Ordering: the host stores the word with release; blocks load both words
+   relaxed; recomp_code_guard_gen fences with acquire before reading code and
+   publishes the seen word with release after the check has passed. */
+#define RECOMP_FEATURE_GUARD_GEN1 2u
+#define RECOMP_GG_VERIFY_ALWAYS 0xFFFFFFFFu
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define RECOMP_GG_LOAD(x) (*(const volatile uint32_t*)&(x))
+#if defined(_M_ARM64)
+#define RECOMP_GG_ACQUIRE_FENCE() __dmb(_ARM64_BARRIER_ISHLD)
+#define RECOMP_GG_STORE_RELEASE(x,v) __stlr32((volatile unsigned __int32*)&(x),(unsigned __int32)(v))
+#else
+#define RECOMP_GG_ACQUIRE_FENCE() _ReadWriteBarrier()
+#define RECOMP_GG_STORE_RELEASE(x,v) do{ _ReadWriteBarrier(); *(volatile uint32_t*)&(x)=(v); }while(0)
+#endif
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_GG_LOAD(x) __atomic_load_n(&(x),__ATOMIC_RELAXED)
+#define RECOMP_GG_ACQUIRE_FENCE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define RECOMP_GG_STORE_RELEASE(x,v) __atomic_store_n(&(x),(v),__ATOMIC_RELEASE)
+#else
+#error "GG1 needs 32-bit atomic loads, stores and fences"
+#endif
+extern uint32_t g_recomp_gg_word;
+extern uint32_t g_recomp_gg_seen[];
+void recomp_code_guard_gen(GuestContext*,uint64_t,const uint32_t*,uint32_t,int,uint32_t*,uint32_t);
+#define RECOMP_GG_GUARD(off,exp,n,idx) { uint32_t _g=RECOMP_GG_LOAD(g_recomp_gg_word); \
+  if(RECOMP_GG_LOAD(g_recomp_gg_seen[idx])!=_g) \
+    recomp_code_guard_gen(c,g_module_base+(off),exp,n,g_recomp_guard_host_v2,&g_recomp_gg_seen[idx],_g); }
+)RT";
+}
+
+inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false) {
     std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
@@ -6353,6 +6452,10 @@ int  recomp_load_segments(GuestContext* c, const char* data_dir);
         text.replace(text.find(abi5_line), abi5_line.size(),
                      std::string("#define RECOMP_IMAGE_ABI ") + FastmemAbiH());
     }
+    if (fastmem && guard_gen) {
+        static constexpr std::string_view anchor = "void recomp_ic_ivau(GuestContext*,uint64_t,int);\n";
+        text.insert(text.find(anchor) + anchor.size(), GuardGenH());
+    }
     return text;
 }
 
@@ -6361,7 +6464,8 @@ int  recomp_load_segments(GuestContext* c, const char* data_dir);
 inline const char* RuntimeH() {
     static const std::string abi5 = BuildRuntimeH(false);
     static const std::string fastmem = BuildRuntimeH(true);
-    return (g_emit_fastmem ? fastmem : abi5).c_str();
+    static const std::string guard_gen = BuildRuntimeH(true, true);
+    return (EmitGuardGen() ? guard_gen : g_emit_fastmem ? fastmem : abi5).c_str();
 }
 
 inline const char* EstimateRuntimeC() {
@@ -6519,7 +6623,25 @@ void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
 )RT";
 }
 
-inline std::string BuildRuntimeC(bool fastmem) {
+// ABI 6 feature GG1: the verification a block runs when its generation moved.
+inline const char* GuardGenC() {
+    return R"RT(/* GG1: the block saw its seen word differ from the generation `gen` it
+   loaded. The acquire fence pairs with the host's release store of `gen`, so
+   the check below reads code and mappings no older than the event that
+   produced it. The check itself is the unchanged per-entry guard, with the
+   same diagnostics and abort. Only after it passes does the seen word take
+   `gen`, with release so another core that skips on it cannot get ahead of
+   this check's reads. VERIFY_ALWAYS is never recorded. */
+void recomp_code_guard_gen(GuestContext* c,uint64_t pc,const uint32_t* expected,uint32_t count,
+                           int host_guard_version,uint32_t* seen,uint32_t gen){
+  RECOMP_GG_ACQUIRE_FENCE();
+  recomp_code_guard(c,pc,expected,count,host_guard_version);
+  if(gen!=RECOMP_GG_VERIFY_ALWAYS) RECOMP_GG_STORE_RELEASE(*seen,gen);
+}
+)RT";
+}
+
+inline std::string BuildRuntimeC(bool fastmem, bool guard_gen = false) {
     // MSVC caps one string literal at 16380 bytes (C2026) and this runtime is
     // past that, so it is assembled from several pieces at first use rather
     // than being a single literal. Adjacent-literal concatenation would not
@@ -7158,14 +7280,21 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
-    return head + (fastmem ? FastmemHelpersC(abi5_helpers) : abi5_helpers) + tail +
-           EstimateRuntimeC();
+    std::string text = head + (fastmem ? FastmemHelpersC(abi5_helpers) : abi5_helpers) + tail +
+                       EstimateRuntimeC();
+    if (fastmem && guard_gen) {
+        static constexpr std::string_view anchor =
+            "void recomp_ic_ivau(GuestContext* c,uint64_t address,int host_guard_version){\n";
+        text.insert(text.find(anchor), GuardGenC());
+    }
+    return text;
 }
 
 inline const char* RuntimeC() {
     static const std::string abi5 = BuildRuntimeC(false);
     static const std::string fastmem = BuildRuntimeC(true);
-    return (g_emit_fastmem ? fastmem : abi5).c_str();
+    static const std::string guard_gen = BuildRuntimeC(true, true);
+    return (EmitGuardGen() ? guard_gen : g_emit_fastmem ? fastmem : abi5).c_str();
 }
 
 } // namespace suyu::recomp
