@@ -802,6 +802,28 @@ inline std::string EmitFPCompareFlags(bool dbl, bool signal, const std::string& 
         " c->n=(uint8_t)_lt; c->z=(uint8_t)_eq; c->c=(uint8_t)!_lt; c->v=0; } }";
 }
 
+// FCMEQ/FCMGE/FCMGT (`kind` "eq", "ge", "gt") of raw S/D bits `a` and `b` into
+// an all-ones or zero _v, which `store` consumes. Integer ordering of the IEEE
+// bits; FZ flushes subnormal inputs (IDC). A NaN compares false and raises IOC
+// when it is signalling, or for any NaN in the ordered GE/GT forms.
+inline std::string EmitFPCompareMask(bool dbl, const std::string& kind, const std::string& a,
+                                     const std::string& b, const std::string& store) {
+    const bool eq = kind == "eq";
+    return "{ uint64_t _a=" + a + ",_b=" + b + ",_v=0; const uint64_t _sign=" +
+        (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
+        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";"
+        " if(c->fpcr&(1ULL<<24)) { if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
+        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }"
+        " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+        " if(_an||_bn) { if(" + std::string(eq ? "(_an&&!(_a&_quiet))||(_bn&&!(_b&_quiet))" : "1") +
+        ") c->fpsr|=1; }"
+        " else { int _eq=_a==_b||!((_a|_b)&~_sign);"
+        " int _gt=!_eq&&(((_a^_b)&_sign)?!(_a&_sign):((_a&_sign)?_a<_b:_a>_b)); (void)_gt; (void)_eq;"
+        " if(" + (eq ? "_eq" : kind == "ge" ? "_eq||_gt" : "_gt") + ") _v=~(uint64_t)0; } " + store + " }";
+}
+
 inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
     if (unhandled) {
         *unhandled = false;
@@ -2742,29 +2764,17 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
         const bool dbl = (size & 1) != 0;
         const char* cmp = nullptr;
-        if (!U && !(size & 2))      cmp = "==";   // FCMEQ
-        else if (U && !(size & 2))  cmp = ">=";   // FCMGE
-        else if (U && (size & 2))   cmp = ">";    // FCMGT
+        if (!U && !(size & 2))      cmp = "eq";   // FCMEQ
+        else if (U && !(size & 2))  cmp = "ge";   // FCMGE
+        else if (U && (size & 2))   cmp = "gt";   // FCMGT
         if (cmp && !(dbl && !Q)) {
-            const char* ct = dbl ? "double" : "float";
-            const int fsz = dbl ? 8 : 4;
-            const int bytes = Q ? 16 : 8;
-            const int lanes = bytes / fsz;
-            const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
-            std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
-                            "],_b[" + std::to_string(lanes) + "]; " + uty + " _r[" +
-                            std::to_string(lanes) + "]; ";
-            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
-            // A NaN operand compares false and the lane comes out zero, which is
-            // what the architecture specifies and what C's comparison already
-            // does - so no NaN test is needed here.
-            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(_a[_i]" + cmp +
-                 "_b[_i]) ? (" + uty + ")~(" + uty + ")0 : (" + uty + ")0; ";
-            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                 "][1]=0; ";
-            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-            put(s);
+            const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+            const int lanes = (Q ? 16 : 8) / (dbl ? 8 : 4);
+            put("{ " + uty + " _n[" + count + "],_m[" + count + "],_r[" + count +
+                "]={0}; memcpy(_n,c->vreg[" + std::to_string(rn) + "],16); memcpy(_m,c->vreg[" +
+                std::to_string(rm) + "],16); for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) " +
+                EmitFPCompareMask(dbl, cmp, "_n[_i]", "_m[_i]", "_r[_i]=(" + uty + ")_v;") +
+                " memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
             return true;
         }
     }
@@ -4232,22 +4242,22 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
             }
             if (cmp) {
-                const char* ct = dbl ? "double" : "float";
+                // Against +0.0: LE and LT are GE and GT with the operands
+                // swapped, which is how the architecture defines them.
                 const int fsz = dbl ? 8 : 4;
                 // A scalar form touches one lane; a vector form covers the
                 // whole selected width.
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
                 const int lanes = bytes / fsz;
-                const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
-                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "]; " +
-                                uty + " _r[" + std::to_string(lanes) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(_a[_i]" + cmp +
-                     "(" + ct + ")0) ? (" + uty + ")~(" + uty + ")0 : (" + uty + ")0; ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-                put(s);
+                const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+                const std::string op = cmp;
+                const bool swap = op == "<=" || op == "<";
+                const char* kind = op == "==" ? "eq" : (op == ">=" || op == "<=") ? "ge" : "gt";
+                put("{ " + uty + " _n[" + count + "],_r[" + count + "]={0}; memcpy(_n,c->vreg[" +
+                    std::to_string(rn) + "],16); for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) " +
+                    EmitFPCompareMask(dbl, kind, swap ? "0" : "_n[_i]", swap ? "_n[_i]" : "0",
+                                      "_r[_i]=(" + uty + ")_v;") +
+                    " memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
                 return true;
             }
         }
