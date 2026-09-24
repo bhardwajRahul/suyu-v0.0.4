@@ -27,6 +27,7 @@ using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 struct ModuleState {
     Module m;
     bool sticky = false;
+    bool pin_logged = false; // whether SetPinLogger's callback has fired for it
     std::uint64_t active_base = 0; // base at activation
     Runs pa_runs;                  // [pa, pa + size) backing the guarded span
 };
@@ -62,6 +63,9 @@ struct State {
     // Activations since registration; only the first can prove anything.
     unsigned activations = 0;
     std::uint64_t bumps[static_cast<unsigned>(Reason::Count)]{};
+    // Diagnostic only; never cleared by SetModules/Forget.
+    PinLogFn pin_logger;
+    TableSeenFn table_seen_logger;
 };
 
 State& S() {
@@ -100,6 +104,19 @@ bool OverlapsModulePa(const ModuleState& s, std::uint64_t pa, std::uint64_t size
     });
 }
 
+// Caller holds the lock. Sets `module` sticky and, the first time this module
+// ever goes sticky, reports why through the registered pin logger.
+void MarkSticky(State& s, std::size_t index, ModuleState& module, PinCause cause,
+                std::uint64_t addr) {
+    module.sticky = true;
+    if (!module.pin_logged) {
+        module.pin_logged = true;
+        if (s.pin_logger) {
+            s.pin_logger(index, cause, addr);
+        }
+    }
+}
+
 // Caller holds the lock. Stores the new generation into every module word, or
 // kVerifyAlways for a module that is not provably stable. Serialised by the
 // lock, so each word's modification order follows bump order.
@@ -113,23 +130,27 @@ void Bump(State& s, Reason reason) {
     } else {
         ++s.counter;
     }
-    for (auto& module : s.modules) {
+    for (std::size_t i = 0; i < s.modules.size(); ++i) {
+        auto& module = s.modules[i];
         if (s.active && LoadBase(module.m) != module.active_base) {
-            module.sticky = true; // rebased since activation
+            MarkSticky(s, i, module, PinCause::Rebased, 0); // rebased since activation
         }
         const bool verify_always = !s.active || s.exhausted || module.sticky;
         StoreWord(module.m, verify_always ? kVerifyAlways : s.counter);
     }
 }
 
-// Caller holds the lock. Makes every module `hit` selects sticky and, if there
-// was one, bumps so that its word drops to kVerifyAlways now.
+// Caller holds the lock. Makes every module `hit` selects sticky (reporting
+// `addr` as the reason's address) and, if there was one, bumps so that its
+// word drops to kVerifyAlways now.
 template <typename Hit>
-void StickyWhere(State& s, Reason reason, Hit&& hit) {
+void StickyWhere(State& s, Reason reason, PinCause cause, Hit&& hit) {
     bool any = false;
-    for (auto& module : s.modules) {
-        if (hit(module)) {
-            module.sticky = true;
+    for (std::size_t i = 0; i < s.modules.size(); ++i) {
+        auto& module = s.modules[i];
+        std::uint64_t addr = 0;
+        if (hit(module, addr)) {
+            MarkSticky(s, i, module, cause, addr);
             any = true;
         }
     }
@@ -210,6 +231,18 @@ bool StableSpan(const State& s, const void* table, std::uint64_t va, std::uint64
 
 } // namespace
 
+void SetPinLogger(PinLogFn fn) {
+    auto& s = S();
+    std::scoped_lock lk{s.lock};
+    s.pin_logger = std::move(fn);
+}
+
+void SetTableSeenLogger(TableSeenFn fn) {
+    auto& s = S();
+    std::scoped_lock lk{s.lock};
+    s.table_seen_logger = std::move(fn);
+}
+
 void SetModules(std::vector<Module> modules, bool enabled) {
     auto& s = S();
     std::scoped_lock lk{s.lock};
@@ -265,13 +298,28 @@ void Activate(std::uint64_t key, const void* table, const WatchFn& watch) {
     // activation, not before a later one.
     const bool tracked = !s.map_log_overflow && !s.exposures_overflow && s.activations == 0 &&
                          std::find(s.tables.begin(), s.tables.end(), table) != s.tables.end();
+    // Which of the four AND'ed conditions above actually failed, for
+    // diagnostics only: `tracked` alone can't say which one.
+    PinCause untracked_cause = PinCause::Untracked;
+    if (s.map_log_overflow) {
+        untracked_cause = PinCause::MapLogOverflow;
+    } else if (s.exposures_overflow) {
+        untracked_cause = PinCause::ExposuresOverflow;
+    } else if (s.activations != 0) {
+        untracked_cause = PinCause::NotFirstActivation;
+    }
     ++s.activations;
-    for (auto& module : s.modules) {
+    for (std::size_t i = 0; i < s.modules.size(); ++i) {
+        auto& module = s.modules[i];
         module.active_base = LoadBase(module.m);
         module.pa_runs.clear();
-        module.sticky = !tracked || SpanSize(module) == 0 ||
-                        !StableSpan(s, table, SpanStart(module), SpanSize(module), module.pa_runs);
-        if (module.sticky) {
+        if (!tracked) {
+            MarkSticky(s, i, module, untracked_cause, reinterpret_cast<std::uint64_t>(table));
+            continue;
+        }
+        if (SpanSize(module) == 0 ||
+            !StableSpan(s, table, SpanStart(module), SpanSize(module), module.pa_runs)) {
+            MarkSticky(s, i, module, PinCause::Hole, SpanStart(module));
             continue;
         }
         // Any other live mapping of the same physical pages, in any table, is
@@ -280,15 +328,18 @@ void Activate(std::uint64_t key, const void* table, const WatchFn& watch) {
             const bool own =
                 rec.table == table && Overlaps(rec.va, rec.size, SpanStart(module), SpanSize(module));
             if (!own && OverlapsModulePa(module, rec.pa, rec.size)) {
-                module.sticky = true;
+                MarkSticky(s, i, module, PinCause::AliasAtActivation, rec.va);
                 break;
             }
+        }
+        if (module.sticky) {
+            continue;
         }
         // A raw pointer into the span handed out before now may still be
         // written through.
         for (const auto& rec : s.exposures) {
             if (rec.table == table && OverlapsModuleVa(module, rec.va, rec.size)) {
-                module.sticky = true;
+                MarkSticky(s, i, module, PinCause::ExposedBeforeActivation, rec.va);
                 break;
             }
         }
@@ -326,9 +377,16 @@ void OnMap(const void* table, std::uint64_t va, std::uint64_t size, std::uint64_
     if (!s.active) {
         return;
     }
-    StickyWhere(s, Reason::Map, [&](const ModuleState& module) {
-        return (table == s.active_table && OverlapsModuleVa(module, va, size)) ||
-               OverlapsModulePa(module, pa, size);
+    StickyWhere(s, Reason::Map, PinCause::Map, [&](const ModuleState& module, std::uint64_t& addr) {
+        if (table == s.active_table && OverlapsModuleVa(module, va, size)) {
+            addr = va;
+            return true;
+        }
+        if (OverlapsModulePa(module, pa, size)) {
+            addr = pa;
+            return true;
+        }
+        return false;
     });
 }
 
@@ -342,8 +400,11 @@ void OnUnmap(const void* table, std::uint64_t va, std::uint64_t size) {
     if (!s.active || table != s.active_table) {
         return;
     }
-    StickyWhere(s, Reason::Unmap,
-                [&](const ModuleState& module) { return OverlapsModuleVa(module, va, size); });
+    StickyWhere(s, Reason::Unmap, PinCause::Unmap,
+                [&](const ModuleState& module, std::uint64_t& addr) {
+                    addr = va;
+                    return OverlapsModuleVa(module, va, size);
+                });
 }
 
 void OnProtect(const void* table, std::uint64_t va, std::uint64_t size, bool writable) {
@@ -360,11 +421,12 @@ void OnProtect(const void* table, std::uint64_t va, std::uint64_t size, bool wri
         return;
     }
     bool any = false;
-    for (auto& module : s.modules) {
+    for (std::size_t i = 0; i < s.modules.size(); ++i) {
+        auto& module = s.modules[i];
         if (OverlapsModuleVa(module, va, size)) {
             any = true;
             if (writable) {
-                module.sticky = true; // guest stores to it are not hooked
+                MarkSticky(s, i, module, PinCause::Protect, va); // guest stores to it are not hooked
             }
         }
     }
@@ -409,8 +471,11 @@ void OnPointerExposed(const void* table, std::uint64_t va, std::uint64_t size) {
     if (!s.active || table != s.active_table) {
         return;
     }
-    StickyWhere(s, Reason::PointerExposed,
-                [&](const ModuleState& module) { return OverlapsModuleVa(module, va, size); });
+    StickyWhere(s, Reason::PointerExposed, PinCause::PointerExposed,
+                [&](const ModuleState& module, std::uint64_t& addr) {
+                    addr = va;
+                    return OverlapsModuleVa(module, va, size);
+                });
 }
 
 void OnJitFallback() {
@@ -419,7 +484,8 @@ void OnJitFallback() {
     }
     auto& s = S();
     std::scoped_lock lk{s.lock};
-    StickyWhere(s, Reason::JitFallback, [](const ModuleState&) { return true; });
+    StickyWhere(s, Reason::JitFallback, PinCause::JitFallback,
+                [](const ModuleState&, std::uint64_t&) { return true; });
 }
 
 void OnDeviceMap(const void* table, std::uint64_t va, std::uint64_t size) {
@@ -432,8 +498,11 @@ void OnDeviceMap(const void* table, std::uint64_t va, std::uint64_t size) {
         return;
     }
     // Device writes land in the backing without any CPU hook.
-    StickyWhere(s, Reason::DeviceMap,
-                [&](const ModuleState& module) { return OverlapsModuleVa(module, va, size); });
+    StickyWhere(s, Reason::DeviceMap, PinCause::DeviceMap,
+                [&](const ModuleState& module, std::uint64_t& addr) {
+                    addr = va;
+                    return OverlapsModuleVa(module, va, size);
+                });
 }
 
 void OnInvalidate(std::uint64_t va, std::uint64_t size) {
@@ -473,6 +542,9 @@ void OnPageTableSwap(const void* table) {
                     s.map_log.end());
     if (std::find(s.tables.begin(), s.tables.end(), table) == s.tables.end()) {
         s.tables.push_back(table);
+    }
+    if (s.table_seen_logger) {
+        s.table_seen_logger(table, s.tables.size());
     }
     Bump(s, Reason::PageTableSwap);
 }

@@ -771,7 +771,72 @@ bool IsRecompFastmemReady() {
     return g_fastmem_ready.load(std::memory_order_acquire);
 }
 
+namespace {
+
+const char* PinCauseName(RecompGuardGen::PinCause cause) {
+    switch (cause) {
+    case RecompGuardGen::PinCause::Untracked:
+        return "untracked table (its pointer was never seen by OnPageTableSwap)";
+    case RecompGuardGen::PinCause::MapLogOverflow:
+        return "untracked: live-mapping log overflowed before activation";
+    case RecompGuardGen::PinCause::ExposuresOverflow:
+        return "untracked: pre-activation raw-pointer log overflowed";
+    case RecompGuardGen::PinCause::NotFirstActivation:
+        return "untracked: a process already activated under this registration";
+    case RecompGuardGen::PinCause::Hole:
+        return "span not wholly mapped read/execute-only at activation";
+    case RecompGuardGen::PinCause::Rebased:
+        return "rebased since activation";
+    case RecompGuardGen::PinCause::AliasAtActivation:
+        return "aliased (another live mapping of its physical pages)";
+    case RecompGuardGen::PinCause::ExposedBeforeActivation:
+        return "raw pointer exposed before activation";
+    case RecompGuardGen::PinCause::Map:
+        return "mapped over (or aliased by) a new mapping";
+    case RecompGuardGen::PinCause::Unmap:
+        return "unmapped";
+    case RecompGuardGen::PinCause::Protect:
+        return "made writable";
+    case RecompGuardGen::PinCause::DeviceMap:
+        return "device-mapped";
+    case RecompGuardGen::PinCause::PointerExposed:
+        return "raw pointer exposed after activation";
+    case RecompGuardGen::PinCause::JitFallback:
+        return "JIT fallback created";
+    }
+    return "unknown";
+}
+
+// Registered once, process-wide: names the rule from DESIGN.md section 2 the
+// first time each module goes sticky, so a log says why instead of just that
+// it did. Info level, one line per module, never per access.
+void EnsureGuardGenPinLogger() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        RecompGuardGen::SetPinLogger([](std::size_t module_index, RecompGuardGen::PinCause cause,
+                                        u64 addr) {
+            if (addr != 0) {
+                LOG_INFO(Core_ARM,
+                         "recomp generation guard: module {} pinned to verify-always: {} "
+                         "(addr={:#x}, page={:#x})",
+                         module_index, PinCauseName(cause), addr, addr >> Memory::YUZU_PAGEBITS);
+            } else {
+                LOG_INFO(Core_ARM, "recomp generation guard: module {} pinned to verify-always: {}",
+                         module_index, PinCauseName(cause));
+            }
+        });
+        RecompGuardGen::SetTableSeenLogger([](const void* table, std::size_t known_tables) {
+            LOG_INFO(Core_ARM,
+                     "recomp generation guard: OnPageTableSwap saw table={} ({} table(s) known)",
+                     table, known_tables);
+        });
+    });
+}
+
+} // namespace
+
 bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules) {
+    EnsureGuardGenPinLogger();
     const bool enabled = !kGuardGenDisabled && !modules.empty() &&
                          g_code_guard_ready.load(std::memory_order_acquire);
     const size_t count = modules.size();
@@ -971,7 +1036,10 @@ struct ArmRecomp::Impl {
                     ->store(1, std::memory_order_relaxed);
             }
         };
-        RecompGuardGen::Activate(key, process.GetMemory().GetPageTableView().entries, watch);
+        const void* const activate_table = process.GetMemory().GetPageTableView().entries;
+        LOG_INFO(Core_ARM, "recomp generation guard: process {} activating against table={}",
+                 process.GetProcessId(), activate_table);
+        RecompGuardGen::Activate(key, activate_table, watch);
         const auto stats = RecompGuardGen::GetStats();
         LOG_INFO(Core_ARM,
                  "recomp generation guard: process {} active={} generation={}; {} of {} "

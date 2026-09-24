@@ -63,6 +63,43 @@ enum class Reason : unsigned {
     Count,
 };
 
+/// Why a module first went sticky ("verify always"). Diagnostic only: it does
+/// not change behaviour, it names the rule from DESIGN.md section 2 so a log
+/// can say which one fired instead of just that one did.
+enum class PinCause : unsigned {
+    Untracked,   ///< the table wasn't fully logged from its creation (2.6.1)
+    MapLogOverflow,      ///< the live-mapping log hit its cap before activation (2.2)
+    ExposuresOverflow,   ///< the pre-activation raw-pointer log hit its cap (2.4)
+    NotFirstActivation,  ///< a process activated before this one under the same registration (2.5)
+    Hole,        ///< the span has a gap, or a writable record, at activation (2.6.2)
+    Rebased,     ///< the module's base moved since activation (2.5)
+    AliasAtActivation, ///< another live mapping shares its physical pages (2.6.3)
+    ExposedBeforeActivation, ///< a raw pointer into it was handed out pre-activation (2.4)
+    Map,         ///< Core::Memory::MapMemoryRegion overlapped it (2.1/2.2)
+    Unmap,       ///< Core::Memory::UnmapRegion overlapped it (2.1)
+    Protect,     ///< ProtectRegion made it writable (2.1)
+    DeviceMap,   ///< DeviceMemoryManager::Map overlapped it (2.2)
+    PointerExposed, ///< a raw pointer into it was handed out after activation (2.4)
+    JitFallback, ///< the hybrid JIT fallback was created (2.4)
+};
+
+/// Called at most once per module, the first time it goes sticky. `addr` is
+/// whatever address explains the cause (a VA, PA, or the table pointer for
+/// Untracked); it is 0 when no single address applies (JitFallback, Rebased).
+using PinLogFn = std::function<void(std::size_t module_index, PinCause cause, std::uint64_t addr)>;
+
+/// Registered once by the emulator; recomp_guard_gen itself stays free of
+/// emulator/logging dependencies. Not reset by SetModules/Forget.
+void SetPinLogger(PinLogFn fn);
+
+/// Diagnostic only: called at the end of every OnPageTableSwap while watching,
+/// with the table pointer just (re)recorded and the number of tables now held
+/// in the log (including this one). Lets a log confirm whether, and when, a
+/// given table identity was ever seen by the hook Activate()'s "tracked" test
+/// looks up.
+using TableSeenFn = std::function<void(const void* table, std::size_t known_tables)>;
+void SetTableSeenLogger(TableSeenFn fn);
+
 struct Stats {
     bool enabled;
     bool active;
