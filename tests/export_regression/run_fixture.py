@@ -47,7 +47,8 @@ def main() -> int:
     helpers = "\n".join((
         extract(source, "static bool CopyFileReplacingExisting(", "// True when both paths"),
         extract(source, "static bool CopyDeconstructedExeFs(", "// Fingerprint the effective files"),
-        extract(source, "static QString HashExeFsFiles(", "void GameExportDialog::SetLibraryEntries"),
+        # Stops before SeedPortableConfig, which needs suyu's settings.
+        extract(source, "static QString HashExeFsFiles(", "static bool SeedPortableConfig("),
         extract(source, "static bool HasUnpairedStandaloneNcaUpdate(",
                 "static FileSys::VirtualFile ExtractRomFsFromRom("),
     ))
@@ -186,7 +187,7 @@ int main(int argc, char** argv) {
         exe = directory / "fixture.exe"
         cpp.write_text(prefix + helpers + body, encoding="utf-8")
         command = [
-            str(Path(env["VCToolsInstallDir"]) / "bin/Hostx64/x64/cl.exe"),
+            str(Path(env["VCTOOLSINSTALLDIR"]) / "bin/Hostx64/x64/cl.exe"),
             "/nologo", "/EHsc", "/std:c++20", "/Zc:__cplusplus", "/utf-8", "/MD",
             f"/I{qt_root / 'include'}", f"/I{qt_root / 'include/QtCore'}",
             f"/I{qt_root / 'mkspecs/win32-msvc'}", str(cpp),

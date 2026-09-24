@@ -41,8 +41,14 @@ def cache_value(build: Path, key: str) -> str | None:
 
 
 def msvc_environment(build: Path, devcmd_value: str | None) -> dict[str, str]:
+    """The MSVC build environment, with every name in upper case.
+
+    Windows looks environment names up case-insensitively, but a Python dict
+    does not, and the two sources disagree on case: os.environ reports names
+    upper-cased while `set` keeps their own spelling ("Path", "VCToolsInstallDir").
+    """
     if os.environ.get("VCToolsInstallDir") and os.environ.get("INCLUDE"):
-        return dict(os.environ)
+        return {name.upper(): value for name, value in os.environ.items()}
     devcmd = Path(devcmd_value) if devcmd_value else None
     if devcmd is None:
         compiler = cache_value(build, "CMAKE_CXX_COMPILER")
@@ -64,7 +70,10 @@ def msvc_environment(build: Path, devcmd_value: str | None) -> dict[str, str]:
         output = subprocess.check_output(
             ["cmd", "/d", "/c", str(batch)], text=True, errors="replace"
         )
-    return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    return {
+        name.upper(): value
+        for name, value in (line.split("=", 1) for line in output.splitlines() if "=" in line)
+    }
 
 
 def main() -> int:
