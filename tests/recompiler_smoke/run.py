@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Compile and execute synthetic ABI5 tests; requires only Python, CMake, C/C++."""
 import argparse
+import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
+
+# SHA-256 of the whole generated smoke tree (every file, by relative path) with
+# the fast-path emit option off. That output must stay byte-identical to ABI 5;
+# update this only for a deliberate ABI 5 emitter change, never for ABI 6 work.
+ABI5_GOLDEN = "fb2540e05b6824651923cb2d6594c037e28bee9cd2e22f115f3ccb29b72c4547"
 
 
 def call(args, expected=0, timeout=120):
@@ -17,6 +23,15 @@ def executable(build, name):
         if candidate.is_file():
             return candidate
     raise RuntimeError(f"missing executable {name} under {build}")
+
+
+def tree_hash(root):
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        data = path.read_bytes()
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0" +
+                      str(len(data)).encode() + b"\0" + data)
+    return digest.hexdigest()
 
 
 def main():
@@ -44,6 +59,9 @@ def main():
             call([args.cmake, "--build", build, "--config", "Release", "--parallel", "2"])
             if stage == "export":
                 call([executable(build, "smoke_export"), generated])
+                actual = tree_hash(generated)
+                if actual != ABI5_GOLDEN:
+                    raise RuntimeError(f"ABI 5 output changed: {actual} != {ABI5_GOLDEN}")
         runner = executable(root / "run", "smoke_run")
         for mode in ("slice", "ordinary-page", "cross-page", "special-page"):
             call([runner, mode], timeout=15)

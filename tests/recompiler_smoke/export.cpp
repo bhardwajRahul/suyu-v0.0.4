@@ -1,8 +1,12 @@
+#include <cstdlib>
 #include "core/recompiler/arm64_to_c.h"
 #include "code.h"
 
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
+    // Same switch the nso_emit harness uses for the ABI 6 fast-path variant.
+    const char* fastmem = std::getenv("SUYU_RECOMP_AB_FASTMEM");
+    suyu::recomp::g_emit_fastmem = fastmem && *fastmem && *fastmem != '0';
     const auto stats = suyu::recomp::EmitProject(
         "smoke", reinterpret_cast<const uint8_t*>(smoke_code), sizeof(smoke_code),
         0x1000, argv[1], true);

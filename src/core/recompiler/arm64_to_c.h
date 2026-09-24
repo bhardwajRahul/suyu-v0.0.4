@@ -302,6 +302,12 @@ inline std::string ChainTo(u64 t);
 // instruction, so the forms that lose to the JIT are turned on here.
 inline bool g_translate_all = false;
 
+// ABI 6 "FM1": memory helpers that read the host page table directly and fall
+// back to the unchanged ABI 5 helpers for anything else. Off by default; while
+// it is off the emitted text is byte-identical to ABI 5, which
+// tests/recompiler_smoke checks against a golden hash.
+inline bool g_emit_fastmem = false;
+
 // Strict static exports have no fallback to carry deliberately gated forms.
 inline bool TranslateAllForExport(bool strict_static, bool explicitly_requested) {
     return strict_static || explicitly_requested;
@@ -6031,8 +6037,9 @@ static RECOMP_INLINE uint64_t recomp_fixed_to_fp(uint64_t bits, unsigned fp_bits
 )FX";
 }
 
-inline const char* RuntimeH() {
-    static const std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
+inline std::string BuildRuntimeH(bool fastmem) {
+    (void)fastmem;
+    std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>   /* offsetof, for the layout assertions below */
@@ -6268,7 +6275,15 @@ int  recomp_save_exists(GuestContext* c, const char* name);
 int  recomp_load_segments(GuestContext* c, const char* data_dir);
 #endif
 )RT";
-    return text.c_str();
+    return text;
+}
+
+// One cached text per variant: the first caller must not fix the variant for
+// the whole process.
+inline const char* RuntimeH() {
+    static const std::string abi5 = BuildRuntimeH(false);
+    static const std::string fastmem = BuildRuntimeH(true);
+    return (g_emit_fastmem ? fastmem : abi5).c_str();
 }
 
 inline const char* EstimateRuntimeC() {
@@ -6327,12 +6342,13 @@ uint64_t recomp_fp_estimate(GuestContext* c,uint64_t bits,unsigned width,int rsq
 )EST";
 }
 
-inline const char* RuntimeC() {
+inline std::string BuildRuntimeC(bool fastmem) {
+    (void)fastmem;
     // MSVC caps one string literal at 16380 bytes (C2026) and this runtime is
     // past that, so it is assembled from two pieces at first use rather than
     // being a single literal. Adjacent-literal concatenation would not help:
     // the limit applies to the result as well.
-    static const std::string text = std::string(R"RT(#include "recomp_runtime.h"
+    const std::string text = std::string(R"RT(#include "recomp_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6963,8 +6979,13 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
-    static const std::string with_estimates = text + EstimateRuntimeC();
-    return with_estimates.c_str();
+    return text + EstimateRuntimeC();
+}
+
+inline const char* RuntimeC() {
+    static const std::string abi5 = BuildRuntimeC(false);
+    static const std::string fastmem = BuildRuntimeC(true);
+    return (g_emit_fastmem ? fastmem : abi5).c_str();
 }
 
 } // namespace suyu::recomp
