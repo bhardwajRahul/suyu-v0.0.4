@@ -746,6 +746,38 @@ inline std::string EmitFPStepValue(bool dbl, bool half) {
     return s;
 }
 
+// Arm FPMin/FPMax/FPMinNum/FPMaxNum on raw S/D bits `a` and `b`, with bitwise
+// ordering so host NaN, signed-zero and denormal modes cannot intervene.
+// Implements baseline FPCR.DN/FZ and cumulative FPSR.IOC/IDC; `store` consumes
+// the result in _v. The line breaks match what put() emits.
+inline std::string EmitFPMinMax(bool dbl, bool minimum, bool numeric, const std::string& a,
+                                const std::string& b, const std::string& store) {
+    std::string s = "{ uint64_t _a=" + a + ",_b=" + b + ",_v; const uint64_t _sign=" +
+        (dbl ? std::string("0x8000000000000000ULL") : "0x80000000ULL") +
+        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";\n    ";
+    s += "if(c->fpcr & (1ULL<<24)) {"
+        " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
+        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }\n    ";
+    s += "{ int _an=(_a&_exp)==_exp&&(_a&_frac),"
+        " _bn=(_b&_exp)==_exp&&(_b&_frac);"
+        " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+        " if(_as||_bs) { c->fpsr|=1; _v=(_as?_a:_b)|_quiet; }\n    ";
+    if (numeric) {
+        s += "else if(_an&&!_bn) _v=_b; else if(_bn&&!_an) _v=_a;\n    ";
+    }
+    s += "else if(_an||_bn) _v=(_an?_a:_b)|_quiet;"
+        " else if(!((_a|_b)&~_sign)) _v=" +
+        std::string(minimum ? "(_a|_b)" : "(_a&_b)") + ";"
+        " else { int _less=((_a^_b)&_sign)?!!(_a&_sign):"
+        " ((_a&_sign)?_a>_b:_a<_b); _v=" +
+        std::string(minimum ? "(_less?_a:_b)" : "(_less?_b:_a)") + "; }\n    ";
+    s += "if((c->fpcr&(1ULL<<25))&&((_v&_exp)==_exp)&&(_v&_frac))"
+        " { _v=_exp|_quiet; } " + store + " } }";
+    return s;
+}
+
 inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
     if (unhandled) {
         *unhandled = false;
@@ -3412,29 +3444,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             };
             const auto emit_pair = [&](const std::string& a, const std::string& b,
                                        const std::string& dest) {
-                put("{ uint64_t _a=" + a + ",_b=" + b + ",_v; const uint64_t _sign=" +
-                    (dbl ? std::string("0x8000000000000000ULL") : "0x80000000ULL") +
-                    ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
-                    ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
-                    ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";");
-                put("if(c->fpcr & (1ULL<<24)) {"
-                    " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
-                    " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }");
-                put("{ int _an=(_a&_exp)==_exp&&(_a&_frac),"
-                    " _bn=(_b&_exp)==_exp&&(_b&_frac);"
-                    " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-                    " if(_as||_bs) { c->fpsr|=1; _v=(_as?_a:_b)|_quiet; }");
-                if (numeric) {
-                    put("else if(_an&&!_bn) _v=_b; else if(_bn&&!_an) _v=_a;");
-                }
-                put("else if(_an||_bn) _v=(_an?_a:_b)|_quiet;"
-                    " else if(!((_a|_b)&~_sign)) _v=" +
-                    std::string(minimum ? "(_a|_b)" : "(_a&_b)") + ";"
-                    " else { int _less=((_a^_b)&_sign)?!!(_a&_sign):"
-                    " ((_a&_sign)?_a>_b:_a<_b); _v=" +
-                    std::string(minimum ? "(_less?_a:_b)" : "(_less?_b:_a)") + "; }");
-                put("if((c->fpcr&(1ULL<<25))&&((_v&_exp)==_exp)&&(_v&_frac))"
-                    " { _v=_exp|_quiet; } " + dest + "=(" + ct + ")_v; } }");
+                put(EmitFPMinMax(dbl, minimum, numeric, a, b, dest + "=(" + ct + ")_v;"));
             };
             if (reduce) {
                 // Architectural reduction is a balanced tree, not a left fold:
@@ -3781,23 +3791,18 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 return true;
             }
 
-            // Remaining two-source scalar operations (opcode in bits 15..12).
-            if (((i >> 10) & 3) == 2) {
+            // FMAX/FMIN/FMAXNM/FMINNM (opcode 4-7 in bits 15..12): the SIMD
+            // forms' exact core. Host comparisons and fmax/fmin got signed
+            // zeros, NaN selection and the FPSR wrong.
+            if (((i >> 10) & 3) == 2 && ((i >> 12) & 15) >= 4 && ((i >> 12) & 15) <= 7) {
                 const u32 opcode = (i >> 12) & 15;
-                // FMAX/FMIN propagate a NaN operand; the NM forms return the
-                // other operand instead, which is exactly what fmax/fmin do.
-                std::string expr2;
-                switch (opcode) {
-                case 4: expr2 = "(_a!=_a||_b!=_b) ? (_a+_b) : (_a>_b?_a:_b)"; break;  // FMAX
-                case 5: expr2 = "(_a!=_a||_b!=_b) ? (_a+_b) : (_a<_b?_a:_b)"; break;  // FMIN
-                case 6: expr2 = dbl ? "fmax(_a,_b)" : "fmaxf(_a,_b)"; break;          // FMAXNM
-                case 7: expr2 = dbl ? "fmin(_a,_b)" : "fminf(_a,_b)"; break;          // FMINNM
-                default: break;
-                }
-                if (!expr2.empty()) {
-                    put(ld_n + ld_m + "_r = " + expr2 + "; " + st_d);
-                    return true;
-                }
+                put("{ uint64_t _n=0,_m=0,_r; memcpy(&_n,c->vreg[" + std::to_string(rn) + "]," +
+                    std::to_string(sz) + "); memcpy(&_m,c->vreg[" + std::to_string(rm) + "]," +
+                    std::to_string(sz) + ");");
+                put(EmitFPMinMax(dbl, (opcode & 1) != 0, opcode >= 6, "_n", "_m", "_r=_v;"));
+                put("c->vreg[" + std::to_string(rd) + "][0]=_r; c->vreg[" + std::to_string(rd) +
+                    "][1]=0; }");
+                return true;
             }
 
             // FCVT between precisions. It shares the one-source encoding but
