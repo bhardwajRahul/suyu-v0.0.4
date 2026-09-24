@@ -3117,6 +3117,11 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                           << "extern unsigned recomp_image_fastmem_v1_" << m
                           << "(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t);\n";
                     }
+                    // GCC's -Werror=missing-declarations rejects a definition with no
+                    // earlier prototype (a real Linux FM1 export hit this; MSVC and
+                    // Apple clang do not warn). Every registry/handshake function
+                    // below needs one, immediately before its definition.
+                    o << "int suyu_recomp_static_fastmem_v1(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t);\n";
                     o << "int suyu_recomp_static_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
                          "                                  uint64_t pointer_mask, uint32_t off_table,\n"
                          "                                  uint32_t off_limit) {\n  int ready=1;\n";
@@ -3127,6 +3132,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     o << "  return ready;\n}\n";
                     // Every feature any module relies on, so the host can refuse
                     // bits it does not implement.
+                    o << "unsigned suyu_recomp_static_features_v1(void);\n";
                     o << "unsigned suyu_recomp_static_features_v1(void) {\n  unsigned f=0;\n";
                     for (const auto& m : ordered) {
                         o << "  f|=recomp_image_features_" << m << "();\n";
@@ -3143,6 +3149,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         o << "extern uint32_t* recomp_image_guard_gen_v1_" << m
                           << "(uint32_t, uint64_t*, uint64_t*, const uint64_t**);\n";
                     }
+                    o << "unsigned suyu_recomp_static_guard_gen_v1(uint32_t host_version,\n"
+                         "                                         SuyuRecompGuardGenModule* out,\n"
+                         "                                         unsigned max);\n";
                     o << "unsigned suyu_recomp_static_guard_gen_v1(uint32_t host_version,\n"
                          "                                         SuyuRecompGuardGenModule* out,\n"
                          "                                         unsigned max) {\n"
@@ -3163,6 +3172,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         o << "extern unsigned recomp_image_fpx_v1_" << m
                           << "(uint32_t, uint32_t, uint64_t);\n";
                     }
+                    o << "unsigned suyu_recomp_static_fpx_v1(uint32_t off_fpcr, uint32_t off_fpsr,\n"
+                         "                                   uint64_t inhibit_bit);\n";
                     o << "unsigned suyu_recomp_static_fpx_v1(uint32_t off_fpcr, uint32_t off_fpsr,\n"
                          "                                   uint64_t inhibit_bit) {\n"
                          "  unsigned r=0;\n";
