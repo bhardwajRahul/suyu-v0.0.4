@@ -37,6 +37,7 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_gap_session.h"
 #include "core/arm/recomp/recomp_image_features.h"
 #include "core/core.h"
 #include "core/perf_stats.h"
@@ -1042,6 +1043,12 @@ int main(int argc, char** argv) {
                 installed_config = FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
 #endif
             }
+            // Coverage gaps are pooled in the installed suyu's user folder, which
+            // its exporter reads; with no installed suyu there is nowhere to pool.
+            const bool installed_found = std::filesystem::is_directory(installed_root, portable_ec);
+            Core::RecompGaps::SetSharedStoreDir(installed_found
+                                                    ? installed_root / "recomp" / "gaps"
+                                                    : std::filesystem::path{});
             // SetSuyuPath ignores a folder that does not exist, which would
             // leave keys pointing into this package; suyu creates it anyway.
             std::filesystem::create_directories(installed_root / "keys", portable_ec);
@@ -1385,6 +1392,7 @@ int main(int argc, char** argv) {
         Core::RecompBlockFn run_slice{};
         unsigned image_abi{};
         unsigned (*guard_v2)(unsigned){};
+        std::string name; // informational, for recomp_gaps.json
     };
     static std::vector<RecompModule> s_recomp_modules;
     bool recomp_guard_ready = false;
@@ -1432,7 +1440,8 @@ int main(int argc, char** argv) {
                 return EXIT_FAILURE;
             }
             s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].run_slice,
-                                        mods[i].image_abi(), nullptr});
+                                        mods[i].image_abi(), nullptr,
+                                        mods[i].name ? mods[i].name : ""});
             LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
                      mods[i].name ? mods[i].name : "?");
         }
@@ -1619,7 +1628,10 @@ int main(int argc, char** argv) {
                     recomp_fpx = fpx;
                 }
                 auto guard = reinterpret_cast<unsigned (*)(unsigned)>(GetProcAddress(h, "recomp_image_guard_v2"));
-                s_recomp_modules.push_back({lkp, sbf, run_slice, abi, guard});
+                std::string module_name = Common::UTF16ToUTF8(dll_name);
+                module_name = module_name.substr(11, module_name.size() - 15); // recompiled_*.dll
+                s_recomp_modules.push_back({lkp, sbf, run_slice, abi, guard,
+                                            module_name == "image" ? "main" : module_name});
                 LOG_INFO(Frontend, "Native recompiled module [{}] loaded from {} — ArmRecomp active",
                          s_recomp_modules.size() - 1, Common::UTF16ToUTF8(dll_name));
             }
@@ -1666,6 +1678,8 @@ int main(int argc, char** argv) {
         Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {
             if (index < s_recomp_modules.size() && s_recomp_modules[index].set_base) {
                 s_recomp_modules[index].set_base(base);
+                // Misses in this module are gaps a re-export can close.
+                Core::RecompGaps::NoteImage(base, s_recomp_modules[index].name);
             }
         });
         // A window running native recompiled code is a standalone game export,

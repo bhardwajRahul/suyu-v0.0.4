@@ -148,6 +148,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_gap_session.h"
 #include "core/arm/recomp/recomp_image_features.h"
 #include "core/core_timing.h"
 #include "core/crypto/key_manager.h"
@@ -7462,6 +7463,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
             record = match(kByLoadOrder[index]);
         }
         if (record && record->set_base) {
+            // Misses in this module are gaps a re-export can close.
+            Core::RecompGaps::NoteImage(base, record->name);
             if (record->base == base) {
                 return;
             }

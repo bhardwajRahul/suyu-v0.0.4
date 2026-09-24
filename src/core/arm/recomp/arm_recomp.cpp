@@ -21,6 +21,7 @@
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/guest_fp_env.h"
+#include "core/arm/recomp/recomp_gap_session.h"
 #include "core/arm/recomp/recomp_diagnostic_sampler.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -488,6 +489,9 @@ struct alignas(64) ThreadBlocks {
 std::mutex g_tally_lock;
 std::vector<ThreadBlocks*> g_tallies;
 std::atomic<u64> g_retired_blocks{0};
+/// TotalStaticBlocks() when the current session began, so a session that never
+/// executed a recompiled block is not counted as a run in recomp_gaps.json.
+std::atomic<u64> g_session_blocks_start{0};
 
 struct ThreadBlockSlot {
     ThreadBlocks* slot = new ThreadBlocks{};
@@ -1659,6 +1663,9 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
     if (g_live_instances.fetch_add(1, std::memory_order_relaxed) == 0) {
         std::scoped_lock lock{g_snapshot_lock};
         g_diagnostic_snapshots.clear();
+        // Before the loader places any module: it reports each one as it does.
+        g_session_blocks_start.store(TotalStaticBlocks(), std::memory_order_relaxed);
+        RecompGaps::BeginSession(process ? process->GetProgramId() : 0, StrictNoFallback());
     }
 }
 
@@ -1671,6 +1678,8 @@ ArmRecomp::~ArmRecomp() {
     // per host-process lifetime.
     if (g_live_instances.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         ReportRecompCoverage();
+        RecompGaps::EndSession(TotalStaticBlocks() >
+                               g_session_blocks_start.load(std::memory_order_relaxed));
     }
 }
 
@@ -2228,8 +2237,11 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             }
             g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
             g_counters.RecordMiss(impl->ctx.pc);
+            RecompGaps::RecordMiss(impl->ctx.pc);
             if (!EnterFallback()) {
                 g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
+                // A strict run stops here, and may never reach teardown.
+                RecompGaps::Flush(true, true);
                 LOG_CRITICAL(Core_ARM,
                              "recomp: no JIT fallback available at PC {:#x}; thread cannot "
                              "continue",
@@ -2246,6 +2258,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         t_blocks.slot->n.store(seen, std::memory_order_relaxed);
         if ((seen & 0x3FFFFULL) == 0x3FFFFULL) {
             WriteRecompCoverageFile(FormatRecompCoverage());
+            // Time-limited inside; teardown is not guaranteed, as above.
+            RecompGaps::Flush(true, false);
         }
         // Generated code calls a direct branch's target itself rather than
         // coming back here, so one call below can run a whole chain of blocks.
@@ -2323,6 +2337,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             const u32 unsupported_opcode =
                 static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4));
             g_counters.RecordUnhandled(unsupported_opcode);
+            RecompGaps::RecordUnimplemented(unsupported_opcode);
             static std::atomic<int> unhandled_count{0};
             if (unhandled_count.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_WARNING(Core_ARM, "recomp: unimplemented opcode {:#010x} at {:#x}; checking fallback policy",
@@ -2330,6 +2345,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             }
             if (!EnterFallback()) {
                 g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
+                RecompGaps::Flush(true, true);
                 LOG_CRITICAL(Core_ARM, "recomp: unimplemented opcode {:#010x} at {:#x} and no JIT fallback",
                              unsupported_opcode, impl->ctx.pc);
                 return HaltReason::PrefetchAbort;
