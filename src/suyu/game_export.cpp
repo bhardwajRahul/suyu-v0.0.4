@@ -2583,6 +2583,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         backend == RecompileBackend::SuyuStatic,
         !qEnvironmentVariableIsEmpty("SUYU_AOT_TRANSLATE_ALL"));
     suyu::recomp::g_translate_all = translate_all;
+    // ABI 6 (FM1) page-table fast path for guest memory access. Off by default,
+    // which keeps exports byte-identical to ABI 5.
+    suyu::recomp::g_emit_fastmem = qEnvironmentVariable("SUYU_AOT_FASTMEM") == QStringLiteral("1");
     const QString debug_root = cache_dir + QDir::separator() + QStringLiteral("debug");
     const QString blockmap_dir = debug_root + QDir::separator() + QStringLiteral("blockmaps");
     const QString code_dir = debug_root + QDir::separator() + QStringLiteral("code");

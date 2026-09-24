@@ -6950,6 +6950,9 @@ namespace {
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
 constexpr unsigned CurrentRecompImageAbi = 5;
+// ABI 6 is ABI 5 plus the FM1 page-table fast path; exports produce it only
+// when SUYU_AOT_FASTMEM is set. A bundle is one ABI or the other, never mixed.
+constexpr unsigned FastmemRecompImageAbi = 6;
 
 // Off unless asked for: this sits on the dispatch path, which runs tens of
 // millions of times a second.
@@ -7111,6 +7114,10 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
                     reason.toStdString());
         return 0;
     };
+    // Set from bundle.json when there is one, otherwise from the first image;
+    // every image must then report the same ABI.
+    unsigned expected_bundle_abi = 0;
+    const auto layout = Core::GetRecompFastmemLayout();
 
     QStringList image_paths;
     if (expected_title_id != 0) {
@@ -7134,11 +7141,14 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
             return refuse_bundle(QStringLiteral("manifest title ID does not match %1")
                                      .arg(expected_title));
         }
-        if (root.value(QStringLiteral("image_abi")).toInt() !=
-            static_cast<int>(CurrentRecompImageAbi)) {
-            return refuse_bundle(QStringLiteral("manifest image ABI is not %1")
-                                     .arg(CurrentRecompImageAbi));
+        const int manifest_abi = root.value(QStringLiteral("image_abi")).toInt();
+        if (manifest_abi != static_cast<int>(CurrentRecompImageAbi) &&
+            manifest_abi != static_cast<int>(FastmemRecompImageAbi)) {
+            return refuse_bundle(QStringLiteral("manifest image ABI is not %1 or %2")
+                                     .arg(CurrentRecompImageAbi)
+                                     .arg(FastmemRecompImageAbi));
         }
+        expected_bundle_abi = static_cast<unsigned>(manifest_abi);
         const QJsonArray images = root.value(QStringLiteral("images")).toArray();
         if (images.isEmpty()) {
             return refuse_bundle(QStringLiteral("manifest contains no images"));
@@ -7278,15 +7288,31 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
         const unsigned abi = image_abi ? image_abi() : 0;
         auto* guard_v2 = reinterpret_cast<unsigned (*)(unsigned)>(
             lib->resolve("recomp_image_guard_v2"));
-        if (abi != CurrentRecompImageAbi || !guard_v2) {
+        bool abi_ok = (abi == CurrentRecompImageAbi || abi == FastmemRecompImageAbi) && guard_v2 &&
+                      (expected_bundle_abi == 0 || abi == expected_bundle_abi);
+        if (abi_ok && abi == FastmemRecompImageAbi) {
+            // FM1 folds the host page table layout and the context offsets into
+            // the module; it has to agree with this host's.
+            auto* features =
+                reinterpret_cast<unsigned (*)()>(lib->resolve("recomp_image_features"));
+            auto* fastmem_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64, u32, u32)>(
+                lib->resolve("recomp_image_fastmem_v1"));
+            abi_ok = features && (features() & 1u) && fastmem_v1 &&
+                     fastmem_v1(layout.page_bits, layout.stride_log2, layout.pointer_mask,
+                                layout.off_table, layout.off_limit) == 1;
+        }
+        if (!abi_ok) {
             LOG_WARNING(Frontend,
-                        "Refusing automatic AOT bundle {}: {} does not provide image ABI {}",
-                        dir.toStdString(), lib->fileName().toStdString(), CurrentRecompImageAbi);
+                        "Refusing automatic AOT bundle {}: {} provides image ABI {}, not a "
+                        "negotiated ABI {} or {} matching the rest of the bundle",
+                        dir.toStdString(), lib->fileName().toStdString(), abi,
+                        CurrentRecompImageAbi, FastmemRecompImageAbi);
             lib->unload();
             lib->deleteLater();
             discard_found();
             return 0;
         }
+        expected_bundle_abi = abi;
         found.push_back(lib);
 
         // The module this image was built from is the directory holding it,
@@ -7518,6 +7544,11 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
     Core::SetRecompCodeGuardReady(guard_ready);
     LOG_INFO(Frontend, "Recompiled instruction guard-v2: {}",
              guard_ready ? "ready" : "not negotiated");
+    // Every image was checked against expected_bundle_abi, and ABI 6 ones
+    // passed the fastmem handshake, before being accepted above.
+    Core::SetRecompFastmemReady(expected_bundle_abi == FastmemRecompImageAbi);
+    LOG_INFO(Frontend, "Recompiled image ABI {}; page-table fastmem: {}", expected_bundle_abi,
+             expected_bundle_abi == FastmemRecompImageAbi ? "negotiated" : "not used");
     LOG_INFO(Frontend, "Loaded {} recompiled module image(s) from {}", loaded_images.size(),
              dir.toStdString());
     return static_cast<int>(loaded_images.size());
