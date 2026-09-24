@@ -778,6 +778,30 @@ inline std::string EmitFPMinMax(bool dbl, bool minimum, bool numeric, const std:
     return s;
 }
 
+// FCMP-style comparison of S/D registers `a` and `b` (register arrays; an
+// empty `b` compares with +0.0) into NZCV: 0110 equal, 1000 less, 0010
+// greater, 0011 unordered. Integer ordering of the IEEE bits, so host compare
+// semantics and modes cannot intervene. FZ flushes subnormal inputs (IDC); a
+// NaN raises IOC when it is signalling, or for any NaN when `signal` is set.
+inline std::string EmitFPCompareFlags(bool dbl, bool signal, const std::string& a,
+                                      const std::string& b) {
+    const std::string sz = dbl ? "8" : "4";
+    return "{ uint64_t _a=0,_b=0; memcpy(&_a," + a + "," + sz + ");" +
+        (b.empty() ? std::string() : " memcpy(&_b," + b + "," + sz + ");") +
+        " const uint64_t _sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
+        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";"
+        " if(c->fpcr&(1ULL<<24)) { if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
+        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }"
+        " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+        " if(_an||_bn) { if(" + (signal ? "1" : "(_an&&!(_a&_quiet))||(_bn&&!(_b&_quiet))") +
+        ") c->fpsr|=1; c->n=0; c->z=0; c->c=1; c->v=1; }"
+        " else { int _eq=_a==_b||!((_a|_b)&~_sign);"
+        " int _lt=!_eq&&(((_a^_b)&_sign)?!!(_a&_sign):((_a&_sign)?_a>_b:_a<_b));"
+        " c->n=(uint8_t)_lt; c->z=(uint8_t)_eq; c->c=(uint8_t)!_lt; c->v=0; } }";
+}
+
 inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
     if (unhandled) {
         *unhandled = false;
@@ -3856,15 +3880,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // FCCMP / FCCMPE: compare when the condition holds, otherwise take
             // the flags straight from nzcv. Bits 11..10 are 01 here, where an
             // ordinary FCMP has 1000 in bits 13..10, so the two do not overlap.
+            // Bit 4 selects the signalling form.
             if (((i >> 10) & 3) == 1) {
                 const u32 cond = (i >> 12) & 15, nzcv = i & 15;
                 std::string s = "{ if " + Cond(cond) + " ";
-                s += ld_n + ld_m;
-                s += "if (_a != _a || _b != _b) { c->n=0; c->z=0; c->c=1; c->v=1; } ";
-                s += "else { c->n = (_a < _b); c->z = (_a == _b); "
-                     "c->c = (_a >= _b); c->v = 0; } ";
-                s += "(void)_r; } ";
-                s += "else { c->n=" + std::to_string((nzcv >> 3) & 1) + "; ";
+                s += EmitFPCompareFlags(dbl, ((i >> 4) & 1) != 0,
+                                        "c->vreg[" + std::to_string(rn) + "]",
+                                        "c->vreg[" + std::to_string(rm) + "]");
+                s += " else { c->n=" + std::to_string((nzcv >> 3) & 1) + "; ";
                 s += "c->z=" + std::to_string((nzcv >> 2) & 1) + "; ";
                 s += "c->c=" + std::to_string((nzcv >> 1) & 1) + "; ";
                 s += "c->v=" + std::to_string(nzcv & 1) + "; } }";
@@ -3875,23 +3898,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // FCMP / FCMPE, including the compare-against-zero forms. The
             // low five bits are opcode2: bit 3 selects the #0.0 variant (Rm is
             // then not a register at all) and bit 4 selects the signalling
-            // form, which differs only in how it reports NaNs and so produces
-            // the same flags here. Requiring all five to be clear, as before,
-            // matched only a quarter of the compares in real code.
+            // form, which raises IOC for a quiet NaN as well. Requiring all
+            // five to be clear, as before, matched only a quarter of the
+            // compares in real code.
             if (((i >> 10) & 0xF) == 8 && ((i >> 14) & 3) == 0 && (i & 7) == 0) {
                 const bool cmp_zero = ((i >> 3) & 1) != 0;
-                std::string s = ld_n;
-                if (cmp_zero) {
-                    s += std::string("_b = (") + ct + ")0; ";
-                } else {
-                    s += ld_m;
-                }
-                // Unordered (either NaN) sets C and V per the architecture.
-                s += "if (_a != _a || _b != _b) { c->n=0; c->z=0; c->c=1; c->v=1; } ";
-                s += "else { c->n = (_a < _b); c->z = (_a == _b); "
-                     "c->c = (_a >= _b); c->v = 0; } ";
-                s += "(void)_r; }";
-                put(s);
+                put(EmitFPCompareFlags(dbl, ((i >> 4) & 1) != 0,
+                                       "c->vreg[" + std::to_string(rn) + "]",
+                                       cmp_zero ? std::string() : "c->vreg[" + std::to_string(rm) + "]"));
                 return true;
             }
         }
