@@ -108,9 +108,17 @@ if (SUYU_CMD OR YUZU_CMD)
                 # binary that black-screens.
                 if (EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h")
                     file(READ "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h" _rt_h)
-                    if (NOT _rt_h MATCHES "#define RECOMP_IMAGE_ABI 5")
+                    if (NOT _rt_h MATCHES "#define RECOMP_IMAGE_ABI ([56])")
                         message(FATAL_ERROR "Module '${_m}' predates correctness ABI 5; re-export ALL modules")
                     endif()
+                    # ABI 6 extends the GuestContext that all modules share
+                    # with one runtime, so a bundle must not mix ABIs.
+                    set(_m_abi "${CMAKE_MATCH_1}")
+                    if (DEFINED _recomp_bundle_abi AND NOT _recomp_bundle_abi STREQUAL _m_abi)
+                        message(FATAL_ERROR "Module '${_m}' is ABI ${_m_abi} but others are ABI "
+                                            "${_recomp_bundle_abi}; re-export ALL modules together")
+                    endif()
+                    set(_recomp_bundle_abi "${_m_abi}")
                     if (NOT _rt_h MATCHES "tpidrro_el0")
                         message(FATAL_ERROR
                             "Recompiled module '${_m}' in ${SUYU_CMD_RECOMP_DIR} predates the "
@@ -149,6 +157,13 @@ if (SUYU_CMD OR YUZU_CMD)
             endif()
             if (EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_guard_v2.h")
                 target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_GUARD_V2=1)
+            endif()
+            if (_recomp_bundle_abi STREQUAL "6")
+                if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_fastmem_v1.h")
+                    message(FATAL_ERROR "ABI 6 modules need a registry with the fastmem "
+                                        "handshake; re-export the title with this build")
+                endif()
+                target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_FASTMEM_V1=1)
             endif()
             target_link_libraries(suyu-cmd-static PRIVATE ${_recomp_libs})
             list(APPEND SUYU_CMD_TARGETS suyu-cmd-static)

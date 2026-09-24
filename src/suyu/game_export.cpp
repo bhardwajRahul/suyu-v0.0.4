@@ -2617,7 +2617,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 QFile::exists(cache_dir + QDir::separator() + QStringLiteral("launcher") +
                               QDir::separator() + QStringLiteral("static_launcher.exe"));
             const bool same_image_abi = contents.contains(
-                QStringLiteral("\"image_abi\": 5,"));
+                suyu::recomp::g_emit_fastmem ? QStringLiteral("\"image_abi\": 6,")
+                                             : QStringLiteral("\"image_abi\": 5,"));
             const bool same_correctness_revision = contents.contains(
                 QStringLiteral("\"correctness_revision\": \"20260920-fixedpoint-v1\","));
             const bool same_translate_all = contents.contains(
@@ -3075,6 +3076,24 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     o << "  recomp_image_guard_v2_" << m << "(ready?2:0);\n";
                 }
                 o << "  return ready;\n}\n";
+                if (suyu::recomp::g_emit_fastmem) {
+                    // ABI 6: every module must report FM1 and accept the host's
+                    // page-table layout and context offsets.
+                    o << "\n";
+                    for (const auto& m : ordered) {
+                        o << "extern unsigned recomp_image_features_" << m << "(void);\n"
+                          << "extern unsigned recomp_image_fastmem_v1_" << m
+                          << "(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t);\n";
+                    }
+                    o << "int suyu_recomp_static_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
+                         "                                  uint64_t pointer_mask, uint32_t off_table,\n"
+                         "                                  uint32_t off_limit) {\n  int ready=1;\n";
+                    for (const auto& m : ordered) {
+                        o << "  if(!(recomp_image_features_" << m << "()&1u) || recomp_image_fastmem_v1_"
+                          << m << "(page_bits,stride_log2,pointer_mask,off_table,off_limit)!=1) ready=0;\n";
+                    }
+                    o << "  return ready;\n}\n";
+                }
                 reg.close();
                 QFile abi_marker(recomp_root + QDir::separator() + QStringLiteral("recomp_abi_v4.h"));
                 if (abi_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -3083,6 +3102,16 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 QFile guard_marker(recomp_root + QDir::separator() + QStringLiteral("recomp_guard_v2.h"));
                 if (guard_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
                     guard_marker.write("/* Separate guarded-code registration; legacy module registry ABI unchanged. */\n");
+                }
+                const QString fastmem_marker_path =
+                    recomp_root + QDir::separator() + QStringLiteral("recomp_fastmem_v1.h");
+                if (suyu::recomp::g_emit_fastmem) {
+                    QFile fastmem_marker(fastmem_marker_path);
+                    if (fastmem_marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                        fastmem_marker.write("/* ABI 6 registry exports suyu_recomp_static_fastmem_v1. */\n");
+                    }
+                } else {
+                    QFile::remove(fastmem_marker_path);
                 }
             }
         };
@@ -3506,7 +3535,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         QTextStream out(&manifest);
         out << "{\n";
         out << "  \"version\": 2,\n";
-        out << "  \"image_abi\": 5,\n";
+        out << "  \"image_abi\": " << (suyu::recomp::g_emit_fastmem ? 6 : 5) << ",\n";
         out << "  \"correctness_revision\": \"20260920-fixedpoint-v1\",\n";
         out << "  \"source_exefs_sha256\": \"" << source_hash << "\",\n";
         out << "  \"translate_all\": " << (translate_all ? "true" : "false") << ",\n";

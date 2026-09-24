@@ -191,6 +191,12 @@ const SuyuRecompStaticModule* suyu_recomp_static_modules_v4(unsigned* count);
 #ifdef SUYU_RECOMP_GUARD_V2
 int suyu_recomp_static_guard_v2(unsigned version);
 #endif
+#ifdef SUYU_RECOMP_FASTMEM_V1
+// ABI 6 registrations: 1 only if every module reports FM1 and accepts this
+// host's layout (see Core::GetRecompFastmemLayout).
+int suyu_recomp_static_fastmem_v1(u32 page_bits, u32 stride_log2, u64 pointer_mask,
+                                  u32 off_table, u32 off_limit);
+#endif
 #endif
 }
 
@@ -1359,6 +1365,25 @@ int main(int argc, char** argv) {
     };
     static std::vector<RecompModule> s_recomp_modules;
     bool recomp_guard_ready = false;
+    // ABI 5 and ABI 6 (FM1 fast path) images are both accepted, but never
+    // mixed: ABI 6 extends the shared GuestContext, so one bundle has one ABI.
+    unsigned recomp_bundle_abi = 0;
+    [[maybe_unused]] const auto accept_recomp_abi = [&recomp_bundle_abi](unsigned abi) {
+        if (abi != 5 && abi != 6) {
+            LOG_CRITICAL(Frontend, "Recompiled image ABI {} is not 5 or 6; re-export all modules",
+                         abi);
+            return false;
+        }
+        if (recomp_bundle_abi != 0 && abi != recomp_bundle_abi) {
+            LOG_CRITICAL(Frontend,
+                         "Recompiled images mix ABI {} and {}; re-export all modules together",
+                         recomp_bundle_abi, abi);
+            return false;
+        }
+        recomp_bundle_abi = abi;
+        return true;
+    };
+    [[maybe_unused]] const auto fastmem_layout = Core::GetRecompFastmemLayout();
 
     // Preferred path: modules compiled straight into this executable. Nothing
     // to find on disk, nothing to load, and no version skew between the exe and
@@ -1368,18 +1393,35 @@ int main(int argc, char** argv) {
         unsigned count = 0;
         const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v4(&count);
         for (unsigned i = 0; i < count; ++i) {
-            if (!mods[i].image_abi || mods[i].image_abi() != 5) {
+            if (!mods[i].image_abi) {
                 LOG_CRITICAL(Frontend, "Static image predates correctness ABI 5; re-export all modules");
                 return EXIT_FAILURE;
             }
+            if (!accept_recomp_abi(mods[i].image_abi())) {
+                return EXIT_FAILURE;
+            }
             s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].run_slice,
-                                        mods[i].image_abi ? mods[i].image_abi() : 0, nullptr});
+                                        mods[i].image_abi(), nullptr});
             LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
                      mods[i].name ? mods[i].name : "?");
         }
 #ifdef SUYU_RECOMP_GUARD_V2
         recomp_guard_ready = suyu_recomp_static_guard_v2(2) != 0;
 #endif
+        if (recomp_bundle_abi == 6) {
+            bool fastmem_ok = false;
+#ifdef SUYU_RECOMP_FASTMEM_V1
+            fastmem_ok = suyu_recomp_static_fastmem_v1(
+                             fastmem_layout.page_bits, fastmem_layout.stride_log2,
+                             fastmem_layout.pointer_mask, fastmem_layout.off_table,
+                             fastmem_layout.off_limit) == 1;
+#endif
+            if (!fastmem_ok) {
+                LOG_CRITICAL(Frontend, "ABI 6 static modules do not match this host's fastmem "
+                                       "layout; re-export all modules with this build");
+                return EXIT_FAILURE;
+            }
+        }
     }
 #endif
 
@@ -1422,10 +1464,26 @@ int main(int argc, char** argv) {
                 auto image_abi = reinterpret_cast<unsigned (*)()>(
                     GetProcAddress(h, "recomp_image_abi"));
                 const unsigned abi = image_abi ? image_abi() : 0;
-                if (abi != 5) {
-                    LOG_CRITICAL(Frontend, "Recompiled image ABI {} is not 5; re-export all modules", abi);
+                if (!accept_recomp_abi(abi)) {
                     FreeLibrary(h);
                     return EXIT_FAILURE;
+                }
+                if (abi == 6) {
+                    auto features = reinterpret_cast<unsigned (*)()>(
+                        GetProcAddress(h, "recomp_image_features"));
+                    auto fastmem_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64, u32, u32)>(
+                        GetProcAddress(h, "recomp_image_fastmem_v1"));
+                    if (!features || !(features() & 1u) || !fastmem_v1 ||
+                        fastmem_v1(fastmem_layout.page_bits, fastmem_layout.stride_log2,
+                                   fastmem_layout.pointer_mask, fastmem_layout.off_table,
+                                   fastmem_layout.off_limit) != 1) {
+                        LOG_CRITICAL(Frontend,
+                                     "{} does not match this host's fastmem layout; re-export "
+                                     "all modules with this build",
+                                     Common::UTF16ToUTF8(dll_name));
+                        FreeLibrary(h);
+                        return EXIT_FAILURE;
+                    }
                 }
                 auto guard = reinterpret_cast<unsigned (*)(unsigned)>(GetProcAddress(h, "recomp_image_guard_v2"));
                 s_recomp_modules.push_back({lkp, sbf, run_slice, abi, guard});
@@ -1459,6 +1517,10 @@ int main(int argc, char** argv) {
         Core::SetRecompCodeGuardReady(recomp_guard_ready);
         LOG_INFO(Frontend, "Recompiled instruction guard-v2: {}",
                  recomp_guard_ready ? "ready" : "not negotiated");
+        // Every ABI 6 module passed the handshake above, or loading stopped.
+        Core::SetRecompFastmemReady(recomp_bundle_abi == 6);
+        LOG_INFO(Frontend, "Recompiled image ABI {}; page-table fastmem: {}", recomp_bundle_abi,
+                 recomp_bundle_abi == 6 ? "negotiated" : "not used");
         // Route base to the module at the same index in load order.
         // rtld=index0, main=index1, subsdk0=index2, ..., sdk=last.
         Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {
