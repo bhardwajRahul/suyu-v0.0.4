@@ -74,6 +74,8 @@
 #include "common/swap.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
+#include "core/arm/recomp/recomp_gap_session.h"
+#include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/recomp/recomp_image_features.h"
 #include "core/core.h"
 #include "core/file_sys/nca_metadata.h"
@@ -346,6 +348,30 @@ void GameExportDialog::SetupUi() {
     update_source_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
     update_source_label->setVisible(false);
     layout->addWidget(update_source_label);
+
+    // Coverage row: what earlier Hybrid runs of this game recorded (recomp_gaps.json in the
+    // suyu user folder), which the export feeds back in and which says whether a static
+    // export can be expected to run. The files carry no game code, so players can pool them.
+    auto* coverage_row = new QHBoxLayout();
+    coverage_row->addWidget(new QLabel(tr("Coverage:"), this));
+    coverage_status_label = new QLabel(this);
+    coverage_status_label->setWordWrap(true);
+    coverage_row->addWidget(coverage_status_label, 1);
+    auto* import_coverage_button = new QPushButton(tr("Import coverage file..."), this);
+    import_coverage_button->setToolTip(
+        tr("Add a coverage file from another player's Hybrid runs of this game. It holds only "
+           "IDs, code offsets, counts and instruction encodings."));
+    coverage_row->addWidget(import_coverage_button);
+    export_coverage_button = new QPushButton(tr("Export coverage file..."), this);
+    export_coverage_button->setToolTip(
+        tr("Save what your Hybrid runs of this game recorded, to share. It holds only IDs, "
+           "code offsets, counts and instruction encodings: no game code and no file paths."));
+    coverage_row->addWidget(export_coverage_button);
+    layout->addLayout(coverage_row);
+    connect(import_coverage_button, &QPushButton::clicked, this,
+            &GameExportDialog::OnImportCoverage);
+    connect(export_coverage_button, &QPushButton::clicked, this,
+            &GameExportDialog::OnExportCoverage);
 
     // Output path row
     auto* out_row = new QHBoxLayout();
@@ -1062,6 +1088,10 @@ QStringList GameExportDialog::FallbackModulesForTesting() const {
     return last_fallback_modules;
 }
 
+QString GameExportDialog::CoverageStatusForTesting() const {
+    return coverage_status_label ? coverage_status_label->text() : QString{};
+}
+
 void GameExportDialog::OnBrowseRom() {
     const QString file = QFileDialog::getOpenFileName(
         this, tr("Select ROM"), QString(),
@@ -1334,6 +1364,7 @@ void GameExportDialog::RefreshUpdateStatus() {
                "or be damaged. Reinstall it, or the export will use the base game version."));
         break;
     }
+    RefreshCoverageStatus();
 }
 
 void GameExportDialog::OnInstallUpdate() {
@@ -2623,6 +2654,192 @@ bool GameExportDialog::WantsCompiledOutput() const {
            output_format_combo->currentIndex() == 1;
 }
 
+// ---------------------------------------------------------------------------
+// Recorded coverage (recomp_gaps.json)
+// ---------------------------------------------------------------------------
+
+/// This suyu's recorded coverage for a title, if any. `error` stays empty when
+/// there is simply no file yet.
+static std::optional<Core::RecompGaps::GapData> LoadRecordedCoverage(quint64 program_id,
+                                                                      std::string* error) {
+    const auto path = Core::RecompGaps::SharedStoreFile(program_id);
+    std::error_code ec;
+    if (path.empty() || !std::filesystem::exists(path, ec)) {
+        return std::nullopt;
+    }
+    auto data = Core::RecompGaps::ReadFile(path, error);
+    if (data && data->title_id != Core::RecompGaps::TitleIdHex(program_id)) {
+        if (error) {
+            *error = "the file is for another title";
+        }
+        return std::nullopt;
+    }
+    return data;
+}
+
+QStringList GameExportDialog::SelectedModuleBuildIds() {
+    const QString rom_path = rom_path_edit->text();
+    if (rom_path == coverage_build_ids_path) {
+        return coverage_build_ids;
+    }
+    coverage_build_ids_path = rom_path;
+    coverage_build_ids.clear();
+    FileSys::VirtualDir exefs;
+    if (QFileInfo(rom_path).isFile()) {
+        exefs = ExtractExeFsFromRom(rom_path.toStdString(), system_);
+    }
+    if (!exefs) {
+        return coverage_build_ids;
+    }
+    for (const auto& file : exefs->GetFiles()) {
+        Loader::NSOHeader header{};
+        if (file && file->GetSize() >= sizeof(header) &&
+            file->ReadObject(&header) == sizeof(header) &&
+            header.magic == Common::MakeMagic('N', 'S', 'O', '0')) {
+            coverage_build_ids.append(BuildIdToHex(header.build_id));
+        }
+    }
+    return coverage_build_ids;
+}
+
+void GameExportDialog::RefreshCoverageStatus() {
+    if (!coverage_status_label) {
+        return;
+    }
+    const quint64 program_id = SelectedProgramId();
+    export_coverage_button->setEnabled(false);
+    if (program_id == 0) {
+        coverage_status_label->setText(tr("Select a game to see what its Hybrid runs recorded."));
+        return;
+    }
+    std::string error;
+    const auto coverage = LoadRecordedCoverage(program_id, &error);
+    if (!coverage || coverage->runs == 0) {
+        coverage_status_label->setText(
+            !error.empty()
+                ? tr("The recorded coverage for this game cannot be read (%1).")
+                      .arg(QString::fromStdString(error))
+                : tr("No Hybrid runs recorded for this game yet. Playing a Hybrid export records "
+                     "any code it had to leave to the JIT, and a later export translates it."));
+        return;
+    }
+    export_coverage_button->setEnabled(true);
+
+    // Only offsets for a module this export will actually contain are used.
+    u64 usable = 0;
+    const QStringList ids = SelectedModuleBuildIds();
+    for (const QString& id : ids) {
+        usable += Core::RecompGaps::RootsFor(*coverage, id.toStdString()).size();
+    }
+    const u64 recorded = coverage->GapOffsets();
+    const auto opcodes = static_cast<u64>(coverage->unimplemented.size());
+    const auto without_image = static_cast<u64>(coverage->no_image.size());
+    const u64 runs = coverage->hybrid_runs + coverage->strict_runs;
+
+    QString text = tr("%n Hybrid run(s) recorded", "", static_cast<int>(coverage->hybrid_runs));
+    if (coverage->strict_runs) {
+        text += tr(", %n static run(s)", "", static_cast<int>(coverage->strict_runs));
+    }
+    text += tr("; %n code address(es) recorded", "", static_cast<int>(recorded));
+    if (!ids.isEmpty() && usable != recorded) {
+        text += tr(" (%n match this game's current code)", "", static_cast<int>(usable));
+    }
+    text += QStringLiteral(". ");
+    if (recorded == 0 && opcodes == 0 && without_image == 0 && coverage->unattributed_misses == 0) {
+        text += tr("No untranslated code found in %n run(s) — static AOT should work for "
+                   "this game.",
+                   "", static_cast<int>(runs));
+    } else {
+        text += tr("%n code address(es) from earlier runs will be translated", "",
+                   static_cast<int>(ids.isEmpty() ? recorded : usable));
+        text += tr("; %n instruction type(s) still need Hybrid", "", static_cast<int>(opcodes));
+        if (without_image) {
+            text += tr("; %n module(s) loaded while playing have no recompiled code and need "
+                       "Hybrid",
+                       "", static_cast<int>(without_image));
+        }
+        text += QStringLiteral(".");
+    }
+    coverage_status_label->setText(text);
+}
+
+void GameExportDialog::OnImportCoverage() {
+    const quint64 program_id = SelectedProgramId();
+    if (program_id == 0) {
+        QMessageBox::information(this, tr("Import Coverage"), tr("Select the game first."));
+        return;
+    }
+    const QString file = QFileDialog::getOpenFileName(this, tr("Import Coverage File"), {},
+                                                      tr("Coverage files (*.json)"));
+    if (file.isEmpty()) {
+        return;
+    }
+    std::string error;
+    auto imported =
+        Core::RecompGaps::ReadFile(std::filesystem::path{file.toStdU16String()}, &error);
+    const std::string title = Core::RecompGaps::TitleIdHex(program_id);
+    if (imported && !imported->title_id.empty() && imported->title_id != title) {
+        error = "it was recorded for title " + imported->title_id + ", not " + title;
+        imported.reset();
+    }
+    if (!imported) {
+        QMessageBox::warning(this, tr("Import Coverage"),
+                             tr("This coverage file cannot be used: %1.")
+                                 .arg(QString::fromStdString(error)));
+        return;
+    }
+    imported->title_id = title;
+    std::string load_error;
+    auto store = LoadRecordedCoverage(program_id, &load_error);
+    if (!store && !load_error.empty()) {
+        QMessageBox::warning(this, tr("Import Coverage"),
+                             tr("This game's recorded coverage cannot be read (%1), so nothing "
+                                "was imported.")
+                                 .arg(QString::fromStdString(load_error)));
+        return;
+    }
+    Core::RecompGaps::GapData merged = store.value_or(Core::RecompGaps::GapData{});
+    Core::RecompGaps::Merge(merged, *imported);
+    const auto path = Core::RecompGaps::SharedStoreFile(program_id);
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (!Core::RecompGaps::WriteFile(path, merged, &error)) {
+        QMessageBox::warning(this, tr("Import Coverage"),
+                             tr("Could not save the coverage: %1.")
+                                 .arg(QString::fromStdString(error)));
+        return;
+    }
+    LOG_INFO(Frontend, "Imported coverage for {}: {} run(s), {} address(es), {} opcode(s)", title,
+             imported->runs, imported->GapOffsets(), imported->unimplemented.size());
+    RefreshCoverageStatus();
+}
+
+void GameExportDialog::OnExportCoverage() {
+    const quint64 program_id = SelectedProgramId();
+    std::string error;
+    const auto coverage = LoadRecordedCoverage(program_id, &error);
+    if (!coverage) {
+        QMessageBox::information(this, tr("Export Coverage"),
+                                 tr("No recorded coverage for this game."));
+        return;
+    }
+    const QString title = QString::fromStdString(Core::RecompGaps::TitleIdHex(program_id));
+    const QString file = QFileDialog::getSaveFileName(
+        this, tr("Export Coverage File"), title + QStringLiteral("-coverage.json"),
+        tr("Coverage files (*.json)"));
+    if (file.isEmpty()) {
+        return;
+    }
+    // Written from the parsed data, never copied: only IDs, offsets, counts and encodings
+    // survive, and module names are reduced to plain file names.
+    if (!Core::RecompGaps::WriteFile(std::filesystem::path{file.toStdU16String()}, *coverage,
+                                     &error)) {
+        QMessageBox::warning(this, tr("Export Coverage"),
+                             tr("Could not save the coverage file: %1.")
+                                 .arg(QString::fromStdString(error)));
+    }
+}
+
 QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                            const QString& cache_dir,
                                            RecompileBackend backend,
@@ -2699,6 +2916,35 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         is_hybrid ? QStringLiteral("suyu-hybrid") : QStringLiteral("suyu-static");
     const QString effective_backend_name = requested_backend_name;
 
+    // Addresses earlier runs of this title reached with no recompiled block
+    // (recomp_gaps.json in this suyu's user folder, where Hybrid runs and
+    // imported coverage files are pooled). They become extra block-discovery
+    // roots below, but only in a module whose build ID matches exactly. With no
+    // recorded addresses nothing changes and the generated code is identical.
+    Core::RecompGaps::GapData recorded_gaps;
+    {
+        std::string gaps_error;
+        const auto program_id = SelectedProgramId();
+        const auto gaps_path = Core::RecompGaps::SharedStoreFile(program_id);
+        std::error_code gaps_ec;
+        if (!gaps_path.empty() && std::filesystem::exists(gaps_path, gaps_ec)) {
+            auto loaded = Core::RecompGaps::ReadFile(gaps_path, &gaps_error);
+            if (loaded && loaded->title_id == Core::RecompGaps::TitleIdHex(program_id)) {
+                recorded_gaps = std::move(*loaded);
+                LOG_INFO(Frontend,
+                         "AOT coverage: {} recorded address(es) over {} run(s) from {}",
+                         recorded_gaps.GapOffsets(), recorded_gaps.runs,
+                         Common::FS::PathToUTF8String(gaps_path));
+            } else {
+                LOG_WARNING(Frontend, "AOT coverage: ignoring {}: {}",
+                            Common::FS::PathToUTF8String(gaps_path),
+                            loaded ? std::string{"recorded for another title"} : gaps_error);
+            }
+        }
+    }
+    const QString coverage_fingerprint =
+        QString::fromStdString(Core::RecompGaps::Fingerprint(recorded_gaps));
+
     // A completed export is immutable for a given game/output directory and
     // scan mode. Reusing it makes re-opening the export dialog or packaging
     // the same title again effectively instant instead of decompressing every
@@ -2735,11 +2981,18 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const bool same_source = contents.contains(
                 QStringLiteral("\"source_exefs_sha256\": \"") + source_hash +
                 QStringLiteral("\""));
+            // Recorded coverage roots change the generated code; a cache from
+            // before this field existed had none.
+            const bool same_coverage =
+                contents.contains(QStringLiteral("\"coverage_fingerprint\": \"") +
+                                  coverage_fingerprint + QStringLiteral("\"")) ||
+                (coverage_fingerprint.isEmpty() &&
+                 !contents.contains(QStringLiteral("\"coverage_fingerprint\"")));
             QStringList cached_fallback_modules;
             const bool same_fallback_policy = ReadCachedFallbackPolicy(
                 manifest_bytes, fallback_enabled, cached_fallback_modules);
             if (same_scan && same_backend && same_image_abi && same_image_features &&
-                same_correctness_revision &&
+                same_correctness_revision && same_coverage &&
                 same_translate_all && same_source && same_fallback_policy &&
                 has_recompiled_project && has_required_launcher) {
                 last_fallback_modules = std::move(cached_fallback_modules);
@@ -2936,6 +3189,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     }
 
     u64 recomp_total_blocks = 0;
+    u64 coverage_roots_used = 0;
     QStringList recomp_module_dirs;
     QStringList fallback_modules;
 
@@ -2989,6 +3243,21 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     LOG_INFO(Frontend, "module {}: {} recorded roots", mod.name.toStdString(), n);
                 }
             }
+            // Offsets are module-relative, which is this module's vaddr frame.
+            u64 used = 0;
+            for (const u64 offset :
+                 Core::RecompGaps::RootsFor(recorded_gaps, mod.build_id_hex.toStdString())) {
+                if ((offset & 3) == 0 && offset >= mod.text_vaddr &&
+                    offset - mod.text_vaddr < mod.text_bytes.size()) {
+                    exported_roots.push_back(offset);
+                    ++used;
+                }
+            }
+            if (used) {
+                LOG_INFO(Frontend, "AOT coverage [{}]: {} recorded address(es) added as roots",
+                         mod.name.toStdString(), used);
+            }
+            coverage_roots_used += used;
             std::sort(exported_roots.begin(), exported_roots.end());
             exported_roots.erase(std::unique(exported_roots.begin(), exported_roots.end()),
                                  exported_roots.end());
@@ -3080,6 +3349,23 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             return {};
         }
     }
+
+    u64 coverage_modules_ignored = 0;
+    for (const auto& [build_id, gaps] : recorded_gaps.modules) {
+        const bool present = std::any_of(
+            module_results.cbegin(), module_results.cend(), [&](const NsoAnalysisResult& mod) {
+                return Core::RecompGaps::BuildIdMatches(build_id, mod.build_id_hex.toStdString());
+            });
+        if (!present) {
+            ++coverage_modules_ignored;
+            LOG_WARNING(Frontend,
+                        "AOT coverage: ignoring {} recorded address(es) for module {} (build ID "
+                        "{}): no module in this export has that build ID",
+                        gaps.offsets.size(), gaps.name, build_id);
+        }
+    }
+    LOG_INFO(Frontend, "AOT coverage: {} recorded address(es) used, {} module(s) ignored",
+             coverage_roots_used, coverage_modules_ignored);
 
     // Remembered so the completion dialog can say which modules degraded. Until
     // now this list only ever became comments in the generated CMakeLists, so a
@@ -3976,6 +4262,10 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             << QString::fromUtf8(QJsonDocument(fallback_array).toJson(QJsonDocument::Compact))
             << ",\n";
         out << "  \"total_modules\": " << module_results.size() << ",\n";
+        // Recorded coverage gaps fed back as block roots (recomp_gaps.json).
+        out << "  \"coverage_roots\": " << coverage_roots_used << ",\n";
+        out << "  \"coverage_modules_ignored\": " << coverage_modules_ignored << ",\n";
+        out << "  \"coverage_fingerprint\": \"" << coverage_fingerprint << "\",\n";
         out << "  \"total_blocks_analyzed\": " << total_blocks << ",\n";
         out << "  \"total_instructions\": " << total_instructions << ",\n";
         out << "  \"total_text_bytes\": " << total_text_bytes << ",\n";

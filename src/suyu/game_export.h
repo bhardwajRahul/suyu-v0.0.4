@@ -82,6 +82,8 @@ public:
     /// Modules the last export could not recompile, which will run on the
     /// Dynarmic JIT instead. Empty when every module was recompiled.
     QStringList FallbackModulesForTesting() const;
+    /// The Coverage row's text: recorded gaps and Hybrid runs for the selected game.
+    QString CoverageStatusForTesting() const;
 
     /// Every standalone recompiled executable that has already been built for
     /// this game, one per recompiled module, newest-looking first. Empty when
@@ -124,6 +126,10 @@ private slots:
     void OnBrowseOutput();
     void OnExport();
     void OnInstallUpdate();
+    /// Merge a coverage file from another player into this suyu's store for the game.
+    void OnImportCoverage();
+    /// Save the game's recorded coverage (IDs, offsets, counts, opcodes only) to share.
+    void OnExportCoverage();
 
 protected:
     // An export pumps the event loop for as long as the compilers take (tens of
@@ -162,6 +168,10 @@ private:
     /// Ask for an update NSP, check it belongs to the selected game, and install it.
     /// Returns true when an update was installed.
     bool PromptAndInstallUpdate();
+    /// Refresh the Coverage row from <suyu user dir>/recomp/gaps/<title>.json.
+    void RefreshCoverageStatus();
+    /// Build IDs of the selected game's ExeFS modules, read once per ROM path.
+    QStringList SelectedModuleBuildIds();
 
     /// True from the moment OnExport() starts until it returns. Guards both
     /// dialog teardown and re-entry into OnExport() itself: the automation RPC
@@ -240,6 +250,10 @@ private:
     QLabel* update_status_label{};
     QLabel* update_source_label{};
     QPushButton* install_update_button{};
+    QLabel* coverage_status_label{};
+    QPushButton* export_coverage_button{};
+    QStringList coverage_build_ids;
+    QString coverage_build_ids_path;
     quint64 rom_program_id{};
     /// ROM path rom_program_id belongs to; a hand-typed different path invalidates it.
     QString rom_program_id_path;

@@ -5746,7 +5746,9 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                         dialog->ExportOutputForTesting()},
                                        {QStringLiteral("fallback_modules"),
                                         QJsonArray::fromStringList(
-                                            dialog->FallbackModulesForTesting())}};
+                                            dialog->FallbackModulesForTesting())},
+                                       {QStringLiteral("coverage_status"),
+                                        dialog->CoverageStatusForTesting()}};
                 });
 
             mcp_server_->RegisterTool(
@@ -6094,6 +6096,17 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                                             backend_index, full_scan, app_version,
                                                             display_version);
                         });
+                    } else if (action == QStringLiteral("aot_select_rom")) {
+                        // Test-only: select a ROM in the open GameExportDialog without
+                        // exporting, so its Update and Coverage rows can be read back
+                        // through get_aot_export_status.
+                        auto* dialog = qobject_cast<GameExportDialog*>(QApplication::activeModalWidget());
+                        const QString rom_path = params[QStringLiteral("rom_path")].toString().trimmed();
+                        if (!dialog || rom_path.isEmpty()) {
+                            return QJsonObject{{QStringLiteral("success"), false},
+                                               {QStringLiteral("error"), QStringLiteral("Needs an open GameExportDialog and rom_path")}};
+                        }
+                        dialog->SetRomPath(rom_path);
                     } else if (action == QStringLiteral("nintendo_test_one_click")) {
                         // Test-only: directly invoke the One-Click Sign In
                         // handler on whatever NintendoAccountDialog is
