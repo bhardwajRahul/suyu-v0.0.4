@@ -5658,8 +5658,12 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << " g_module_base=g_module_base_" << mod
        << " g_recomp_guard_host_v2=g_recomp_guard_host_v2_" << mod
        << " recomp_image_abi=recomp_image_abi_" << mod
-       << " recomp_image_guard_v2=recomp_image_guard_v2_" << mod
-       << " recomp_lookup=recomp_lookup_" << mod
+       << " recomp_image_guard_v2=recomp_image_guard_v2_" << mod;
+    if (g_emit_fastmem) {
+        cm << " recomp_image_features=recomp_image_features_" << mod
+           << " recomp_image_fastmem_v1=recomp_image_fastmem_v1_" << mod;
+    }
+    cm << " recomp_lookup=recomp_lookup_" << mod
        << " recomp_build_index=recomp_build_index_" << mod
        << " _recomp_index_view=_recomp_index_view_" << mod
        << " recomp_image_index=recomp_image_index_" << mod
@@ -5694,8 +5698,22 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "   and exact guest floating-point status. */\n"
           "RECOMP_API unsigned recomp_image_abi(void){ return RECOMP_IMAGE_ABI; }\n"
           "RECOMP_API unsigned recomp_image_guard_v2(unsigned host_version){\n"
-          "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n"
-          "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
+          "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n";
+    if (g_emit_fastmem) {
+        ex << "/* ABI 6 feature handshake. The host passes its own view of the page\n"
+              "   table layout and of the context offsets; 1 means this image was\n"
+              "   compiled against exactly those, so the host may enable fm_limit. */\n"
+              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FASTMEM_PT1; }\n"
+              "RECOMP_API unsigned recomp_image_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
+              "                                            uint64_t ptr_mask, uint32_t off_table,\n"
+              "                                            uint32_t off_limit){\n"
+              "  return page_bits==RECOMP_FM_PAGE_BITS && stride_log2==RECOMP_FM_STRIDE_LOG2 &&\n"
+              "         ptr_mask==(uint64_t)RECOMP_FM_PTR_MASK &&\n"
+              "         off_table==offsetof(GuestContext,fm_table) &&\n"
+              "         off_limit==offsetof(GuestContext,fm_limit);\n"
+              "}\n";
+    }
+    ex << "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
           "/* Run a bounded sequence while control flow stays inside this module.\n"
           "   Compact conditional branches return to this C loop instead of the\n"
           "   cross-library host dispatcher. Every additional block consumes the\n"
@@ -6037,8 +6055,51 @@ static RECOMP_INLINE uint64_t recomp_fixed_to_fp(uint64_t bits, unsigned fp_bits
 )FX";
 }
 
+// ABI 6 (FM1) header pieces. Each is empty in the ABI 5 text.
+inline const char* FastmemAbiH() {
+    return R"RT(6
+/* ABI 6 adds FM1, direct guest memory access through the host page table.
+   The memory helpers read Common::PageTable's entry array themselves, with its
+   layout folded in as the constants below, and serve an access only when it
+   lies inside one page whose entry holds a real backing pointer. Anything else
+   goes to the unchanged ABI 5 helper. The host enables this per context through
+   fm_table/fm_limit, and only after recomp_image_fastmem_v1 has confirmed these
+   constants and the field offsets for every loaded module. */
+#define RECOMP_FEATURE_FASTMEM_PT1 1u
+#define RECOMP_FM_PAGE_BITS 12
+#define RECOMP_FM_STRIDE_LOG2 5
+#define RECOMP_FM_PTR_MASK (~(uintptr_t)3)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RECOMP_NOINLINE __declspec(noinline)
+#define RECOMP_LIKELY(x) (x)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_NOINLINE __attribute__((noinline))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define RECOMP_NOINLINE
+#define RECOMP_LIKELY(x) (x)
+#endif
+)RT";
+}
+
+inline const char* FastmemContextFieldsH() {
+    return R"RT(    /* ABI 6 (FM1). Written only by the host thread that owns this context,
+       before it enters generated code. fm_limit 0 turns the fast path off.
+       Otherwise fm_table is host_mem->page_entries, and fm_limit is page
+       aligned, at most 2^39, and no higher than host_mem->address_space_max. */
+    uint32_t fm_reserved;
+    const unsigned char* fm_table;
+    uint64_t fm_limit;
+)RT";
+}
+
+inline const char* FastmemLayoutPinsH() {
+    return R"RT(typedef char recomp_layout_fm_table[offsetof(GuestContext, fm_table) == 872 ? 1 : -1];
+typedef char recomp_layout_fm_limit[offsetof(GuestContext, fm_limit) == 880 ? 1 : -1];
+)RT";
+}
+
 inline std::string BuildRuntimeH(bool fastmem) {
-    (void)fastmem;
     std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
@@ -6066,8 +6127,7 @@ inline std::string BuildRuntimeH(bool fastmem) {
 )RT") + FPScanHelpers() + FPFixedHelpers() + R"RT(
 /* Supplied by the host when the recompiled image is driven by an emulator
    rather than run standalone. `size` is 1, 2, 4 or 8 bytes. */
-#define RECOMP_IMAGE_ABI 5
-
+#define RECOMP_IMAGE_ABI )RT" + (fastmem ? FastmemAbiH() : "5\n") + R"RT(
 typedef struct RecompHostMem {
     void* user;
     uint64_t (*load)(void* user, uint64_t va, uint32_t size);
@@ -6170,7 +6230,7 @@ typedef struct GuestContext {
        save_dir below lands 512 bytes further along on this side than on that
        one. The layout assertions below are what catch that. */
     int chain_budget;
-    /* Save-data filesystem state */
+)RT" + (fastmem ? FastmemContextFieldsH() : "") + R"RT(    /* Save-data filesystem state */
     char save_dir[512];
     /* Heap break for SVC memory allocation */
     uint64_t heap_base; uint64_t heap_end; uint64_t heap_cur;
@@ -6199,7 +6259,7 @@ typedef char recomp_layout_fpsr[offsetof(GuestContext, fpsr) == 856 ? 1 : -1];
 typedef char recomp_layout_host[offsetof(GuestContext, host_mem) == 832 ? 1 : -1];
 typedef char recomp_layout_chain[offsetof(GuestContext, chain_budget) == 864 ? 1 : -1];
 typedef char recomp_layout_tpidrro[offsetof(GuestContext, tpidrro_el0) == 840 ? 1 : -1];
-
+)RT" + (fastmem ? FastmemLayoutPinsH() : "") + R"RT(
 /* Where this module is actually loaded in the guest's address space.
    Every address the static pass bakes in - ADR/ADRP results, branch targets,
    return addresses - is relative to the module, because that is all it can
@@ -6342,13 +6402,112 @@ uint64_t recomp_fp_estimate(GuestContext* c,uint64_t bits,unsigned width,int rsq
 )EST";
 }
 
+// ABI 6 (FM1) memory helpers. `abi5` is the ABI 5 helper text. It is kept
+// verbatim as the slow path, with only the twelve public helpers renamed to
+// recomp_*_slow (their calls to one another included) and made static and
+// noinline. Deriving it from the ABI 5 text rather than restating it means the
+// slow path cannot drift from what ABI 5 does.
+inline std::string FastmemHelpersC(std::string abi5) {
+    static constexpr const char* kHelpers[] = {
+        "load8",  "load16",  "load32", "load64", "store8", "store16",
+        "store32", "store64", "ldp64", "stp64",  "ldp32",  "stp32",
+    };
+    const auto replace_all = [&abi5](const std::string& from, const std::string& to) {
+        for (size_t at = abi5.find(from); at != std::string::npos;
+             at = abi5.find(from, at + to.size())) {
+            abi5.replace(at, from.size(), to);
+        }
+    };
+    for (const char* name : kHelpers) {
+        const std::string base = std::string("recomp_") + name;
+        replace_all(base + " (", base + "_slow(");
+        replace_all(base + "(", base + "_slow(");
+    }
+    replace_all("\nuint64_t recomp_", "\nstatic RECOMP_NOINLINE uint64_t recomp_");
+    replace_all("\nvoid recomp_", "\nstatic RECOMP_NOINLINE void recomp_");
+    return abi5 + R"RT(
+/* ABI 6 (FM1) fast path. One read of the same page-table entry the ABI 5 walk
+   would read, for exactly the accesses ABI 5 would serve from that entry:
+   in range, inside one page, and backed by a real pointer. It returns the
+   entry's pointer part (host page - guest page), or 0 to decline. Declining is
+   always safe, because the caller then runs the unchanged ABI 5 helper above.
+
+   fm_limit is page aligned, no higher than address_space_max and at most 2^39,
+   so one compare covers the disabled state (0), every bound ABI 5 checks, and
+   any tagged or out-of-range address, which ABI 5 then masks and serves as
+   before. Unmapped, debug and GPU-tracked pages have a null pointer part, so
+   they decline too and still reach the host callback, in the same order and
+   with the same arguments. */
+static RECOMP_INLINE uintptr_t recomp_fm_entry(const GuestContext* c, uint64_t va, unsigned bytes){
+  if(va >= c->fm_limit) return 0;
+  if((va & 0xfffu) > 0x1000u - bytes) return 0;
+  return *(const uintptr_t*)(c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS)
+                                            << RECOMP_FM_STRIDE_LOG2)) & RECOMP_FM_PTR_MASK;
+}
+#define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))
+
+uint64_t recomp_load8 (GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,1);
+  if(RECOMP_LIKELY(e)) return (uint64_t)*RECOMP_FM_PTR(e,a);
+  return recomp_load8_slow(c,a);}
+uint64_t recomp_load16(GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,2);
+  if(RECOMP_LIKELY(e)){uint16_t v;memcpy(&v,RECOMP_FM_PTR(e,a),2);return (uint64_t)v;}
+  return recomp_load16_slow(c,a);}
+uint64_t recomp_load32(GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,4);
+  if(RECOMP_LIKELY(e)){uint32_t v;memcpy(&v,RECOMP_FM_PTR(e,a),4);return (uint64_t)v;}
+  return recomp_load32_slow(c,a);}
+uint64_t recomp_load64(GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){uint64_t v;memcpy(&v,RECOMP_FM_PTR(e,a),8);return v;}
+  return recomp_load64_slow(c,a);}
+void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,1);
+  if(RECOMP_LIKELY(e)){*RECOMP_FM_PTR(e,a)=(unsigned char)v;return;}
+  recomp_store8_slow(c,a,v);}
+void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,2);
+  if(RECOMP_LIKELY(e)){uint16_t t=(uint16_t)v;memcpy(RECOMP_FM_PTR(e,a),&t,2);return;}
+  recomp_store16_slow(c,a,v);}
+void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,4);
+  if(RECOMP_LIKELY(e)){uint32_t t=(uint32_t)v;memcpy(RECOMP_FM_PTR(e,a),&t,4);return;}
+  recomp_store32_slow(c,a,v);}
+void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){memcpy(RECOMP_FM_PTR(e,a),&v,8);return;}
+  recomp_store64_slow(c,a,v);}
+void recomp_ldp64(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
+  uintptr_t e=recomp_fm_entry(c,a,16);
+  if(RECOMP_LIKELY(e)){const unsigned char* p=RECOMP_FM_PTR(e,a);
+    memcpy(lo,p,8); memcpy(hi,p+8,8); return;}
+  recomp_ldp64_slow(c,a,lo,hi);}
+void recomp_stp64(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
+  uintptr_t e=recomp_fm_entry(c,a,16);
+  if(RECOMP_LIKELY(e)){unsigned char* p=RECOMP_FM_PTR(e,a);
+    memcpy(p,&v0,8); memcpy(p+8,&v1,8); return;}
+  recomp_stp64_slow(c,a,v0,v1);}
+void recomp_ldp32(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){const unsigned char* p=RECOMP_FM_PTR(e,a); uint32_t x,y;
+    memcpy(&x,p,4); memcpy(&y,p+4,4); *lo=(uint64_t)x; *hi=(uint64_t)y; return;}
+  recomp_ldp32_slow(c,a,lo,hi);}
+void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){unsigned char* p=RECOMP_FM_PTR(e,a); uint32_t x=(uint32_t)v0,y=(uint32_t)v1;
+    memcpy(p,&x,4); memcpy(p+4,&y,4); return;}
+  recomp_stp32_slow(c,a,v0,v1);}
+)RT";
+}
+
 inline std::string BuildRuntimeC(bool fastmem) {
-    (void)fastmem;
     // MSVC caps one string literal at 16380 bytes (C2026) and this runtime is
-    // past that, so it is assembled from two pieces at first use rather than
-    // being a single literal. Adjacent-literal concatenation would not help:
-    // the limit applies to the result as well.
-    const std::string text = std::string(R"RT(#include "recomp_runtime.h"
+    // past that, so it is assembled from several pieces at first use rather
+    // than being a single literal. Adjacent-literal concatenation would not
+    // help: the limit applies to the result as well. The memory helpers are a
+    // piece of their own because ABI 6 reuses their exact text as its slow path.
+    const std::string head = std::string(R"RT(#include "recomp_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6566,7 +6725,8 @@ uint64_t recomp_cntpct(GuestContext* c){
     return ((now_ns - base_ns) / 1000ULL) * 19200ULL / 1000ULL;
   }
 }
-)RT") + std::string(R"RT(
+)RT");
+    const std::string abi5_helpers = R"RT(
 /* Resolve a guest address to a host pointer the way Memory::GetPointerImpl
    does: mask, bounds check, one page-table entry, extract the backing pointer.
    A null result means unmapped, debug, or GPU-tracked memory, all of which have
@@ -6677,7 +6837,8 @@ void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
   }
   recomp_store32(c,a,v0); recomp_store32(c,a+4,v1);
 }
-
+)RT";
+    const std::string tail = std::string(R"RT(
 #ifndef RECOMP_STATIC_HOST
 /* Owned by the runtime in the single-module shapes (standalone exe, loadable
    shared image). When several modules are linked statically into one host this
@@ -6979,7 +7140,8 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
-    return text + EstimateRuntimeC();
+    return head + (fastmem ? FastmemHelpersC(abi5_helpers) : abi5_helpers) + tail +
+           EstimateRuntimeC();
 }
 
 inline const char* RuntimeC() {
