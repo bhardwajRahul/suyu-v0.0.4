@@ -26,16 +26,30 @@ the `user\` folder of a portable suyu).
 - **Missing firmware:** install firmware in suyu (**Tools > Install Firmware**), or
   choose **Continue anyway**. Without firmware, Mii screens and some menus may fail.
 
-## Exported JIT game stutters
+## Exported game stutters
 
 Short freezes, often at the start of a race or a new area, are usually shaders being
-built for the first time. The title bar shows "Building N shaders" when this happens.
+built for the first time. The title bar shows "Building N shaders" when this happens,
+and it goes away as the cache fills in. Each launch also shows a "Preparing
+shaders: N of M" progress bar for a few seconds while the cache loads; this is normal.
 
 1. Play the game in suyu for a while so it builds its shader cache.
-2. Export again with **Include transferable shader cache** ticked.
+2. Export again with **Include transferable shader cache** ticked. The export includes
+   your existing cache, so later launches stutter less.
 
 Packages made before v0.0.11 never got their shader cache, even with the box ticked.
 Re-export them.
+
+## Exported game crashes on start-up, or when closing suyu with Export Game open
+
+A rare crash can happen right at start-up (system services still starting); just
+launch the game again. Separately, closing suyu while the **Export Game** dialog is
+still open can crash suyu. Both are known issues.
+
+## No sound in an exported game
+
+Check `audio_muted` in the package's `user\config\sdl2-config.ini`. If it says `true`,
+set it to `false` and start the game again.
 
 ## Exported game shows "Ver. 1.0.0"
 

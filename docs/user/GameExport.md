@@ -37,8 +37,21 @@ The CPU backends, in the order the dialog lists them:
 - **suyu static AOT (Experimental)** runs pre-compiled code only, with no JIT fallback. It
   stops when it reaches code it doesn't cover. Use it for testing.
 
-For Mario Kart 8 Deluxe v4.0.0 on Windows, the Dynarmic JIT export ran at 60 fps in a
-race, Hybrid at 31–35 and static at about 25.
+Static and Hybrid exports are now much faster. For Mario Kart 8 Deluxe v4.0.0, a race
+runs at about 60 fps on the Dynarmic JIT export and about 56 fps on Windows for a
+static export (about 60 on macOS and Linux). A Hybrid export with Clang reached about
+51 fps on Windows; Hybrid performance still varies by game. On Windows, reaching that speed needs Clang/LLVM
+installed (see **Select an export format** below); without it, static and Hybrid
+exports still work but run slower. **Re-export a game you already exported to get the
+speed-up.** Static is still tested on Mario Kart 8 Deluxe only; the Dynarmic JIT stays
+the default and the most compatible choice for other games.
+
+The dialog also shows a coverage line for the selected game, for example whether static
+AOT looks safe to try, or how much code still needs Hybrid's JIT fallback. Playing a
+Hybrid export records any code that still needed the JIT, so re-exporting the same game
+later can cover more of it. **Import / Export coverage file** lets players share this
+information; the file only holds module IDs, code offsets and counts, no game code.
+Hybrid remains the choice when static won't run a game.
 
 ## Select an export format
 
@@ -118,6 +131,10 @@ Library**):
 - **Include custom game configuration**. The game's own settings from suyu are added
   on top of your global settings.
 
+Ticking these boxes now reliably includes save data, shader cache and per-game settings
+in the package. Older exports could leave them out even when the box was ticked;
+re-export if that happened to you.
+
 **Never:** keys or firmware. See the next section.
 
 ## Keys and firmware
@@ -148,10 +165,16 @@ The title bar shows FPS, frame time, the CPU backend, and "Building N shaders"
 while shaders are being built. A stutter at the same moment as a shader build means
 the shader cache didn't have that shader yet.
 
+Each launch, an exported game first prepares the shaders in its cache: you'll see a
+progress bar ("Preparing shaders: N of M") and "Building shaders N/M" in the title
+bar. This is normal and usually takes a few seconds (about 3 for Mario Kart 8 Deluxe).
+
 The package reports the game's real update version. Packages made before v0.0.11
 showed "Ver. 1.0.0"; re-export them.
 
-Controllers are assigned automatically. Press **F12** for the controls panel. See
+Controllers are assigned automatically. Press **F12** for the controls panel, which now
+also has a **Resolution Scale** choice — it's saved in the package and takes effect the
+next time the game starts. See
 [Controllers in exported games](./Controllers.md#controllers-in-exported-games).
 
 ## Steam
@@ -173,6 +196,14 @@ JIT backend.
 - **Restart Steam** to see the new shortcut.
 
 Steam shows no description for non-Steam games; that is a Steam limitation.
+
+## Discord
+
+Exported games show up in Discord as playing suyu, with the game's cover art (from
+Wikipedia, which receives the game's title). This is on by default: to turn it off for
+a specific export, untick **Show this game in Discord (cover art from Wikipedia)**
+before exporting. To turn it off later, set `enabled=0` in the `discord.ini` file next
+to the game's `.exe`.
 
 ## Known limitations
 

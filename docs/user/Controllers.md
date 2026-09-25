@@ -24,6 +24,8 @@ Press **F12** in the game for the controls panel:
 
 - **Combine Joy-Cons into one player** / **Split Joy-Cons into two players** changes how
   Joy-Con halves are used.
+- **Resolution Scale** sets the internal resolution. It's saved in the package and
+  takes effect the next time the game starts.
 - **Use keyboard** or **Rebind** sets controls by hand. Doing either turns automatic
   assignment off for that package. To turn it back on, set
   `auto_assign_controllers=true` under `[Controls]` in the package's
