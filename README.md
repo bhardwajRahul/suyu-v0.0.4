@@ -98,9 +98,9 @@ about 60 on macOS and Linux, against 60 for the JIT; see the
 |---|---|
 | suyu Dynarmic JIT (Baseline) | Default. Dynamic compilation; the most compatible. |
 | suyu Hybrid JIT + AOT | Static code with JIT fallback. Performance varies by game; compare it with the Dynarmic JIT export. |
-| suyu static AOT (Experimental) | Ahead-of-time AArch64 code with suyu HLE; use the separate `no-jit` binaries for a host with Dynarmic entirely absent. |
+| suyu static AOT (Experimental) | Ahead-of-time AArch64 code with suyu HLE; for a host with Dynarmic entirely absent, build with `-DSUYU_NO_JIT=ON`. |
 
-The `no-jit` downloads are compiled with `-DSUYU_NO_JIT=ON` and audited for Dynarmic build inputs and executable symbols. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
+Builds configured with `-DSUYU_NO_JIT=ON` leave Dynarmic out entirely; releases no longer ship separate no-JIT downloads. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
 **Re-export old builds (ABI 4 → ABI 5).** ABI 5 validates the generated-image revision, instruction coverage, and memory guards more strictly; ABI 4 bundles are intentionally rejected. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
 

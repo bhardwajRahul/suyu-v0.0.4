@@ -30,9 +30,6 @@ jobs:
           - variant: standard
             no_jit: 'OFF'
             archive: suyu-linux-x86_64.tar.gz
-          - variant: no-jit
-            no_jit: 'ON'
-            archive: suyu-linux-x86_64-no-jit.tar.gz
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,31 +81,11 @@ jobs:
             -Dfmt_FORCE_BUNDLED=ON
       - name: Build
         run: cmake --build build --target suyu suyu-cmd
-      - name: Verify no-JIT build
-        if: matrix.variant == 'no-jit'
-        run: |
-          grep -qx 'SUYU_NO_JIT:BOOL=ON' build/CMakeCache.txt
-          ninja -C build -t inputs suyu suyu-cmd > build/no-jit-inputs.txt
-          if grep -Ei '(^|[/\\])dynarmic([/\\.]|$)|arm_dynarmic|libdynarmic[.]a' build/no-jit-inputs.txt; then
-            echo 'Dynarmic input found in the no-JIT build' >&2
-            exit 1
-          fi
-          for target in suyu suyu-cmd; do
-            nm -C "build/bin/$target" > "build/$target-symbols.txt"
-            # A stripped or unreadable binary is not evidence of zero symbols.
-            grep -Eq '[[:space:]][Tt][[:space:]]' "build/$target-symbols.txt"
-            if grep -E 'Dynarmic::|dynarmic::' "build/$target-symbols.txt"; then
-              echo "Dynarmic symbol found in $target" >&2
-              exit 1
-            fi
-          done
-          printf 'Source: %s\nSUYU_NO_JIT=ON\nNo Dynarmic target inputs or executable symbols.\n' "$GITHUB_SHA" > build/no-jit-audit.txt
       - name: Package
         run: |
           mkdir -p _pkg
           cp build/bin/suyu build/bin/suyu-cmd _pkg/
           cp LICENSE.txt _pkg/
-          if [ -f build/no-jit-audit.txt ]; then cp build/no-jit-audit.txt _pkg/; fi
           tar -czf '${{ matrix.archive }}' -C _pkg .
       - uses: actions/upload-artifact@v4
         with:
@@ -127,10 +104,6 @@ jobs:
             no_jit: 'OFF'
             linker_flags: ''
             archive: suyu-windows-x86_64.zip
-          - variant: no-jit
-            no_jit: 'ON'
-            linker_flags: '/MAP'
-            archive: suyu-windows-x86_64-no-jit.zip
     steps:
       - uses: actions/checkout@v4
         with:
@@ -170,42 +143,6 @@ jobs:
       - name: Build
         shell: bash
         run: cmake --build build --target suyu suyu-cmd
-      - name: Verify no-JIT build
-        if: matrix.variant == 'no-jit'
-        shell: pwsh
-        run: |
-          if (-not (Select-String -Path build/CMakeCache.txt -Pattern '^SUYU_NO_JIT:BOOL=ON$' -Quiet)) {
-            throw 'No-JIT build setting is missing'
-          }
-          ninja -C build -t inputs suyu suyu-cmd | Set-Content build/no-jit-inputs.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Ninja inputs' }
-          if (Select-String -Path build/no-jit-inputs.txt -Pattern '(^|[/\\])dynarmic([/\\.]|$)|arm_dynarmic|libdynarmic[.]a' -Quiet) {
-            throw 'Dynarmic input found in the no-JIT build'
-          }
-          foreach ($target in @('suyu', 'suyu-cmd')) {
-            $maps = @(Get-ChildItem build -Recurse -File -Filter "$target.map")
-            if ($maps.Count -ne 1 -or $maps[0].Length -eq 0) {
-              throw "Expected one nonempty link map for $target"
-            }
-            if (-not (Select-String -LiteralPath $maps[0].FullName -Pattern 'Publics by Value' -Quiet)) {
-              throw "No public-symbol table found in $target link map"
-            }
-            # MSVC encodes UI text such as "Dynarmic" in ??_C@ literal symbols.
-            # Exclude only those literals; retain every code/data symbol row.
-            $symbols = @(Select-String -LiteralPath $maps[0].FullName -Pattern '^\s+[0-9a-f]+:[0-9a-f]+\s+(\S+)\s+[0-9a-f]{8,}\b' |
-              Where-Object { -not $_.Matches[0].Groups[1].Value.StartsWith('??_C@') })
-            if ($symbols.Count -eq 0) {
-              throw "No nonliteral symbols found in $target link map"
-            }
-            if ($symbols.Line -match '@Dynarmic@|\bdynarmic[.]lib\b') {
-              throw "Dynarmic symbol found in $target link map"
-            }
-          }
-          @(
-            "Source: $env:GITHUB_SHA"
-            'SUYU_NO_JIT=ON'
-            'No Dynarmic target inputs or executable link-map symbols.'
-          ) | Set-Content build/no-jit-audit.txt
       - name: Package
         shell: pwsh
         run: |
@@ -216,7 +153,6 @@ jobs:
           windeployqt --release --no-translations _pkg\suyu.exe
           if ($LASTEXITCODE -ne 0) { throw 'Qt deployment failed' }
           Copy-Item LICENSE.txt _pkg\
-          if (Test-Path build/no-jit-audit.txt) { Copy-Item build/no-jit-audit.txt _pkg\ }
           Compress-Archive -Path _pkg\* -DestinationPath '${{ matrix.archive }}'
       - uses: actions/upload-artifact@v4
         with:
@@ -571,9 +507,7 @@ jobs:
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.apk' \) -exec mv {} out/ \;
           for asset in \
             suyu-linux-x86_64.tar.gz \
-            suyu-linux-x86_64-no-jit.tar.gz \
             suyu-windows-x86_64.zip \
-            suyu-windows-x86_64-no-jit.zip \
             suyu-macos-arm64.zip \
             suyu-android-arm64.apk \
             suyu-libretro-linux-x86_64.tar.gz \
